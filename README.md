@@ -10,4 +10,4 @@ Shows similar results! Max 10.
 
 Feel free to leave suggestions/comments but please keep in mind this is a passion project. It's going to have bugs, I'll try my best to fix what I can in future releases!
 
-Support me at: https://ko-fi.com/plexrenamer
+Support me at: https://ko-fi.com/pathrenamer
