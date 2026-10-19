@@ -173,3 +173,15 @@ def test_window_closes_cleanly(main, make_window, tmp_path, qapp):
     w.close()
     w.deleteLater(); _wait(qapp, 30)
     assert "window_geometry" in make_window.saved
+
+
+def test_layout_options_apply_without_switching(main, make_window, qapp):
+    from PyQt6.QtCore import Qt
+    w = make_window()
+    w.show(); w.resize(1200, 760); _wait(qapp, 50)
+    w.cfg.update(density="compact", panel_mode="stacked", show_details=False)
+    w._apply_layout_options()
+    assert w.table.verticalHeader().defaultSectionSize() == 26
+    assert _wait_until(qapp, lambda: w._split_main.orientation() == Qt.Orientation.Vertical)
+    assert _wait_until(qapp, w.details.isHidden)
+    assert not w.act_details.isChecked()
