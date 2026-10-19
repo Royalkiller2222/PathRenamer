@@ -201,3 +201,20 @@ def test_rename_and_undo_from_the_window(main, window, tmp_path):
     window._undo()
     assert video.exists() and all(s.exists() for s in subs)
     assert not movie_dir.exists()
+
+
+def test_one_episode_from_a_season_pack_takes_only_its_subtitles(main, tmp_path):
+    # Only E05 was downloaded, but the pack's Subs folder has every episode
+    video, = make_files(tmp_path, "Severance.S01/Severance.S01E05.1080p.WEB-DL.mkv")
+    make_files(tmp_path, *(f"Severance.S01/Subs/Severance.S01E0{n}.1080p.WEB-DL/2_English.srt" for n in (1, 2, 5)))
+    make_files(tmp_path, "Severance.S01/Subs/Severance.S01E01.eng.srt", "Severance.S01/Subs/Severance.S01E05.eng.srt")
+    assert _names(main.find_subtitle_siblings(video), tmp_path) == [
+        "Severance.S01/Subs/Severance.S01E05.1080p.WEB-DL/2_English.srt",
+        "Severance.S01/Subs/Severance.S01E05.eng.srt"]
+
+
+def test_similar_show_names_are_different_shows(main, tmp_path):
+    lost, who = make_files(tmp_path, "dl/Lost.S01E01.mkv", "dl/Doctor.Who.2005.S06E13.mkv")
+    make_files(tmp_path, "dl/Lost.Girl.S01E01.en.srt", "dl/Subs/Doctor.Who.S06E13.eng.srt")
+    assert main.find_subtitle_siblings(lost) == []
+    assert _names(main.find_subtitle_siblings(who), tmp_path) == ["dl/Subs/Doctor.Who.S06E13.eng.srt"]

@@ -195,6 +195,17 @@ def _episode_tag(stem):
     season, episode = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
     return re.sub(r"[\W_]+", "", stem[:m.start()].lower()), (int(season), int(episode))
 
+# What may follow a show name and still be the same show: a year or a country
+# ("doctorwho" / "doctorwho2005", "theoffice" / "theofficeus"), not more words
+# ("lost" / "lostgirl" are different shows).
+_SAME_SHOW_SUFFIX = re.compile(r"(?:19|20)\d\d|us|uk|au|nz|ca")
+
+def _same_show(a, b):
+    if a == b:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    return bool(short) and long_.startswith(short) and bool(_SAME_SHOW_SUFFIX.fullmatch(long_[len(short):]))
+
 def _list_dir(folder):
     """(file names, folder names) in folder, sorted case-insensitively.
     os.scandir gives the entry types with the listing, which keeps this fast
@@ -254,17 +265,24 @@ def find_subtitle_siblings(video):
         t = _episode_tag(stem)
         if not t or t[1] != tag[1]:
             return False
-        show, video_show = t[0], tag[0]
-        if not show:                     # "Subs/S01E02.eng.srt"
+        if not t[0]:                     # "Subs/S01E02.eng.srt"
             return in_sub_dir
-        return bool(video_show) and (video_show.startswith(show) or show.startswith(video_show))
+        return bool(tag[0]) and _same_show(t[0], tag[0])
 
-    def belongs(stem, in_sub_dir):
+    def other_episode(stem):
+        # Named for another episode: e.g. one episode downloaded from a season
+        # pack whose Subs folder still has every episode's subtitles
+        t = _episode_tag(stem)
+        return t is not None and tag is not None and t[1] != tag[1]
+
+    def belongs(stem, in_sub_dir, folder=False):
         if _sub_matches_video(stem, vstem):
             # "Movie.Extended.en.srt" belongs to "Movie.Extended.mkv", not "Movie.mkv"
             return not any(len(o) > len(vstem) and _sub_matches_video(stem, o) for o in others)
-        if not ((only_video and (in_sub_dir or is_language_only_name(stem)))
-                or same_episode(stem, in_sub_dir)):
+        if other_episode(stem):
+            return False
+        lone = only_video and ((in_sub_dir and not folder) or is_language_only_name(stem))
+        if not (lone or same_episode(stem, in_sub_dir)):
             return False
         return not any(_sub_matches_video(stem, o) for o in others)   # named after another video
 
@@ -290,7 +308,7 @@ def find_subtitle_siblings(video):
                 _add(sub_dir, n, "Subs folder")
         for nd in nested:
             # Season packs: Subs/<video name>/ or Subs/S01E02/
-            if belongs(nd.strip(), True):
+            if belongs(nd.strip(), True, folder=True):
                 for n in _list_dir(sub_dir / nd)[0]:
                     if _split_name(n)[1] in SUB_EXT:
                         _add(sub_dir / nd, n, "per-episode Subs folder")
@@ -2773,6 +2791,8 @@ class MainWindow(QMainWindow):
         self._thread = self._worker = None
         self._scanning = False
         self._layout_name = None
+        self._anims = {}              # running panel animations by kind
+        self._shown_once = False
         self._split_main = self._split_preview = None
         self._files_stack = self._preview_stack = None
         self.setWindowTitle("PathRenamer")
@@ -2962,7 +2982,9 @@ class MainWindow(QMainWindow):
         name = self.cfg.get("layout", "modern")
         if name not in LAYOUTS:
             name = "modern"
-        # The previous layout's frames and splitters are deleted below
+        # The previous layout's frames and splitters are deleted below:
+        # stop animations that are still moving them
+        self._stop_animation()
         self._split_main = self._split_preview = None
         self._files_stack = self._preview_stack = None
         old = self.takeCentralWidget()
@@ -3040,6 +3062,12 @@ class MainWindow(QMainWindow):
         br.addWidget(self.btn_undo)
         self.btn_rename.setFixedWidth(160)
         br.addWidget(self.btn_rename); L.addLayout(br)
+        # The Modern layout's stacked panes hide the list and table when they
+        # leave them; show everything Classic uses
+        for w in (self.src, self.btn_browse, self.combo, self.btn_preview, self.file_list,
+                  self.btn_sel_all, self.btn_rem_files, self.btn_clear_files, self.table,
+                  self.btn_remove, self.btn_undo, self.btn_rename):
+            w.show()
 
     def _arrange_modern(self, root):
         """Toolbar on top, file list and preview side by side (stacked on narrow
@@ -3111,6 +3139,7 @@ class MainWindow(QMainWindow):
         self._split_preview.setChildrenCollapsible(False); self._split_preview.setHandleWidth(10)
         self._split_preview.addWidget(preview); self._split_preview.addWidget(self.details)
         self._split_preview.setStretchFactor(0, 1); self._split_preview.setStretchFactor(1, 0)
+        self.details.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.details.setVisible(self.cfg.get("show_details", True))
         split.addWidget(self._split_preview)
         split.setStretchFactor(0, 0); split.setStretchFactor(1, 1)
@@ -3124,6 +3153,11 @@ class MainWindow(QMainWindow):
         al.addWidget(self.summary, 1)
         al.addWidget(self.btn_remove); al.addWidget(self.btn_undo); al.addWidget(self.btn_rename)
         outer.addWidget(bar)
+        for w in (self.src, self.btn_browse, self.btn_preview, self.seg, self.match_combo,
+                  self.lib_label, self.btn_change_lib, self.files_count, self.preview_count,
+                  self.btn_sel_all, self.btn_rem_files, self.btn_clear_files, self.summary,
+                  self.btn_remove, self.btn_undo, self.btn_rename):
+            w.show()
         self._update_panel_orientation()
 
     def _panel_orientation(self):
@@ -3172,33 +3206,61 @@ class MainWindow(QMainWindow):
             self.cfg["files_ratio"] = round(sizes[0] / sum(sizes), 3)
 
     def _set_details_visible(self, show, animate=True):
-        """Slide the details panel in or out under the preview."""
+        """Slide the details panel in or out under the preview. A click while
+        it is still sliding turns it around from where it is."""
         sp = self._split_preview
         if sp is None:
             return
         animate = animate and self.cfg.get("animations", True) and self.isVisible()
-        if show == (not self.details.isHidden()):
+        self._stop_animation("details")
+        visible = not self.details.isHidden()
+        if not show and not visible:
             return
-        total = sum(sp.sizes()) or sp.height()
-        target = self._details_height(total)
+        sizes = sp.sizes()
+        total = sum(sizes) or sp.height()
+        current = sizes[1] if visible and len(sizes) > 1 else 0
         # Size policy "Ignored" lets the splitter squeeze the panel below its
         # normal minimum while it slides; restored when done.
         self.details.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored)
         def step(v):
-            sp.setSizes([max(total - v, 1), v])
-        def done_show():
+            try:
+                sp.setSizes([max(total - v, 1), v])
+            except RuntimeError:          # layout replaced meanwhile
+                pass
+        def restore_policy():
             self.details.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         def done_hide():
             self.details.hide()
-            self.details.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+            restore_policy()
         if show:
-            self.details.show()
+            if not visible:
+                self.details.show()
+                step(0)
             self._update_details()
-            step(0)
-            _animate(self, 0, target, step, on_done=done_show, enabled=animate)
+            self._run_animation("details", current, self._details_height(total), step,
+                                on_done=restore_policy, enabled=animate)
         else:
-            current = sp.sizes()[1] if len(sp.sizes()) > 1 else 0
-            _animate(self, current, 0, step, on_done=done_hide, enabled=animate)
+            self._run_animation("details", current, 0, step, on_done=done_hide, enabled=animate)
+
+    def _run_animation(self, key, start, end, on_value, on_done=None, enabled=True):
+        """_animate, first stopping the previous animation of the same kind so
+        quick repeated clicks always end in the latest state."""
+        self._stop_animation(key)
+        anim = _animate(self, start, end, on_value, on_done=on_done, enabled=enabled)
+        if anim is not None:
+            self._anims[key] = anim
+            anim.finished.connect(lambda k=key, a=anim: self._anims.get(k) is a and self._anims.pop(k))
+
+    def _stop_animation(self, key=None):
+        """Stop one running animation (or all). A stopped animation does not
+        run its "done" step."""
+        for k in ([key] if key else list(self._anims)):
+            anim = self._anims.pop(k, None)
+            if anim is not None:
+                try:
+                    anim.stop()
+                except RuntimeError:      # already finished and deleted
+                    pass
 
     def _toggle_details(self, checked):
         self.cfg["show_details"] = bool(checked)
@@ -3224,17 +3286,18 @@ class MainWindow(QMainWindow):
         if self._layout_name != "modern":
             return
         animate = animate and self.cfg.get("animations", True) and self.isVisible()
+        self._stop_animation("tvdb")
         if forced:
             start = 0 if self.tvdb_edit.isHidden() else self.tvdb_edit.width()
             self.tvdb_edit.show()
-            _animate(self, start, 130, self.tvdb_edit.setFixedWidth, enabled=animate)
+            self._run_animation("tvdb", start, 130, self.tvdb_edit.setFixedWidth, enabled=animate)
             if animate:
                 self.tvdb_edit.setFocus()
         elif self.tvdb_edit.isHidden():
             self.tvdb_edit.setFixedWidth(0)
         else:
-            _animate(self, self.tvdb_edit.width(), 0, self.tvdb_edit.setFixedWidth,
-                     on_done=self.tvdb_edit.hide, enabled=animate)
+            self._run_animation("tvdb", self.tvdb_edit.width(), 0, self.tvdb_edit.setFixedWidth,
+                                on_done=self.tvdb_edit.hide, enabled=animate)
 
     def _restore_geometry(self):
         geo = self.cfg.get("window_geometry")
@@ -3257,7 +3320,9 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
-        QTimer.singleShot(0, self._apply_split_sizes)
+        if not self._shown_once:          # (restoring from minimized keeps the user's sizes)
+            self._shown_once = True
+            QTimer.singleShot(0, self._apply_split_sizes)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -3406,7 +3471,6 @@ class MainWindow(QMainWindow):
             self.table.set_modern(True, self.cfg.get("density", "comfortable"))
             self._update_panel_orientation()
             self._set_details_visible(self.cfg.get("show_details", True))
-            QTimer.singleShot(0, self._apply_split_sizes)
         self._apply_theme()
         self._update_layout_menu()
         self._update_library_label()

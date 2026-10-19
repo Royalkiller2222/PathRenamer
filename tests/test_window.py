@@ -185,3 +185,52 @@ def test_layout_options_apply_without_switching(main, make_window, qapp):
     assert _wait_until(qapp, lambda: w._split_main.orientation() == Qt.Orientation.Vertical)
     assert _wait_until(qapp, w.details.isHidden)
     assert not w.act_details.isChecked()
+
+
+# ── regressions found in review ─────────────────────────────────────────────
+def test_classic_shows_list_and_table_after_switching_from_modern(main, make_window, qapp, tmp_path):
+    w = make_window()
+    _preview(main, w, make_files(tmp_path / "dl", "Movie.2019.mkv"))
+    w.show(); _wait(qapp, 30)
+    w._set_layout("classic"); _wait(qapp, 30)
+    assert w.file_list.isVisible() and w.table.isVisible()
+    w._set_layout("modern"); _wait(qapp, 30)
+    assert w.file_list.isVisible() and w.table.isVisible()
+
+
+def test_quick_forced_automatic_forced_keeps_the_id_box(main, make_window, qapp):
+    w = make_window()
+    w.show(); w.resize(1200, 760); _wait(qapp, 30)
+    w.match_combo.setCurrentIndex(1); _wait(qapp, 40)
+    w.match_combo.setCurrentIndex(0); _wait(qapp, 40)
+    w.match_combo.setCurrentIndex(1)
+    assert _wait_until(qapp, lambda: not w._anims)
+    assert w.tvdb_edit.isVisible() and w.tvdb_edit.width() == 130
+
+
+def test_quick_hide_then_show_details_ends_shown(main, make_window, qapp):
+    w = make_window()
+    w.show(); w.resize(1200, 760); _wait(qapp, 50)
+    w._toggle_details(False); _wait(qapp, 40)
+    w._toggle_details(True)
+    assert _wait_until(qapp, lambda: not w._anims)
+    assert not w.details.isHidden() and w._split_preview.sizes()[1] > 100
+
+
+def test_switching_layout_while_a_panel_slides(main, make_window, qapp):
+    w = make_window()
+    w.show(); w.resize(1200, 760); _wait(qapp, 50)
+    w._toggle_details(False); _wait(qapp, 30)
+    w._set_layout("classic")
+    _wait(qapp, 400)                     # slot errors would fail the test
+    w._set_layout("modern"); _wait(qapp, 100)
+    assert not w._anims
+
+
+def test_restoring_the_window_keeps_pane_sizes(main, make_window, qapp):
+    w = make_window()
+    w.show(); w.resize(1200, 760); _wait(qapp, 50)
+    w._split_main.setSizes([500, 650]); _wait(qapp, 20)
+    before = w._split_main.sizes()
+    w.hide(); _wait(qapp, 20); w.show(); _wait(qapp, 50)
+    assert w._split_main.sizes() == before
