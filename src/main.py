@@ -1,4 +1,4 @@
-import sys, os, json, re, shutil, gzip, time, xml.etree.ElementTree as ET, logging, traceback
+import sys, os, json, re, shutil, gzip, time, xml.etree.ElementTree as ET, logging, traceback, html, functools
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
@@ -60,6 +60,8 @@ sys.excepthook = _global_except_hook
 import requests
 import re
 from parser import analyse_path
+from scanner import (SUBTITLE_EXTENSIONS, detect_subtitle_language, is_language_only_name,
+                     unique_subtitle_filename)
 from rapidfuzz import fuzz
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -68,11 +70,13 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QDialog, QFormLayout, QCheckBox, QDialogButtonBox,
     QGroupBox, QTabWidget, QListWidget, QListWidgetItem, QScrollArea,
     QGridLayout, QFrame, QScrollBar, QSizePolicy, QTextEdit,
-    QMenu, QInputDialog,
+    QMenu, QInputDialog, QStyledItemDelegate, QSplitter, QStackedWidget, QButtonGroup,
 )
-from PyQt6.QtGui import QColor, QAction, QDesktopServices, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import (QColor, QAction, QActionGroup, QDesktopServices, QDragEnterEvent,
+                         QDropEvent, QKeySequence, QShortcut, QPainter, QPalette)
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QUrl, QTimer
+from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QObject, QUrl, QTimer, QVariantAnimation,
+                          QEasingCurve, QByteArray)
 
 # ═══════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -97,7 +101,18 @@ DEFAULTS = {
     "cleanup_empty_folders": True,
     "confirm_rename": True,
     "first_run": True,
+    # Window layout (Settings → Appearance → Layout)
+    "layout": "modern",            # "modern" | "classic"
+    "panel_mode": "auto",          # modern: "auto" (by window width) | "side" | "stacked"
+    "density": "comfortable",      # modern: "comfortable" | "compact"
+    "show_details": True,          # modern: details panel under the preview
+    "animations": True,            # modern: smooth panel animations
+    "files_ratio": 0.3,            # modern: share of the window for the file list
 }
+
+LAYOUTS = ("modern", "classic")
+PANEL_MODES = ("auto", "side", "stacked")
+DENSITIES = ("comfortable", "compact")
 
 # Previous default movie templates. cfg_load() upgrades configs that still
 # use one of them to the current default.
@@ -127,7 +142,7 @@ def cfg_save(cfg):
 #  SCANNER
 # ═══════════════════════════════════════════════════════════════════
 VIDEO_EXT = {".mkv",".mp4",".avi",".mov",".wmv",".m4v",".ts",".m2ts",".flv",".webm",".mpg",".mpeg"}
-SUB_EXT   = {".srt",".sub",".ass",".ssa",".vtt",".idx"}
+SUB_EXT   = set(SUBTITLE_EXTENSIONS)     # .srt .sub .idx .ass .ssa .vtt .sup .smi
 
 # Sub-folders holding samples and bonus material, not episodes or movies
 # (Plex's extras folder names plus the usual release-folder ones).
@@ -166,56 +181,137 @@ def _sub_matches_video(sub_stem, video_stem):
         start = s.find(v, start + 1)
     return False
 
-def find_subtitle_siblings(video):
-    """Find subtitles in same dir and Subs folder."""
-    subs = []
-    seen = set()
+# Folders next to a video that hold its subtitles (compared lower-case)
+SUBTITLE_DIR_NAMES = {"subs", "subtitles", "subtitle", "sub", "captions", "vobsub", "english", "字幕"}
+# S01E02 / 1x02, with the text before it (the show name)
+_EPISODE_TAG = re.compile(r"(?i)(?<![a-z0-9])s(\d{1,2})[ ._-]?e(\d{1,3})(?!\d)|(?<![0-9])(\d{1,2})x(\d{2,3})(?!\d)")
 
-    def _add(f):
-        key = os.path.normcase(str(f))
-        if key not in seen:
-            seen.add(key)
-            subs.append(f)
+@functools.lru_cache(maxsize=8192)
+def _episode_tag(stem):
+    """(show name squashed to lower-case letters/digits, (season, episode)) or None."""
+    m = _EPISODE_TAG.search(stem)
+    if not m:
+        return None
+    season, episode = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+    return re.sub(r"[\W_]+", "", stem[:m.start()].lower()), (int(season), int(episode))
 
-    parent = video.parent
+# What may follow a show name and still be the same show: a year or a country
+# ("doctorwho" / "doctorwho2005", "theoffice" / "theofficeus"), not more words
+# ("lost" / "lostgirl" are different shows).
+_SAME_SHOW_SUFFIX = re.compile(r"(?:19|20)\d\d|us|uk|au|nz|ca")
 
-    # Same directory: subtitle stem starts with the video stem (handles .en.srt etc.)
-    if parent.exists() and parent.is_dir():
-        for f in parent.iterdir():
-            if f.is_file() and f.suffix.lower() in SUB_EXT:
-                if f.stem.lower().startswith(video.stem.lower()) and _sub_matches_video(f.stem, video.stem):
-                    log.debug(f"Found sub in same dir: {f}")
-                    _add(f)
+def _same_show(a, b):
+    if a == b:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    return bool(short) and long_.startswith(short) and bool(_SAME_SHOW_SUFFIX.fullmatch(long_[len(short):]))
 
-    # Subtitle sub-folders next to the video (Subs/, Subtitles/, ...)
-
-    SUBTITLE_FOLDER_NAMES = ["Subs", "Subtitles", "sub", "subtitle", "subs", "captions", "字幕", "VobSub", "VOBSUB", "English"]
-    # A release folder with a single video: everything in its Subs folder belongs
-    # to that video, whatever the subtitle files are called ("Subs/2_English.srt").
+def _list_dir(folder):
+    """(file names, folder names) in folder, sorted case-insensitively.
+    os.scandir gives the entry types with the listing, which keeps this fast
+    in download folders with thousands of entries."""
+    files, dirs = [], []
     try:
-        only_video = sum(1 for f in parent.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXT
-                         and not _SAMPLE_FILE.search(f.stem)) == 1
+        with os.scandir(folder) as it:
+            for e in it:
+                try:
+                    if e.is_file():
+                        files.append(e.name)
+                    elif e.is_dir():
+                        dirs.append(e.name)
+                except OSError:
+                    pass
     except OSError:
-        only_video = False
-    seen_dirs = set()
-    for sub_dir_name in SUBTITLE_FOLDER_NAMES:
-        sub_dir = parent / sub_dir_name
-        dir_key = os.path.normcase(str(sub_dir))
-        if dir_key in seen_dirs or not sub_dir.is_dir():
+        return [], []
+    files.sort(key=str.lower)
+    dirs.sort(key=str.lower)
+    return files, dirs
+
+def _split_name(name):
+    """("Movie.en", ".srt") like Path.stem / Path.suffix, for a bare file name."""
+    i = name.rfind(".")
+    return (name[:i], name[i:].lower()) if i > 0 else (name, "")
+
+def find_subtitle_siblings(video):
+    """Subtitles that belong to a video: next to it, in a Subs/Subtitles folder
+    beside it, or in a per-episode folder inside that (season packs:
+    "Subs/<video name>/2_English.srt").
+
+    A subtitle belongs to the video when
+      - it is named after the video ("Movie.en.srt"), unless another video in
+        the folder has a longer name it also matches ("Movie.Extended.en.srt");
+      - the video is the only one in its folder and the subtitle is named only
+        by language ("English.srt"), or sits in the Subs folder (any name);
+      - (season packs) it has the same SxxEyy and show name as the video and no
+        other video in the folder has that episode.
+    """
+    parent = video.parent
+    vstem = video.stem
+    names, dirnames = _list_dir(parent)
+    own = os.path.normcase(video.name)
+    others = []                          # names (without extension) of the other videos
+    for n in names:
+        stem, ext = _split_name(n)
+        if ext in VIDEO_EXT and os.path.normcase(n) != own and not _SAMPLE_FILE.search(stem):
+            others.append(stem)
+    only_video = not others
+    tag = _episode_tag(vstem)
+    episode_unique = tag is not None and not any(
+        (t := _episode_tag(o)) and t[1] == tag[1] for o in others)
+
+    def same_episode(stem, in_sub_dir):
+        if not episode_unique:
+            return False
+        t = _episode_tag(stem)
+        if not t or t[1] != tag[1]:
+            return False
+        if not t[0]:                     # "Subs/S01E02.eng.srt"
+            return in_sub_dir
+        return bool(tag[0]) and _same_show(t[0], tag[0])
+
+    def other_episode(stem):
+        # Named for another episode: e.g. one episode downloaded from a season
+        # pack whose Subs folder still has every episode's subtitles
+        t = _episode_tag(stem)
+        return t is not None and tag is not None and t[1] != tag[1]
+
+    def belongs(stem, in_sub_dir, folder=False):
+        if _sub_matches_video(stem, vstem):
+            # "Movie.Extended.en.srt" belongs to "Movie.Extended.mkv", not "Movie.mkv"
+            return not any(len(o) > len(vstem) and _sub_matches_video(stem, o) for o in others)
+        if other_episode(stem):
+            return False
+        lone = only_video and ((in_sub_dir and not folder) or is_language_only_name(stem))
+        if not (lone or same_episode(stem, in_sub_dir)):
+            return False
+        return not any(_sub_matches_video(stem, o) for o in others)   # named after another video
+
+    subs = []
+    def _add(folder, name, where):
+        f = folder / name
+        subs.append(f)
+        log.debug(f"Found sub ({where}): {f}")
+
+    for n in names:
+        stem, ext = _split_name(n)
+        if ext in SUB_EXT and belongs(stem, False):
+            _add(parent, n, "next to the video")
+
+    for d in dirnames:
+        if d.strip().lower() not in SUBTITLE_DIR_NAMES:
             continue
-        seen_dirs.add(dir_key)
-        for f in sorted(sub_dir.iterdir()):
-            if f.is_file() and f.suffix.lower() in SUB_EXT:
-                if only_video or _sub_matches_video(f.stem, video.stem):
-                    log.debug(f"Found sub in Sub folder: {f}")
-                    _add(f)
-        # Season packs: Subs/<video name>/2_English.srt
-        nested = sub_dir / video.stem
-        if nested.is_dir():
-            for f in sorted(nested.iterdir()):
-                if f.is_file() and f.suffix.lower() in SUB_EXT:
-                    log.debug(f"Found sub in per-episode Sub folder: {f}")
-                    _add(f)
+        sub_dir = parent / d
+        files, nested = _list_dir(sub_dir)
+        for n in files:
+            stem, ext = _split_name(n)
+            if ext in SUB_EXT and belongs(stem, True):
+                _add(sub_dir, n, "Subs folder")
+        for nd in nested:
+            # Season packs: Subs/<video name>/ or Subs/S01E02/
+            if belongs(nd.strip(), True, folder=True):
+                for n in _list_dir(sub_dir / nd)[0]:
+                    if _split_name(n)[1] in SUB_EXT:
+                        _add(sub_dir / nd, n, "per-episode Subs folder")
 
     log.debug(f"Total subs found for {video.name}: {len(subs)}")
     return subs
@@ -391,22 +487,44 @@ def _is_inside(child: Path, root: Path) -> bool:
 
 class Renamer:
     def __init__(self): self._history = []
+
+    @staticmethod
+    def _move(src, dst):
+        op = RenameOp(src=src, dst=dst)
+        try:
+            if not src.exists():
+                raise FileNotFoundError(f"Source no longer exists: {src}")
+            if dst.exists() and not _same_path(dst, src):
+                raise FileExistsError(f"Exists: {dst}")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            op.success = True
+        except Exception as e:
+            op.error = str(e)
+        return op
+
     def execute(self, ops, dest_root=None):
+        """Move each (src, dst) pair on its own; one undo step for all."""
+        return self.execute_groups([(op, []) for op in ops], dest_root)
+
+    def execute_groups(self, groups, dest_root=None):
+        """groups: [((video src, dst), [(subtitle src, dst), ...]), ...].
+        A video's subtitles are moved only if the video was, so a failed move
+        never leaves its subtitles alone in the library. One undo step for all."""
         result, batch = RenameResult(), []
-        for src, dst in ops:
-            op = RenameOp(src=src, dst=dst)
-            try:
-                if not src.exists():
-                    raise FileNotFoundError(f"Source no longer exists: {src}")
-                if dst.exists() and not _same_path(dst, src):
-                    raise FileExistsError(f"Exists: {dst}")
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(dst))
-                op.success = True
-            except Exception as e:
-                op.error = str(e)
+        for (src, dst), sub_ops in groups:
+            op = self._move(src, dst)
             result.ops.append(op)
-            if op.success: batch.append(op)
+            if op.success:
+                batch.append(op)
+            for s, d in sub_ops:
+                if not op.success:
+                    result.ops.append(RenameOp(src=s, dst=d, error="Skipped: its video was not moved"))
+                    continue
+                sop = self._move(s, d)
+                result.ops.append(sop)
+                if sop.success:
+                    batch.append(sop)
         if batch: self._history.append((batch, dest_root))
         return result
     def can_undo(self): return bool(self._history)
@@ -805,62 +923,22 @@ class MatchEngine:
         return self.match_with_override(path, media_type)
 
     def _transform_subtitle_dest(self, cand, is_subtitle, output_counts=None):
-        """If cand is for a subtitle file, transform destination to Plex subtitle format.
-        
-        output_counts: dict to track used output filenames to handle duplicates.
+        """For a subtitle file matched on its own (no video picked), turn the
+        video-style destination into a Plex subtitle name next to where the
+        video goes: "Show S01E01 - Title.eng.forced.srt".
+
+        output_counts: {destination folder: set of names used}, shared across
+        a scan so two subtitles never get the same name.
         """
-        if not is_subtitle:
+        if not is_subtitle or cand.error:
             return cand
-
-        try:
-            from scanner import detect_subtitle_language, format_subtitle_filename
-        except ImportError:
-            return cand
-
         src = cand.source
         lang, flags = detect_subtitle_language(src)
-
-        # dest_rel was built as if the subtitle were a video file
-        dest_rel = cand.dest_rel
-
-        # Use the video name (without extension) as the subtitle base name
-        dest_path = Path(dest_rel)
-        video_stem = dest_path.stem
-
-        # e.g. "Show - S01E01 - Title.eng.forced.srt"
-        new_sub_name = format_subtitle_filename(video_stem, lang, src.suffix.lower(), flags if flags else None)
-
-        # Avoid two subtitles getting the same output name in one folder
-        if output_counts is not None:
-            sub_dir = str(dest_path.parent)
-            if sub_dir not in output_counts:
-                output_counts[sub_dir] = {}
-
-            used_names = output_counts[sub_dir]
-
-            if new_sub_name in used_names:
-                # Name already taken: add a counter suffix (-1, -2, ...)
-                base_stem = Path(new_sub_name).stem
-                ext = src.suffix.lower()
-                counter = used_names[new_sub_name]
-
-
-                while True:
-                    variant_name = f"{base_stem}-{counter}{ext}"
-                    if variant_name not in used_names:
-                        new_sub_name = variant_name
-                        break
-                    counter += 1
-                    if counter > 100:
-                        new_sub_name = f"{base_stem}-x{counter}{ext}"
-                        break
-
-            used_names[new_sub_name] = used_names.get(new_sub_name, 0) + 1
-
-
-        new_dest_rel = str(dest_path.parent / new_sub_name).replace("\\", "/")
-
-        cand.dest_rel = new_dest_rel
+        dest_path = Path(cand.dest_rel)          # built as if the subtitle were the video
+        taken = set() if output_counts is None else output_counts.setdefault(
+            str(dest_path.parent).lower(), set())
+        name = unique_subtitle_filename(dest_path.stem, lang, src.suffix.lower(), flags, taken)
+        cand.dest_rel = str(dest_path.parent / name).replace("\\", "/")
         return cand
 
     def search_all_matches(self, path, media_type):
@@ -1121,41 +1199,20 @@ class MatchEngine:
         return c
 
     def _subs(self, video, video_rel, cand):
-        if not self.cfg.get("rename_subtitles", True): return
-        try:
-            from scanner import detect_subtitle_language, format_subtitle_filename
-            has_scanner = True
-        except ImportError:
-            has_scanner = False
-
+        """Add the video's subtitles to cand, each with its Plex name next to
+        the renamed video: "Movie (2010).eng.srt", "Movie (2010).spa.forced.srt".
+        Two subtitles with the same language and flags are numbered
+        ("Movie (2010).2.eng.srt") so neither overwrites the other."""
+        if not self.cfg.get("rename_subtitles", True):
+            return
         dest = Path(video_rel)
-        video_stem = dest.stem
-
-        seen_srcs, seen_dests = set(), set()
+        taken = set()
         for sub in find_subtitle_siblings(video):
             if _same_path(sub, video):
                 continue
-            src_key = os.path.normcase(str(sub))
-            if src_key in seen_srcs:
-                continue
-            seen_srcs.add(src_key)
-            if has_scanner:
-                lang, flags = detect_subtitle_language(sub)
-                new_name = format_subtitle_filename(video_stem, lang, sub.suffix.lower(), flags if flags else None)
-                new_sub_dest = str(dest.parent / new_name).replace("\\", "/")
-            else:
-                extra = sub.name[len(video.stem):]
-                new_sub_dest = str(dest.parent / (video_stem + extra)).replace("\\", "/")
-
-            # Two subtitles with the same language/flags: number the later ones
-            if new_sub_dest.lower() in seen_dests:
-                p = Path(new_sub_dest)
-                n = 1
-                while f"{p.parent}/{p.stem}-{n}{p.suffix}".lower() in seen_dests:
-                    n += 1
-                new_sub_dest = str(p.parent / f"{p.stem}-{n}{p.suffix}")
-            seen_dests.add(new_sub_dest.lower())
-            cand.subtitles.append((sub, new_sub_dest))
+            lang, flags = detect_subtitle_language(sub, video.stem)
+            name = unique_subtitle_filename(dest.stem, lang, sub.suffix.lower(), flags, taken)
+            cand.subtitles.append((sub, str(dest.parent / name).replace("\\", "/")))
 
 # ═══════════════════════════════════════════════════════════════════
 #  THEMES
@@ -1285,6 +1342,82 @@ QLabel#preview_label{background:#f1efec;border:1px solid #ddd8d0;border-radius:4
 
 THEMES = {"dark": DARK, "midnight": MIDNIGHT, "light": LIGHT}
 
+# Each theme's colours (all taken from the stylesheets above), for the
+# Modern layout and the details panel. Layouts change shapes and spacing,
+# never colours.
+PALETTES = {
+    "dark": dict(bg="#0b100b", surface="#131b13", border="#234023", text="#c2dcc2",
+                 accent="#4ade80", button="#162116", button_border="#2a4d2a", hover="#1e2e1e",
+                 pressed="#274027", bar="#080c08", muted="#7ba37b", grid="#182418",
+                 disabled="#4a5f4a", soft="#101710"),
+    "midnight": dict(bg="#060a12", surface="#0d1524", border="#1b2b4a", text="#bcd0f0",
+                     accent="#4d9fff", button="#101a2e", button_border="#22355c", hover="#16233d",
+                     pressed="#1d2f52", bar="#04070d", muted="#5d739e", grid="#111c30",
+                     disabled="#44577e", soft="#0b1220"),
+    "light": dict(bg="#faf9f7", surface="#ffffff", border="#ddd8d0", text="#262421",
+                  accent="#5b5bd6", button="#f1efec", button_border="#ddd8d0", hover="#e9e6e1",
+                  pressed="#ddd8d0", bar="#f1efec", muted="#706a5f", grid="#e5e1da",
+                  disabled="#a8a29a", soft="#f1efec"),
+}
+
+# Rules for the Modern layout and the sidebar Settings window. Every rule is
+# scoped to #modernRoot / #settingsModern, so the Classic layout is untouched.
+_MODERN_QSS = """
+QWidget#modernRoot{background:%(bg)s}
+#modernRoot QFrame#topBar{background:%(bar)s;border:none;border-bottom:1px solid %(border)s}
+#modernRoot QFrame#card{background:%(bg)s;border:1px solid %(border)s;border-radius:10px}
+#modernRoot QFrame#actionBar{background:%(bg)s;border:none;border-top:1px solid %(border)s}
+#modernRoot QLabel#paneTitle{color:%(accent)s;font-weight:bold;font-size:12px;letter-spacing:1px;background:transparent}
+#modernRoot QLabel#paneCount,#modernRoot QLabel#muted{color:%(muted)s;background:transparent}
+#modernRoot QLabel#summary{color:%(muted)s;background:transparent;padding-left:2px}
+#modernRoot QLineEdit#srcEdit{padding:7px 10px;border-radius:8px}
+#modernRoot QComboBox{border-radius:8px;padding:6px 10px}
+#modernRoot QPushButton{border-radius:8px;padding:7px 16px}
+#modernRoot QPushButton#flat{background:transparent;border:1px solid transparent;color:%(muted)s;padding:4px 8px;font-weight:normal}
+#modernRoot QPushButton#flat:hover{background:%(hover)s;border-color:%(button_border)s;color:%(text)s}
+#modernRoot QPushButton#flat:disabled{color:%(disabled)s}
+#modernRoot QPushButton#link{background:transparent;border:none;color:%(accent)s;padding:0 4px;font-weight:normal;text-decoration:underline}
+#modernRoot QPushButton#seg{padding:7px 14px}
+#modernRoot QPushButton#seg:checked{background:%(pressed)s;color:%(accent)s;border-color:%(accent)s}
+#modernRoot QFrame#dropZone{background:%(bg)s;border:2px dashed %(border)s;border-radius:10px}
+#modernRoot QFrame#dropZone[hover="true"]{border-color:%(accent)s;background:%(soft)s}
+#modernRoot QLabel#dropTitle{color:%(text)s;font-size:15px;font-weight:bold;background:transparent}
+#modernRoot QLabel#dropHint{color:%(muted)s;background:transparent}
+#modernRoot QLabel#emptyHint{color:%(muted)s;background:transparent;font-size:13px}
+#modernRoot QListWidget{border:none;background:%(bg)s;border-radius:6px}
+#modernRoot QListWidget::item{padding:%(list_pad)s;border-radius:6px;margin:1px 0}
+#modernRoot QTableWidget{border:none;background:%(bg)s}
+#modernRoot QHeaderView::section{background:%(bg)s}
+#modernRoot QLabel#details{background:transparent;color:%(text)s}
+#modernRoot QSplitter::handle{background:transparent}
+#modernRoot QSplitter::handle:hover{background:%(border)s}
+#modernRoot QProgressBar#slimProgress{border:none;border-radius:2px;background:%(surface)s;max-height:4px;min-height:4px}
+#modernRoot QProgressBar#slimProgress::chunk{background:%(accent)s;border-radius:2px}
+#modernRoot QScrollBar:vertical{background:transparent;width:10px;margin:2px}
+#modernRoot QScrollBar:horizontal{background:transparent;height:10px;margin:2px}
+#modernRoot QScrollBar::handle:vertical{background:%(border)s;border-radius:3px;min-height:28px}
+#modernRoot QScrollBar::handle:horizontal{background:%(border)s;border-radius:3px;min-width:28px}
+#modernRoot QScrollBar::handle:hover{background:%(button_border)s}
+#modernRoot QScrollBar::add-line,#modernRoot QScrollBar::sub-line{width:0;height:0;border:none;background:none}
+#modernRoot QScrollBar::add-page,#modernRoot QScrollBar::sub-page{background:none}
+QDialog#settingsModern QListWidget#settingsNav{background:%(bar)s;border:none;border-right:1px solid %(border)s;padding:8px 6px;outline:0}
+QDialog#settingsModern QListWidget#settingsNav::item{padding:9px 14px;border-radius:8px;margin:1px 0;color:%(text)s}
+QDialog#settingsModern QListWidget#settingsNav::item:selected{background:%(pressed)s;color:%(accent)s}
+QDialog#settingsModern QListWidget#settingsNav::item:hover:!selected{background:%(hover)s}
+QDialog#settingsModern QGroupBox{border-radius:10px;margin-top:12px;padding-top:12px}
+QDialog#settingsModern QPushButton{border-radius:8px}
+QDialog#settingsModern QLineEdit,QDialog#settingsModern QComboBox{border-radius:8px}
+"""
+
+def modern_qss(theme, density="comfortable"):
+    pal = dict(PALETTES.get(theme, PALETTES["dark"]))
+    pal["list_pad"] = "3px 8px" if density == "compact" else "7px 10px"
+    return _MODERN_QSS % pal
+
+def app_stylesheet(theme, density="comfortable"):
+    """The theme's stylesheet plus the (scoped) Modern rules."""
+    return THEMES.get(theme, DARK) + modern_qss(theme, density)
+
 def tab_style_for(theme):
     """QTabWidget/QTabBar styling matched to each theme's palette."""
     if theme == "midnight":
@@ -1320,22 +1453,48 @@ class SettingsDialog(QDialog):
         self.setMinimumHeight(500)
         L = QVBoxLayout(self)
 
-        tabs = QTabWidget()
-
         theme = self.cfg.get("theme", "dark")
-        tab_style = self._get_tab_style(theme)
-        tabs.setStyleSheet(tab_style)
-
-        tabs.addTab(self._build_folders_tab(theme), "Folders")
-        tabs.addTab(self._build_formats_tab(theme), "Formats")
-        tabs.addTab(self._build_appearance_tab(theme), "Appearance")
-        tabs.addTab(self._build_options_tab(theme), "Options")
-        tabs.addTab(self._build_api_tab(theme), "API Keys")
-        tabs.addTab(self._build_about_tab(theme), "About")
-        L.addWidget(tabs)
+        pages = [
+            ("Folders", self._build_folders_tab(theme)),
+            ("Formats", self._build_formats_tab(theme)),
+            ("Appearance", self._build_appearance_tab(theme)),
+            ("Options", self._build_options_tab(theme)),
+            ("API Keys", self._build_api_tab(theme)),
+            ("About", self._build_about_tab(theme)),
+        ]
+        self.nav = None
+        if self.cfg.get("layout", "modern") == "modern":
+            # Sidebar navigation (styled by the #settingsModern rules)
+            self.setObjectName("settingsModern")
+            self.setMinimumWidth(720)
+            L.setContentsMargins(0, 0, 0, 12)
+            body = QHBoxLayout(); body.setSpacing(0)
+            self.nav = QListWidget(); self.nav.setObjectName("settingsNav")
+            self.nav.setFixedWidth(170)
+            self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            stack = QStackedWidget()
+            for name, page in pages:
+                self.nav.addItem(name)
+                page.layout().setContentsMargins(18, 14, 18, 8)
+                stack.addWidget(page)
+            self.nav.currentRowChanged.connect(stack.setCurrentIndex)
+            self.nav.setCurrentRow(0)
+            body.addWidget(self.nav); body.addWidget(stack, 1)
+            L.addLayout(body, 1)
+        else:
+            tabs = QTabWidget()
+            tabs.setStyleSheet(self._get_tab_style(theme))
+            for name, page in pages:
+                tabs.addTab(page, name)
+            L.addWidget(tabs)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self._save); btns.rejected.connect(self.reject); L.addWidget(btns)
+        btns.accepted.connect(self._save); btns.rejected.connect(self.reject)
+        if self.nav is not None:
+            row = QHBoxLayout(); row.setContentsMargins(0, 0, 14, 0); row.addWidget(btns)
+            L.addLayout(row)
+        else:
+            L.addWidget(btns)
 
     def _get_tab_style(self, theme):
         return tab_style_for(theme)
@@ -1450,6 +1609,47 @@ class SettingsDialog(QDialog):
         gl.addRow("Color Scheme:", self.theme_combo)
 
         L.addWidget(grp)
+
+        grp_layout = QGroupBox("Layout")
+        fl = QFormLayout(grp_layout)
+        self.layout_combo = QComboBox()
+        self.layout_combo.addItems(["Modern — side-by-side panes", "Classic — original layout"])
+        self.layout_combo.setCurrentIndex(LAYOUTS.index(self.cfg.get("layout", "modern"))
+                                          if self.cfg.get("layout") in LAYOUTS else 0)
+        fl.addRow("Window layout:", self.layout_combo)
+
+        self.panel_combo = QComboBox()
+        self.panel_combo.addItems(["Automatic (by window width)", "Side by side", "Stacked"])
+        pm = self.cfg.get("panel_mode", "auto")
+        self.panel_combo.setCurrentIndex(PANEL_MODES.index(pm) if pm in PANEL_MODES else 0)
+        fl.addRow("File list position:", self.panel_combo)
+
+        self.density_combo = QComboBox()
+        self.density_combo.addItems(["Comfortable", "Compact"])
+        dn = self.cfg.get("density", "comfortable")
+        self.density_combo.setCurrentIndex(DENSITIES.index(dn) if dn in DENSITIES else 0)
+        fl.addRow("Row spacing:", self.density_combo)
+
+        self.show_details_chk = QCheckBox("Show the details panel (where each file and subtitle goes)")
+        self.show_details_chk.setChecked(self.cfg.get("show_details", True))
+        fl.addRow(self.show_details_chk)
+
+        self.animations_chk = QCheckBox("Smooth animations")
+        self.animations_chk.setChecked(self.cfg.get("animations", True))
+        fl.addRow(self.animations_chk)
+
+        layout_hint = QLabel("The Modern options apply to the Modern layout. "
+                             "Colors always follow the theme above.")
+        layout_hint.setWordWrap(True)
+        layout_hint.setStyleSheet("color:#888;font-size:11px")
+        fl.addRow(layout_hint)
+
+        def _modern_only(index):
+            for wdg in (self.panel_combo, self.density_combo, self.show_details_chk, self.animations_chk):
+                wdg.setEnabled(index == 0)
+        self.layout_combo.currentIndexChanged.connect(_modern_only)
+        _modern_only(self.layout_combo.currentIndex())
+        L.addWidget(grp_layout)
 
         grp2 = QGroupBox("Table Display")
         gl2 = QFormLayout(grp2)
@@ -1602,6 +1802,11 @@ class SettingsDialog(QDialog):
             "episode_tv": ep_map[self.episode_tv.currentIndex()],
             "episode_anime": ep_map[self.episode_anime.currentIndex()],
             "theme": theme_map[self.theme_combo.currentIndex()],
+            "layout": LAYOUTS[self.layout_combo.currentIndex()],
+            "panel_mode": PANEL_MODES[self.panel_combo.currentIndex()],
+            "density": DENSITIES[self.density_combo.currentIndex()],
+            "show_details": self.show_details_chk.isChecked(),
+            "animations": self.animations_chk.isChecked(),
             "show_full_path": self.show_new_path.isChecked(),
             "show_detected": self.show_detected.isChecked(),
             "rename_subtitles": self.rename_subs.isChecked(),
@@ -1638,6 +1843,15 @@ ROW_COLORS_LIGHT = {
 COLUMNS     = ["Original Filename","Detected Match","New Path","Subtitles","Status"]
 STATUS_COL  = 4
 
+class _ElideDelegate(QStyledItemDelegate):
+    """Cut long text at a chosen end: paths keep their (informative) end."""
+    def __init__(self, mode, parent=None):
+        super().__init__(parent)
+        self._mode = mode
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.textElideMode = self._mode
+
 class RenameTable(QTableWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1645,6 +1859,9 @@ class RenameTable(QTableWidget):
         self._dest_root = ""
         self._show_detected = True
         self._show_full_path = True
+        self._modern = False
+        self._elide_middle = _ElideDelegate(Qt.TextElideMode.ElideMiddle, self)
+        self._elide_left = _ElideDelegate(Qt.TextElideMode.ElideLeft, self)
         self._row_colors = ROW_COLORS_DARK
         self.setColumnCount(len(COLUMNS))
         self.setHorizontalHeaderLabels(COLUMNS)
@@ -1669,6 +1886,43 @@ class RenameTable(QTableWidget):
         self._show_full_path = show_full_path
         self.setColumnHidden(1, not show_detected)
 
+    def set_modern(self, modern: bool, density: str = "comfortable"):
+        """Modern layout: one line per row (no wrapping), long paths cut at the
+        start, smooth scrolling, subtitle counts instead of names. Classic
+        keeps the original wrapped rows."""
+        self._modern = modern
+        hh, vh = self.horizontalHeader(), self.verticalHeader()
+        if modern:
+            self.setWordWrap(False)
+            self.setShowGrid(False)
+            self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            self.setItemDelegateForColumn(0, self._elide_middle)
+            self.setItemDelegateForColumn(2, self._elide_left)
+            vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+            vh.setDefaultSectionSize(26 if density == "compact" else 34)
+            hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+            hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.horizontalHeaderItem(STATUS_COL).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.setColumnWidth(1, 200)
+        else:
+            self.setWordWrap(True)
+            self.setShowGrid(True)
+            self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerItem)
+            self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerItem)
+            for col in (0, 2):
+                self.setItemDelegateForColumn(col, None)
+            vh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+            vh.setDefaultSectionSize(30)
+            hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            hh.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        if self._cands:
+            self.populate(self._cands, self._dest_root)
+
     def set_light_mode(self, light: bool):
         self._row_colors = ROW_COLORS_LIGHT if light else ROW_COLORS_DARK
         if self._cands:
@@ -1689,7 +1943,9 @@ class RenameTable(QTableWidget):
             bg, fg, status = *self._row_colors["low"], f"? Low ({int(c.confidence*100)}%)"
 
         sub_count = len(c.subtitles) if hasattr(c, "subtitles") and c.subtitles else 0
-        if sub_count > 0:
+        if self._modern:
+            sub_text = f"{sub_count} subtitle{'s' if sub_count != 1 else ''}" if sub_count else "—"
+        elif sub_count > 0:
             sub_names = ", ".join(s.name for s, _ in c.subtitles[:5])
             if sub_count > 5:
                 sub_text = f"{sub_names} +{sub_count-5} more"
@@ -1697,13 +1953,20 @@ class RenameTable(QTableWidget):
                 sub_text = sub_names
         else:
             sub_text = "None"
+        # Hovering the Subtitles cell shows where each subtitle goes
+        sub_tip = "\n".join(f"{s.name}  →  {Path(d).name}" for s, d in c.subtitles) if sub_count else ""
 
-        for col, text in enumerate([c.source.name, detected, new_path, sub_text, status]):
+        texts = [c.source.name, detected, new_path, sub_text, status]
+        tips = [str(c.source), "", new_path, sub_tip, c.error]
+        for col, text in enumerate(texts):
             item = QTableWidgetItem(text)
             item.setBackground(bg); item.setForeground(fg)
+            if tips[col]:
+                item.setToolTip(tips[col])
             if col == STATUS_COL: item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.setItem(row, col, item)
-        self.resizeRowToContents(row)
+        if not self._modern:
+            self.resizeRowToContents(row)
 
     def populate(self, cands, dest_root):
         self._cands = cands
@@ -1780,9 +2043,17 @@ class ScanWorker(QObject):
 
     def run(self):
         log.info(f"Scan started: {len(self.files)} file(s), type={self.media_type}, dest={self.dest_root}")
-        for i, f in enumerate(self.files):
+        # Videos first: their subtitles are renamed with them, so a subtitle
+        # file that was also added to the list on its own is not done twice.
+        files = ([f for f in self.files if f.suffix.lower() not in SUB_EXT] +
+                 [f for f in self.files if f.suffix.lower() in SUB_EXT])
+        claimed = set()      # subtitles already renamed together with a video
+        for i, f in enumerate(files):
             try:
                 log.debug(f"Matching: {f.name}")
+                if f.suffix.lower() in SUB_EXT and os.path.normcase(str(f)) in claimed:
+                    log.debug("  -> renamed with its video")
+                    continue
 
                 if not f.exists():
                     self.candidate_ready.emit(Candidate(
@@ -1815,12 +2086,14 @@ class ScanWorker(QObject):
                     if not _same_path(owner, f):
                         cand.error = f"Same new name as {owner.name}"
                         log.warning(f"  DUPLICATE: {f.name} and {owner.name} -> {dest}")
+                    else:
+                        claimed.update(os.path.normcase(str(s)) for s, _ in cand.subtitles)
                 self.candidate_ready.emit(cand)
             except Exception as e:
                 log.exception(f"Error matching {f.name}: {e}")
                 self.candidate_ready.emit(Candidate(f, f.name, self.media_type, 0.0, error=str(e)))
             finally:
-                self.progress.emit(i + 1, len(self.files))
+                self.progress.emit(i + 1, len(files))
         log.info("Scan finished.")
         self.finished.emit()
 
@@ -2370,17 +2643,159 @@ class FormatEditorDialog(QDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  MODERN LAYOUT PIECES
+# ═══════════════════════════════════════════════════════════════════
+def _animate(owner, start, end, on_value, duration=200, on_done=None, enabled=True):
+    """Move a value smoothly from start to end, calling on_value on each step
+    (or straight to end when animations are off)."""
+    if not enabled or start == end:
+        on_value(end)
+        if on_done:
+            on_done()
+        return None
+    anim = QVariantAnimation(owner)
+    anim.setStartValue(int(start)); anim.setEndValue(int(end)); anim.setDuration(duration)
+    anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+    anim.valueChanged.connect(on_value)
+    if on_done:
+        anim.finished.connect(on_done)
+    anim.start(QVariantAnimation.DeletionPolicy.DeleteWhenStopped)
+    return anim
+
+
+class SegmentedControl(QWidget):
+    """Toggle buttons where exactly one is on: TV Shows | Movies | Anime."""
+    changed = pyqtSignal(int)
+
+    def __init__(self, labels, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(4)
+        self._group = QButtonGroup(self); self._group.setExclusive(True)
+        for i, text in enumerate(labels):
+            b = QPushButton(text); b.setObjectName("seg"); b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._group.addButton(b, i); lay.addWidget(b)
+        self._group.idClicked.connect(self.changed.emit)
+
+    def setCurrentIndex(self, i):
+        b = self._group.button(i)
+        if b is not None and not b.isChecked():
+            b.setChecked(True)
+
+    def currentIndex(self):
+        return self._group.checkedId()
+
+
+class ElidedLabel(QLabel):
+    """A one-line label that shortens its text with "…" instead of clipping it."""
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(40)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        r = self.contentsRect()
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideMiddle, r.width())
+        self.style().drawItemText(p, r, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                                  self.palette(), self.isEnabled(), text, QPalette.ColorRole.WindowText)
+
+
+class DropZone(QFrame):
+    """The empty file list: a large drag & drop target that also opens Browse."""
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("dropZone")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QVBoxLayout(self); lay.setSpacing(6)
+        title = QLabel("Drop files or folders here"); title.setObjectName("dropTitle")
+        hint = QLabel("or click to choose your downloads folder"); hint.setObjectName("dropHint")
+        for lbl in (title, hint):
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter); lbl.setWordWrap(True)
+        lay.addStretch(); lay.addWidget(title); lay.addWidget(hint); lay.addStretch()
+
+    def set_hover(self, on):
+        self.setProperty("hover", "true" if on else "false")
+        self.style().unpolish(self); self.style().polish(self)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+class DetailsPanel(QFrame):
+    """Where the selected file goes, how sure the match is, and the new name
+    of each of its subtitles."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("card")
+        self.pal = PALETTES["dark"]
+        lay = QVBoxLayout(self); lay.setContentsMargins(14, 10, 14, 10); lay.setSpacing(4)
+        title = QLabel("DETAILS"); title.setObjectName("paneTitle")
+        lay.addWidget(title)
+        self.body = QLabel(); self.body.setObjectName("details")
+        self.body.setWordWrap(True); self.body.setTextFormat(Qt.TextFormat.RichText)
+        self.body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.body.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame); scroll.setWidget(self.body)
+        lay.addWidget(scroll, 1)
+        self.show_candidate(None)
+
+    def show_candidate(self, cand, dest_root=""):
+        p, esc = self.pal, html.escape
+        muted = lambda t: f"<span style='color:{p['muted']}'>{esc(t)}</span>"
+        arrow = f"<span style='color:{p['accent']}'>&nbsp;→&nbsp;</span>"
+        if cand is None:
+            self.body.setText(muted("Select a row to see where the file and its subtitles will go."))
+            return
+        info = [f"<b>{esc(cand.source.name)}</b>", muted("from " + str(cand.source.parent))]
+        if cand.error:
+            info.append(muted("Not renamed: ") + esc(cand.error))
+        else:
+            dest = str(Path(dest_root) / cand.dest_rel) if dest_root else cand.dest_rel
+            info.append(arrow + esc(dest))
+            info.append(muted("A file with this name already exists there, so it will be skipped.")
+                        if cand.conflict else muted(f"Match confidence {int(cand.confidence * 100)}%"))
+        if cand.subtitles:
+            subs = [f"<b>Subtitles ({len(cand.subtitles)})</b>"]
+            subs += [esc(s.name) + arrow + esc(Path(d).name) for s, d in cand.subtitles]
+        elif cand.error:
+            subs = []
+        else:
+            subs = [muted("No subtitles found for this file.")]
+        if subs:
+            # File on the left, its subtitles on the right
+            self.body.setText(
+                "<table width='100%' cellspacing='0' cellpadding='0'><tr>"
+                f"<td width='52%' valign='top' style='padding-right:18px'>{'<br>'.join(info)}</td>"
+                f"<td valign='top'>{'<br>'.join(subs)}</td></tr></table>")
+        else:
+            self.body.setText("<br>".join(info))
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ═══════════════════════════════════════════════════════════════════
 class MainWindow(QMainWindow):
+    MEDIA_TYPES = ("tv", "movie", "anime")
+
     def __init__(self):
         super().__init__()
         self.cfg = cfg_load()
         self.renamer = Renamer()
         self._cands = []
         self._thread = self._worker = None
+        self._scanning = False
+        self._layout_name = None
+        self._anims = {}              # running panel animations by kind
+        self._shown_once = False
+        self._split_main = self._split_preview = None
+        self._files_stack = self._preview_stack = None
         self.setWindowTitle("PathRenamer")
-        self.setMinimumSize(1050, 680)
         self.setAcceptDrops(True)
         # Window icon: bundled next to the script, or in PyInstaller's
         # temp dir (sys._MEIPASS) when running as the frozen EXE.
@@ -2397,11 +2812,11 @@ class MainWindow(QMainWindow):
         except Exception as e:
             log.debug(f"Could not load window icon: {e}")
 
-        theme = self.cfg.get("theme", "dark")
-        self.setStyleSheet(THEMES.get(theme, DARK))
-
-        self._build_menu(); self._build_ui()
         self.status = QStatusBar(); self.setStatusBar(self.status)
+        self._build_menu()
+        self._create_widgets()
+        self._apply_layout()
+        self._restore_geometry()
         self.status.showMessage("Ready — select a source folder and click Preview Renames.")
         self._refresh_clients()
 
@@ -2418,13 +2833,15 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
         fm = mb.addMenu("File")
-        a = QAction("Settings…", self); a.triggered.connect(self._settings); fm.addAction(a)
+        a = QAction("Settings…", self); a.triggered.connect(self._settings)
+        a.setShortcut(QKeySequence("Ctrl+,")); fm.addAction(a)
         fm.addSeparator()
         q = QAction("Quit", self); q.triggered.connect(self.close); fm.addAction(q)
 
         em = mb.addMenu("Edit")
         self.act_undo = QAction("Undo Last Rename", self)
         self.act_undo.triggered.connect(self._undo); self.act_undo.setEnabled(False)
+        self.act_undo.setShortcut(QKeySequence("Ctrl+Z"))
         em.addAction(self.act_undo)
 
         vm = mb.addMenu("View")
@@ -2446,88 +2863,548 @@ class MainWindow(QMainWindow):
         self.act_theme_light.triggered.connect(lambda: self._set_theme("light"))
         vm.addAction(self.act_theme_light)
 
-    def _build_ui(self):
-        c = QWidget(); self.setCentralWidget(c)
-        L = QVBoxLayout(c); L.setContentsMargins(12,12,12,12); L.setSpacing(10)
+        vm.addSeparator()
+        lm = vm.addMenu("Layout")
+        group = QActionGroup(self); group.setExclusive(True)
+        self.act_layout = {}
+        for key, label in (("modern", "Modern"), ("classic", "Classic")):
+            act = QAction(label, self); act.setCheckable(True)
+            act.triggered.connect(lambda _=False, k=key: self._set_layout(k))
+            group.addAction(act); lm.addAction(act)
+            self.act_layout[key] = act
+        self.act_details = QAction("Show Details Panel", self)
+        self.act_details.setCheckable(True)
+        self.act_details.setChecked(self.cfg.get("show_details", True))
+        self.act_details.triggered.connect(self._toggle_details)
+        vm.addAction(self.act_details)
 
-        grp = QGroupBox("Source Folder"); gl = QVBoxLayout(grp)
-
-        sr = QHBoxLayout(); sr.addWidget(QLabel("Folder:"))
+    # ── Widgets (made once; each layout arranges them) ───────────────
+    def _create_widgets(self):
         remembered = self.cfg.get("last_source_folder","") if self.cfg.get("remember_folders", True) else ""
         self.src = QLineEdit(remembered)
         self.src.setPlaceholderText("Folder containing media files to rename...")
         self.src.textChanged.connect(self._on_src_changed)
-        sr.addWidget(self.src, 1)
-        b = QPushButton("Browse…"); b.clicked.connect(self._browse_src); sr.addWidget(b)
-        gl.addLayout(sr)
-        L.addWidget(grp)
+        self.btn_browse = QPushButton("Browse…"); self.btn_browse.clicked.connect(self._browse_src)
+        self.btn_browse.setToolTip("Choose the folder with your media files (Ctrl+O)")
 
-        cr = QHBoxLayout(); cr.addWidget(QLabel("Media Type:"))
         self.combo = QComboBox(); self.combo.addItems(["TV Shows","Movies","Anime"])
         saved_type = self.cfg.get("media_type", "tv")
         log.debug(f"Startup: media_type from config = '{saved_type}'")
         self.combo.setCurrentIndex({"tv": 0, "movie": 1, "anime": 2}.get(saved_type, 0))
-        log.debug(f"Startup: combo index set to {self.combo.currentIndex()}")
-        self.combo.setFixedWidth(140); cr.addWidget(self.combo)
         self.combo.currentIndexChanged.connect(self._on_media_type_changed)
-        cr.addStretch()
+        self.seg = SegmentedControl(["TV Shows", "Movies", "Anime"])
+        self.seg.setCurrentIndex(self.combo.currentIndex())
+        self.seg.changed.connect(self.combo.setCurrentIndex)
+
         self.btn_preview = QPushButton("⟳  Preview Renames")
         self.btn_preview.setObjectName("btn_preview")
-        self.btn_preview.clicked.connect(self._preview); cr.addWidget(self.btn_preview)
-        gl.addLayout(cr)
-        L.addWidget(grp)
+        self.btn_preview.setToolTip("Look up the new names (F5)")
+        self.btn_preview.clicked.connect(self._preview)
 
-        file_grp = QGroupBox("Selected Files")
-        file_l = QVBoxLayout(file_grp)
-        file_l.setContentsMargins(4, 8, 4, 4)
+        # Modern: matching mode in the toolbar instead of a question on every preview
+        self.match_combo = QComboBox(); self.match_combo.addItems(["Automatic match", "Forced match (TVDB ID)"])
+        self.match_combo.setToolTip("Automatic: look the show up by its name.\n"
+                                    "Forced: use the show with this TVDB ID for every file.")
+        self.tvdb_edit = QLineEdit(); self.tvdb_edit.setPlaceholderText("TVDB ID")
+        self.tvdb_edit.setFixedWidth(0)
+        self.tvdb_edit.returnPressed.connect(self._preview)
+        self.match_combo.currentIndexChanged.connect(lambda _: self._on_match_mode_changed())
 
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.file_list.setAlternatingRowColors(False)
-        self.file_list.setMinimumHeight(120)
-        file_l.addWidget(self.file_list)
+        model = self.file_list.model()
+        for sig in (model.rowsInserted, model.rowsRemoved, model.modelReset):
+            sig.connect(lambda *_: self._update_files_ui())
+        self.file_list.itemSelectionChanged.connect(self._update_files_ui)
+        self.btn_sel_all = QPushButton("Select All"); self.btn_sel_all.clicked.connect(self.file_list.selectAll)
+        self.btn_rem_files = QPushButton("Remove"); self.btn_rem_files.clicked.connect(self._remove_selected_files)
+        self.btn_clear_files = QPushButton("Clear List"); self.btn_clear_files.clicked.connect(self._clear_file_list)
 
-        hint = QLabel("Drag & drop files here, or Ctrl/Shift+click to select multiple")
-        hint.setStyleSheet("color: #6c7086; font-size: 11px; padding: 2px;")
-        file_l.addWidget(hint)
-
-        br_file = QHBoxLayout()
-        br_file.addStretch()
-        b_sel = QPushButton("Select All")
-        b_sel.clicked.connect(self.file_list.selectAll)
-        br_file.addWidget(b_sel)
-        b_rem = QPushButton("Remove")
-        b_rem.clicked.connect(self._remove_selected_files)
-        br_file.addWidget(b_rem)
-        b_clr = QPushButton("Clear List")
-        b_clr.clicked.connect(self._clear_file_list)
-        br_file.addWidget(b_clr)
-        file_l.addLayout(br_file)
-
-        L.addWidget(file_grp)
-
-        self.pbar = QProgressBar(); self.pbar.setVisible(False); L.addWidget(self.pbar)
-        self.table = RenameTable(); L.addWidget(self.table, 1)
+        self.pbar = QProgressBar(); self.pbar.setVisible(False)
+        self.table = RenameTable()
         self.table.set_display_options(
             self.cfg.get("show_detected", True),
             self.cfg.get("show_full_path", True),
         )
         self.table.set_light_mode(self.cfg.get("theme", "dark") == "light")
 
-        br = QHBoxLayout(); br.addStretch()
         self.btn_remove = QPushButton("✕ Remove Selected")
         self.btn_remove.setObjectName("btn_remove")
         self.btn_remove.setEnabled(False)
-        self.btn_remove.clicked.connect(self._remove_selected_rows); br.addWidget(self.btn_remove)
-        self.table.itemSelectionChanged.connect(
-            lambda: self.btn_remove.setEnabled(bool(self.table.selectedItems())))
+        self.btn_remove.setToolTip("Leave the selected rows out of this rename (Delete)")
+        self.btn_remove.clicked.connect(self._remove_selected_rows)
+        self.table.itemSelectionChanged.connect(self._on_table_selection)
         self.btn_undo = QPushButton("↩  Undo Last")
         self.btn_undo.setObjectName("btn_undo"); self.btn_undo.setEnabled(False)
-        self.btn_undo.clicked.connect(self._undo); br.addWidget(self.btn_undo)
+        self.btn_undo.setToolTip("Put the last renamed files back (Ctrl+Z)")
+        self.btn_undo.clicked.connect(self._undo)
         self.btn_rename = QPushButton("✔  Rename Files")
         self.btn_rename.setObjectName("btn_rename"); self.btn_rename.setEnabled(False)
-        self.btn_rename.setFixedWidth(160); self.btn_rename.clicked.connect(self._rename)
+        self.btn_rename.setToolTip("Move the files to their new names (Ctrl+Enter)")
+        self.btn_rename.clicked.connect(self._rename)
+
+        # Modern-only pieces
+        self.drop_zone = DropZone(); self.drop_zone.clicked.connect(self._browse_src)
+        self.details = DetailsPanel()
+        self.summary = QLabel(); self.summary.setObjectName("summary")
+        self.lib_label = ElidedLabel(); self.lib_label.setObjectName("muted")
+        self.btn_change_lib = QPushButton("Change…"); self.btn_change_lib.setObjectName("link")
+        self.btn_change_lib.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_change_lib.clicked.connect(self._settings)
+        self.files_count = QLabel(); self.files_count.setObjectName("paneCount")
+        self.preview_count = QLabel(); self.preview_count.setObjectName("paneCount")
+        self.preview_empty = QLabel("Click  ⟳ Preview  to see the new names here.")
+        self.preview_empty.setObjectName("emptyHint")
+        self.preview_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_empty.setWordWrap(True)
+
+        # Widgets a layout doesn't use wait here (hidden) until it is switched back
+        self._parking = QWidget(self); self._parking.hide()
+        self._persistent = [
+            self.src, self.btn_browse, self.combo, self.seg, self.btn_preview, self.match_combo,
+            self.tvdb_edit, self.file_list, self.btn_sel_all, self.btn_rem_files, self.btn_clear_files,
+            self.pbar, self.table, self.btn_remove, self.btn_undo, self.btn_rename, self.drop_zone,
+            self.details, self.summary, self.lib_label, self.btn_change_lib, self.files_count,
+            self.preview_count, self.preview_empty,
+        ]
+
+        # Keyboard shortcuts (all layouts)
+        for keys, slot in (("F5", self._preview), ("Ctrl+O", self._browse_src),
+                           ("Ctrl+Return", self._rename_if_ready), ("Ctrl+Enter", self._rename_if_ready),
+                           ("Delete", self._delete_pressed)):
+            QShortcut(QKeySequence(keys), self).activated.connect(slot)
+
+    # ── Layouts ──────────────────────────────────────────────────────
+    def _apply_layout(self):
+        """Build the window in the layout chosen in Settings, keeping the file
+        list, preview and everything typed."""
+        name = self.cfg.get("layout", "modern")
+        if name not in LAYOUTS:
+            name = "modern"
+        # The previous layout's frames and splitters are deleted below:
+        # stop animations that are still moving them
+        self._stop_animation()
+        self._split_main = self._split_preview = None
+        self._files_stack = self._preview_stack = None
+        old = self.takeCentralWidget()
+        for w in self._persistent:
+            w.setParent(self._parking)
+        root = QWidget()
+        if name == "modern":
+            self._arrange_modern(root)
+        else:
+            self._arrange_classic(root)
+        self.setCentralWidget(root)
+        if old is not None:
+            old.deleteLater()
+        self._layout_name = name
+        self.pbar.setVisible(self._scanning)       # setParent() hides widgets
+        self._on_match_mode_changed(animate=False)
+        self._apply_theme()
+        self._update_layout_menu()
+        self._update_files_ui()
+        self._update_summary()
+        self._update_library_label()
+        if self.isVisible():
+            QTimer.singleShot(0, self._apply_split_sizes)
+
+    def _arrange_classic(self, root):
+        """The original PathRenamer layout."""
+        self.setMinimumSize(1050, 680)
+        for w, name in ((self.src, ""), (self.pbar, ""), (self.btn_sel_all, ""),
+                        (self.btn_rem_files, ""), (self.btn_clear_files, "")):
+            w.setObjectName(name)
+        self.btn_sel_all.setText("Select All"); self.btn_rem_files.setText("Remove")
+        self.btn_clear_files.setText("Clear List")
+        self.pbar.setTextVisible(True)
+        self.table.set_modern(False)
+        self.file_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerItem)
+        self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.file_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.file_list.setMinimumHeight(120)
+        for b in (self.btn_sel_all, self.btn_rem_files, self.btn_clear_files):
+            b.setEnabled(True)
+
+        L = QVBoxLayout(root); L.setContentsMargins(12,12,12,12); L.setSpacing(10)
+        grp = QGroupBox("Source Folder"); gl = QVBoxLayout(grp)
+        sr = QHBoxLayout(); sr.addWidget(QLabel("Folder:"))
+        sr.addWidget(self.src, 1); sr.addWidget(self.btn_browse)
+        gl.addLayout(sr)
+
+        cr = QHBoxLayout(); cr.addWidget(QLabel("Media Type:"))
+        self.combo.setFixedWidth(140); cr.addWidget(self.combo)
+        cr.addStretch()
+        self.btn_preview.setText("⟳  Preview Renames")
+        cr.addWidget(self.btn_preview)
+        gl.addLayout(cr)
+        L.addWidget(grp)
+
+        file_grp = QGroupBox("Selected Files")
+        file_l = QVBoxLayout(file_grp)
+        file_l.setContentsMargins(4, 8, 4, 4)
+        file_l.addWidget(self.file_list)
+        hint = QLabel("Drag & drop files here, or Ctrl/Shift+click to select multiple")
+        hint.setStyleSheet("color: #6c7086; font-size: 11px; padding: 2px;")
+        file_l.addWidget(hint)
+        br_file = QHBoxLayout()
+        br_file.addStretch()
+        for b in (self.btn_sel_all, self.btn_rem_files, self.btn_clear_files):
+            br_file.addWidget(b)
+        file_l.addLayout(br_file)
+        L.addWidget(file_grp)
+
+        L.addWidget(self.pbar)
+        L.addWidget(self.table, 1)
+
+        br = QHBoxLayout(); br.addStretch()
+        br.addWidget(self.btn_remove)
+        br.addWidget(self.btn_undo)
+        self.btn_rename.setFixedWidth(160)
         br.addWidget(self.btn_rename); L.addLayout(br)
+        # The Modern layout's stacked panes hide the list and table when they
+        # leave them; show everything Classic uses
+        for w in (self.src, self.btn_browse, self.combo, self.btn_preview, self.file_list,
+                  self.btn_sel_all, self.btn_rem_files, self.btn_clear_files, self.table,
+                  self.btn_remove, self.btn_undo, self.btn_rename):
+            w.show()
+
+    def _arrange_modern(self, root):
+        """Toolbar on top, file list and preview side by side (stacked on narrow
+        windows), details under the preview, actions at the bottom."""
+        self.setMinimumSize(760, 540)
+        root.setObjectName("modernRoot")
+        density = self.cfg.get("density", "comfortable")
+        self.src.setObjectName("srcEdit")
+        self.pbar.setObjectName("slimProgress"); self.pbar.setTextVisible(False)
+        for b, text in ((self.btn_sel_all, "Select all"), (self.btn_rem_files, "Remove"),
+                        (self.btn_clear_files, "Clear")):
+            b.setObjectName("flat"); b.setText(text)
+        self.table.set_modern(True, density)
+        self.file_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        # Long names are shortened in the middle (full path on hover), no sideways scrolling
+        self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.file_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.file_list.setMinimumHeight(0)
+        self.btn_rename.setMinimumWidth(150); self.btn_rename.setMaximumWidth(16777215)
+
+        outer = QVBoxLayout(root); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+
+        # Toolbar: folder + Preview, then media type, matching and library folder
+        top = QFrame(); top.setObjectName("topBar")
+        tl = QVBoxLayout(top); tl.setContentsMargins(16, 12, 16, 10); tl.setSpacing(8)
+        r1 = QHBoxLayout(); r1.setSpacing(8)
+        r1.addWidget(self.src, 1); r1.addWidget(self.btn_browse)
+        self.btn_preview.setText("⟳  Preview")
+        self.btn_preview.setMinimumWidth(120)
+        r1.addWidget(self.btn_preview)
+        tl.addLayout(r1)
+        r2 = QHBoxLayout(); r2.setSpacing(8)
+        r2.addWidget(self.seg); r2.addSpacing(6)
+        r2.addWidget(self.match_combo); r2.addWidget(self.tvdb_edit)
+        r2.addSpacing(10)
+        r2.addWidget(self.lib_label, 1); r2.addWidget(self.btn_change_lib)
+        tl.addLayout(r2)
+        outer.addWidget(top)
+        outer.addWidget(self.pbar)
+
+        body = QWidget(); bl = QVBoxLayout(body); bl.setContentsMargins(14, 12, 14, 10)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False); split.setHandleWidth(10)
+
+        files = QFrame(); files.setObjectName("card"); files.setMinimumSize(290, 150)
+        fl = QVBoxLayout(files); fl.setContentsMargins(12, 10, 12, 10); fl.setSpacing(6)
+        fh = QHBoxLayout(); fh.setSpacing(4)
+        t = QLabel("FILES"); t.setObjectName("paneTitle")
+        fh.addWidget(t); fh.addSpacing(4); fh.addWidget(self.files_count); fh.addStretch()
+        for b in (self.btn_sel_all, self.btn_rem_files, self.btn_clear_files):
+            fh.addWidget(b)
+        fl.addLayout(fh)
+        self._files_stack = QStackedWidget()
+        self._files_stack.addWidget(self.drop_zone); self._files_stack.addWidget(self.file_list)
+        fl.addWidget(self._files_stack, 1)
+        split.addWidget(files)
+
+        preview = QFrame(); preview.setObjectName("card"); preview.setMinimumSize(360, 150)
+        pl = QVBoxLayout(preview); pl.setContentsMargins(12, 10, 12, 10); pl.setSpacing(6)
+        ph = QHBoxLayout()
+        t2 = QLabel("PREVIEW"); t2.setObjectName("paneTitle")
+        ph.addWidget(t2); ph.addSpacing(4); ph.addWidget(self.preview_count); ph.addStretch()
+        pl.addLayout(ph)
+        self._preview_stack = QStackedWidget()
+        self._preview_stack.addWidget(self.preview_empty); self._preview_stack.addWidget(self.table)
+        pl.addWidget(self._preview_stack, 1)
+
+        self._split_preview = QSplitter(Qt.Orientation.Vertical)
+        self._split_preview.setChildrenCollapsible(False); self._split_preview.setHandleWidth(10)
+        self._split_preview.addWidget(preview); self._split_preview.addWidget(self.details)
+        self._split_preview.setStretchFactor(0, 1); self._split_preview.setStretchFactor(1, 0)
+        self.details.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.details.setVisible(self.cfg.get("show_details", True))
+        split.addWidget(self._split_preview)
+        split.setStretchFactor(0, 0); split.setStretchFactor(1, 1)
+        split.splitterMoved.connect(self._on_split_moved)
+        self._split_main = split
+        bl.addWidget(split)
+        outer.addWidget(body, 1)
+
+        bar = QFrame(); bar.setObjectName("actionBar")
+        al = QHBoxLayout(bar); al.setContentsMargins(16, 10, 16, 10); al.setSpacing(8)
+        al.addWidget(self.summary, 1)
+        al.addWidget(self.btn_remove); al.addWidget(self.btn_undo); al.addWidget(self.btn_rename)
+        outer.addWidget(bar)
+        for w in (self.src, self.btn_browse, self.btn_preview, self.seg, self.match_combo,
+                  self.lib_label, self.btn_change_lib, self.files_count, self.preview_count,
+                  self.btn_sel_all, self.btn_rem_files, self.btn_clear_files, self.summary,
+                  self.btn_remove, self.btn_undo, self.btn_rename):
+            w.show()
+        self._update_panel_orientation()
+
+    def _panel_orientation(self):
+        mode = self.cfg.get("panel_mode", "auto")
+        if mode == "side":
+            return Qt.Orientation.Horizontal
+        if mode == "stacked":
+            return Qt.Orientation.Vertical
+        return Qt.Orientation.Horizontal if self.width() >= 980 else Qt.Orientation.Vertical
+
+    def _update_panel_orientation(self):
+        if self._split_main is None:
+            return
+        orient = self._panel_orientation()
+        if self._split_main.orientation() != orient:
+            self._split_main.setOrientation(orient)
+            QTimer.singleShot(0, self._apply_split_sizes)
+
+    def _apply_split_sizes(self):
+        """File list share of the window, and the details panel height."""
+        split = self._split_main
+        if split is None:
+            return
+        horizontal = split.orientation() == Qt.Orientation.Horizontal
+        total = split.width() if horizontal else split.height()
+        if total > 0:
+            ratio = min(max(float(self.cfg.get("files_ratio", 0.3)), 0.15), 0.7)
+            if not horizontal:
+                ratio = min(ratio, 0.35)        # stacked: the preview needs the height
+            first = int(total * ratio)
+            split.setSizes([first, total - first])
+        sp = self._split_preview
+        if sp is not None and not self.details.isHidden():
+            h = sum(sp.sizes()) or sp.height()
+            d = self._details_height(h)
+            sp.setSizes([max(h - d, 1), d])
+
+    @staticmethod
+    def _details_height(total):
+        return min(230, max(130, int(total * 0.36)))
+
+    def _on_split_moved(self, *_):
+        split = self._split_main
+        sizes = split.sizes() if split is not None else []
+        if len(sizes) == 2 and sum(sizes) > 0 and split.orientation() == Qt.Orientation.Horizontal:
+            self.cfg["files_ratio"] = round(sizes[0] / sum(sizes), 3)
+
+    def _set_details_visible(self, show, animate=True):
+        """Slide the details panel in or out under the preview. A click while
+        it is still sliding turns it around from where it is."""
+        sp = self._split_preview
+        if sp is None:
+            return
+        animate = animate and self.cfg.get("animations", True) and self.isVisible()
+        self._stop_animation("details")
+        visible = not self.details.isHidden()
+        if not show and not visible:
+            return
+        sizes = sp.sizes()
+        total = sum(sizes) or sp.height()
+        current = sizes[1] if visible and len(sizes) > 1 else 0
+        # Size policy "Ignored" lets the splitter squeeze the panel below its
+        # normal minimum while it slides; restored when done.
+        self.details.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored)
+        def step(v):
+            try:
+                sp.setSizes([max(total - v, 1), v])
+            except RuntimeError:          # layout replaced meanwhile
+                pass
+        def restore_policy():
+            self.details.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        def done_hide():
+            self.details.hide()
+            restore_policy()
+        if show:
+            if not visible:
+                self.details.show()
+                step(0)
+            self._update_details()
+            self._run_animation("details", current, self._details_height(total), step,
+                                on_done=restore_policy, enabled=animate)
+        else:
+            self._run_animation("details", current, 0, step, on_done=done_hide, enabled=animate)
+
+    def _run_animation(self, key, start, end, on_value, on_done=None, enabled=True):
+        """_animate, first stopping the previous animation of the same kind so
+        quick repeated clicks always end in the latest state."""
+        self._stop_animation(key)
+        anim = _animate(self, start, end, on_value, on_done=on_done, enabled=enabled)
+        if anim is not None:
+            self._anims[key] = anim
+            anim.finished.connect(lambda k=key, a=anim: self._anims.get(k) is a and self._anims.pop(k))
+
+    def _stop_animation(self, key=None):
+        """Stop one running animation (or all). A stopped animation does not
+        run its "done" step."""
+        for k in ([key] if key else list(self._anims)):
+            anim = self._anims.pop(k, None)
+            if anim is not None:
+                try:
+                    anim.stop()
+                except RuntimeError:      # already finished and deleted
+                    pass
+
+    def _toggle_details(self, checked):
+        self.cfg["show_details"] = bool(checked)
+        cfg_save(self.cfg)
+        self._set_details_visible(bool(checked))
+
+    def _set_layout(self, name):
+        if name == self._layout_name:
+            return
+        self.cfg["layout"] = name
+        cfg_save(self.cfg)
+        self._apply_layout()
+
+    def _update_layout_menu(self):
+        for key, act in self.act_layout.items():
+            act.setChecked(key == self._layout_name)
+        self.act_details.setEnabled(self._layout_name == "modern")
+        self.act_details.setChecked(self.cfg.get("show_details", True))
+
+    def _on_match_mode_changed(self, animate=True):
+        """Modern: show the TVDB ID box (sliding open) when Forced is chosen."""
+        forced = self.match_combo.currentIndex() == 1
+        if self._layout_name != "modern":
+            return
+        animate = animate and self.cfg.get("animations", True) and self.isVisible()
+        self._stop_animation("tvdb")
+        if forced:
+            start = 0 if self.tvdb_edit.isHidden() else self.tvdb_edit.width()
+            self.tvdb_edit.show()
+            self._run_animation("tvdb", start, 130, self.tvdb_edit.setFixedWidth, enabled=animate)
+            if animate:
+                self.tvdb_edit.setFocus()
+        elif self.tvdb_edit.isHidden():
+            self.tvdb_edit.setFixedWidth(0)
+        else:
+            self._run_animation("tvdb", self.tvdb_edit.width(), 0, self.tvdb_edit.setFixedWidth,
+                                on_done=self.tvdb_edit.hide, enabled=animate)
+
+    def _restore_geometry(self):
+        geo = self.cfg.get("window_geometry")
+        if geo:
+            try:
+                if self.restoreGeometry(QByteArray.fromBase64(geo.encode("ascii"))):
+                    return
+            except Exception:
+                pass
+        if self._layout_name == "modern":
+            self.resize(1180, 760)
+
+    def closeEvent(self, event):
+        try:
+            self.cfg["window_geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
+            cfg_save(self.cfg)
+        except Exception as e:
+            log.debug(f"Could not save window size: {e}")
+        super().closeEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._shown_once:          # (restoring from minimized keeps the user's sizes)
+            self._shown_once = True
+            QTimer.singleShot(0, self._apply_split_sizes)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_panel_orientation()
+
+    # ── Live parts of the Modern layout ──────────────────────────────
+    def _update_files_ui(self):
+        try:
+            n = self.file_list.count()
+        except RuntimeError:          # window is being destroyed
+            return
+        sel = len(self.file_list.selectedItems())
+        self.files_count.setText(f"{n}" + (f"  ·  {sel} selected" if sel else ""))
+        if self._files_stack is not None:
+            self._files_stack.setCurrentIndex(1 if n else 0)
+        if self._layout_name == "modern":
+            self.btn_sel_all.setEnabled(n > 0)
+            self.btn_clear_files.setEnabled(n > 0)
+            self.btn_rem_files.setEnabled(sel > 0)
+
+    def _update_summary(self):
+        cands = self.table.get_cands()
+        ok = [c for c in cands if not c.error]
+        ready = sum(1 for c in ok if not c.conflict and c.confidence >= 0.85)
+        check = sum(1 for c in ok if not c.conflict and c.confidence < 0.85)
+        conflicts = sum(1 for c in ok if c.conflict)
+        errors = len(cands) - len(ok)
+        subs = sum(len(c.subtitles) for c in ok if not c.conflict)
+        if not cands:
+            text = "Scanning…" if self._scanning else "Add files, then click Preview."
+        else:
+            parts = [f"{ready} ready"]
+            if check:
+                parts.append(f"{check} to check")
+            if conflicts:
+                parts.append(f"{conflicts} conflict{'s' if conflicts != 1 else ''}")
+            if errors:
+                parts.append(f"{errors} can't be renamed")
+            if subs:
+                parts.append(f"{subs} subtitle{'s' if subs != 1 else ''}")
+            text = "  ·  ".join(parts)
+        self.summary.setText(text)
+        self.preview_count.setText(str(len(cands)) if cands else "")
+        if self._preview_stack is not None:
+            self._preview_stack.setCurrentIndex(1 if (cands or self._scanning) else 0)
+
+    def _update_details(self):
+        if self._layout_name != "modern" or self.details.isHidden():
+            return
+        rows = self.table.selected_rows()
+        cands = self.table.get_cands()
+        cand = cands[rows[-1]] if rows and rows[-1] < len(cands) else None
+        self.details.show_candidate(cand, self._get_destination())
+
+    def _update_library_label(self):
+        kind = {"tv": "TV shows", "movie": "Movies", "anime": "Anime"}[self._media_type()]
+        dest = self._get_destination()
+        if dest:
+            self.lib_label.setText(f"{kind} go to  {dest}")
+            self.btn_change_lib.setText("Change…")
+        else:
+            self.lib_label.setText(f"No library folder set for {kind.lower()} yet")
+            self.btn_change_lib.setText("Set folder…")
+        self.lib_label.setToolTip(dest)
+        self.lib_label.update()
+
+    def _on_table_selection(self):
+        try:
+            self.btn_remove.setEnabled(bool(self.table.selectedItems()))
+        except RuntimeError:          # window is being destroyed
+            return
+        self._update_details()
+
+    def _rename_if_ready(self):
+        if self.btn_rename.isEnabled():
+            self._rename()
+
+    def _delete_pressed(self):
+        if self.table.hasFocus() and self.table.selectedItems():
+            self._remove_selected_rows()
+        elif self.file_list.hasFocus() and self.file_list.selectedItems():
+            self._remove_selected_files()
 
     def _browse_src(self):
         f = QFileDialog.getExistingDirectory(self, "Source Folder", self.src.text())
@@ -2573,8 +3450,6 @@ class MainWindow(QMainWindow):
             # in-memory copy can't simply be kept.
             self.cfg = cfg_load()
         self._refresh_clients()
-        self._apply_theme()
-        self._update_theme_menu()
         saved_type = self.cfg.get("media_type", "tv")
         idx = {"tv": 0, "movie": 1, "anime": 2}.get(saved_type, 0)
         if self.combo.currentIndex() != idx:
@@ -2583,6 +3458,23 @@ class MainWindow(QMainWindow):
             self.cfg.get("show_detected", True),
             self.cfg.get("show_full_path", True),
         )
+        if self.cfg.get("layout", "modern") != self._layout_name:
+            self._apply_layout()
+        else:
+            self._apply_layout_options()
+        self._update_theme_menu()
+
+    def _apply_layout_options(self):
+        """Settings changed without switching layout: density, file list
+        position, details panel, theme, library folder."""
+        if self._layout_name == "modern":
+            self.table.set_modern(True, self.cfg.get("density", "comfortable"))
+            self._update_panel_orientation()
+            self._set_details_visible(self.cfg.get("show_details", True))
+        self._apply_theme()
+        self._update_layout_menu()
+        self._update_library_label()
+        self._update_summary()
 
     def _set_theme(self, theme):
         self.cfg["theme"] = theme
@@ -2592,8 +3484,10 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self):
         theme = self.cfg.get("theme", "dark")
-        self.setStyleSheet(THEMES.get(theme, DARK))
+        self.setStyleSheet(app_stylesheet(theme, self.cfg.get("density", "comfortable")))
         self.table.set_light_mode(theme == "light")
+        self.details.pal = PALETTES.get(theme, PALETTES["dark"])
+        self._update_details()
 
     def _update_theme_menu(self):
         theme = self.cfg.get("theme", "dark")
@@ -2604,6 +3498,8 @@ class MainWindow(QMainWindow):
     def _on_media_type_changed(self):
         self.cfg["media_type"] = self._media_type()
         cfg_save(self.cfg)
+        self.seg.setCurrentIndex(self.combo.currentIndex())
+        self._update_library_label()
 
     def _get_destination(self):
         mtype = self._media_type()
@@ -2640,7 +3536,35 @@ class MainWindow(QMainWindow):
             return "tv"
         return None
 
+    def _choose_match_mode(self):
+        """("normal" | "forced", TVDB id or None), or (None, None) if cancelled.
+        Classic asks in two dialogs; Modern reads the toolbar."""
+        if self._layout_name == "modern":
+            if self.match_combo.currentIndex() == 1:
+                tvdb_id = self.tvdb_edit.text().strip()
+                if not tvdb_id:
+                    QMessageBox.information(self, "Forced Match",
+                                            "Type the show's TVDB ID in the box next to “Forced match”.")
+                    self.tvdb_edit.setFocus()
+                    return None, None
+                return "forced", tvdb_id
+            return "normal", None
+        match_type, ok = QInputDialog.getItem(
+            self, "Match Type", "Select matching mode:",
+            ["Normal Match (automatic)", "Forced Match (enter TVDB ID)"], 0, False
+        )
+        if not ok:
+            return None, None
+        if "Forced" in match_type:
+            forced_id, ok = QInputDialog.getText(self, "Forced Match", "Enter TVDB ID for the show:")
+            if not ok or not forced_id.strip():
+                return None, None
+            return "forced", forced_id.strip()
+        return "normal", None
+
     def _preview(self):
+        if self._scanning:
+            return
         dst = self._get_destination()
         # Prefer files selected in the list; fall back to the source folder.
         selected_paths = self._get_selected_files()
@@ -2678,20 +3602,19 @@ class MainWindow(QMainWindow):
                 self.combo.blockSignals(True)
                 self.combo.setCurrentIndex(idx)
                 self.combo.blockSignals(False)
+                self.seg.setCurrentIndex(idx)
                 self.cfg["media_type"] = detected
                 cfg_save(self.cfg)
+                self._update_library_label()
                 self.status.showMessage(f"Auto-detected media type: {detected}")
                 dst = self._get_destination()
 
         if not dst:
             return QMessageBox.warning(self, "PathRenamer", "Set destination folder in Settings (tab: Folders).")
 
-        # Ask for the matching mode.
-        match_type, ok = QInputDialog.getItem(
-            self, "Match Type", "Select matching mode:",
-            ["Normal Match (automatic)", "Forced Match (enter TVDB ID)"], 0, False
-        )
-        if not ok:
+        # Matching mode: automatic, or one show forced by its TVDB id
+        match_mode, forced_id = self._choose_match_mode()
+        if match_mode is None:
             return
 
         # str(path) -> (title, (source, id)) chosen by the user.
@@ -2707,11 +3630,7 @@ class MainWindow(QMainWindow):
         )
 
         forced_match = None
-        if "Forced" in match_type:
-            forced_id, ok = QInputDialog.getText(self, "Forced Match", "Enter TVDB ID for the show:")
-            if not ok or not forced_id.strip():
-                return
-            forced_id = forced_id.strip()
+        if match_mode == "forced":
             if self.tvmaze:
                 try:
                     forced_match = self.tvmaze.get_show_by_tvdb_id(forced_id)
@@ -2764,10 +3683,13 @@ class MainWindow(QMainWindow):
         )
         self.btn_rename.setEnabled(False)
 
+        self._scanning = True
         self.pbar.setVisible(True)
         self.pbar.setMaximum(len(files))
         self.pbar.setValue(0)
         self.btn_preview.setEnabled(False)
+        self._update_summary()
+        self._update_details()
 
         self._thread = QThread()
         self._worker = ScanWorker(files, engine, media_type, dst, selected_overrides)
@@ -2781,12 +3703,18 @@ class MainWindow(QMainWindow):
     def _on_candidate(self, cand):
         self._cands.append(cand)
         self.table.append_candidate(cand, self._get_destination())
+        self._update_summary()
 
     def _on_scan_done(self):
-        self._thread.quit()
-        self._thread.wait(2000)
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(2000)
+        self._scanning = False
         self.pbar.setVisible(False)
         self.btn_preview.setEnabled(True)
+        self._update_summary()
+        if self.table.rowCount() and not self.table.selectedItems() and self._layout_name == "modern":
+            self.table.selectRow(0)       # fills the details panel
 
         total = len(self._cands)
         conflicts = self.table.conflict_count()
@@ -2838,18 +3766,18 @@ class MainWindow(QMainWindow):
             skip = {id(g) for g in conflicted}
             groups = [g for g in groups if id(g) not in skip]
 
-        ops = []
-        for main_op, sub_ops in groups:
-            ops.append(main_op)
-            ops.extend(s for s in sub_ops if not detect_conflicts([s]))
+        # A subtitle whose new name already exists stays where it is
+        sub_skipped = sum(1 for _, sub_ops in groups for s in sub_ops if detect_conflicts([s]))
+        groups = [(main_op, [s for s in sub_ops if not detect_conflicts([s])])
+                  for main_op, sub_ops in groups]
 
-        if not ops:
+        if not groups:
             self.status.showMessage("Nothing to rename after skipping conflicts.")
             return
 
         if self.cfg.get("confirm_rename", True):
             n_vids = len(groups)
-            n_subs = len(ops) - n_vids
+            n_subs = sum(len(sub_ops) for _, sub_ops in groups)
             msg = f"Move {n_vids} file(s)"
             if n_subs:
                 msg += f" and {n_subs} subtitle(s)"
@@ -2861,9 +3789,10 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        result = self.renamer.execute(ops, dest_root=dst)
+        result = self.renamer.execute_groups(groups, dest_root=dst)
         ok_count = len(result.succeeded)
         fail_count = len(result.failed)
+        ok_subs = sum(1 for op in result.succeeded if op.src.suffix.lower() in SUB_EXT)
 
         # Remove folders left empty in the source tree.
         if self.cfg.get("cleanup_empty_folders", True):
@@ -2872,9 +3801,14 @@ class MainWindow(QMainWindow):
                 for op in result.succeeded:
                     _cleanup_empty_dirs(op.src.parent, stop=Path(src_root))
 
-        self.status.showMessage(
-            f"Renamed {ok_count} file(s)" + (f", {fail_count} failed" if fail_count else "")
-        )
+        msg = f"Renamed {ok_count - ok_subs} file(s)"
+        if ok_subs:
+            msg += f" and {ok_subs} subtitle(s)"
+        if fail_count:
+            msg += f", {fail_count} failed"
+        if sub_skipped:
+            msg += f" · {sub_skipped} subtitle(s) left in place (new name already exists)"
+        self.status.showMessage(msg)
         if fail_count:
             details = "\n".join(f"{o.src.name}: {o.error}" for o in result.failed[:10])
             QMessageBox.warning(self, "Some Renames Failed", details)
@@ -2887,6 +3821,8 @@ class MainWindow(QMainWindow):
         self.table.clear_all()
         self.btn_rename.setEnabled(False)
         self._update_undo_buttons()
+        self._update_summary()
+        self._update_details()
 
     def _undo(self):
         if not self.renamer.can_undo():
@@ -2913,6 +3849,8 @@ class MainWindow(QMainWindow):
         self._cands = self.table.get_cands()
         errors = sum(1 for c in self._cands if c.error)
         self.btn_rename.setEnabled(len(self._cands) - errors > 0)
+        self._update_summary()
+        self._update_details()
 
     def _purge_files_from_list(self, paths):
         gone = {os.path.normcase(str(p)) for p in paths}
@@ -2928,6 +3866,7 @@ class MainWindow(QMainWindow):
             if p not in existing:
                 item = QListWidgetItem(p.name)
                 item.setData(256, p)
+                item.setToolTip(str(p))
                 self.file_list.addItem(item)
 
     def _get_selected_files(self):
@@ -2941,6 +3880,8 @@ class MainWindow(QMainWindow):
         self._cands = []
         self.table.clear_all()
         self.btn_rename.setEnabled(False)
+        self._update_summary()
+        self._update_details()
 
     def _remove_selected_files(self):
         for item in self.file_list.selectedItems():
@@ -2950,13 +3891,21 @@ class MainWindow(QMainWindow):
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+            self.drop_zone.set_hover(True)
+
+    def dragLeaveEvent(self, event):
+        self.drop_zone.set_hover(False)
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
+        self.drop_zone.set_hover(False)
         files = []
         for url in event.mimeData().urls():
             path = Path(url.toLocalFile())
             if path.is_file():
-                files.append(path)
+                # Videos and subtitles only, not .nfo/.txt/.jpg dropped with them
+                if path.suffix.lower() in VIDEO_EXT or path.suffix.lower() in SUB_EXT:
+                    files.append(path)
             elif path.is_dir():
                 folder_files = scan_folder(str(path))
                 if not folder_files:

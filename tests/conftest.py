@@ -22,6 +22,25 @@ def main():
     return app
 
 
+@pytest.fixture(autouse=True)
+def fail_on_slot_errors(monkeypatch):
+    """Errors raised inside Qt slots don't reach pytest (and the app's own
+    handler would open a message box); collect them and fail the test."""
+    errors = []
+    monkeypatch.setattr(sys, "excepthook", lambda *exc: errors.append(exc))
+    yield
+    if errors:
+        raise errors[0][1]
+
+
+@pytest.fixture(scope="session")
+def qapp(main):
+    """One QApplication for every test that builds windows (kept referenced:
+    Qt aborts if it is garbage collected while widgets exist)."""
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
 def make_files(root: Path, *rel_paths: str) -> list:
     """Create empty files under root and return their paths."""
     out = []

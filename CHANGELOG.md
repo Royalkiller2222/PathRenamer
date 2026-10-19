@@ -55,7 +55,46 @@ reversed or garbled names, or names the reference data numbers differently
 - `Show - 1.srt` is no longer attached to `Show - 10.mkv`.
 - Subtitles in a release's `Subs` folder are found even when they are not named
   after the video (`Subs/2_English.srt`), and per-episode folders in season packs
-  (`Subs/Show.S01E01/2_English.srt`) are picked up.
+  (`Subs/Show.S01E01/2_English.srt`, `Subs/S01E01/`) are picked up.
+- Also found: subtitles named only by language next to a single video
+  (`English.srt`), `SUBS`/`SubTitles` folders in any letter case, season-pack
+  subtitles with shorter names than the episodes (`Subs/Lost.S01E01.eng.srt`),
+  and `.sup` (PGS) and `.smi` files.
+- Languages are read correctly from 639-2/T codes (`fra`, `deu`), region codes
+  (`pt-BR`, `es-419`, `zh-Hans`, `fr-CA`) and names like
+  `Spanish (Latin America)` or `Portuguese (Brazil)`; these all used to be
+  labelled English. Words in a title are no longer read as tags
+  ("The IT Crowd" was Italian, "Hi Score Girl" was hearing-impaired).
+- All languages use Plex's three-letter codes (`.eng`, `.spa`, ...).
+- A second subtitle with the same language is numbered before the language
+  (`Movie.2.eng.srt`) so Plex still sees its language (was `Movie.eng-1.srt`).
+- A subtitle that matches two videos goes to the one it is named after
+  (`Movie.Extended.en.srt` → the Extended cut).
+- Subtitles are moved only if their video is; one that was also added to the
+  list on its own is no longer processed twice.
+- The status bar says how many subtitles were moved, and which were left in
+  place because their new name already exists. Hovering the Subtitles cell
+  shows each subtitle's new name.
+
+**Layout**
+- New Modern layout (the default): toolbar with the source folder, media type
+  buttons and matching mode; file list and preview side by side in resizable
+  panes that stack on narrow windows; a details panel showing where the
+  selected file and each of its subtitles will go; a summary bar
+  ("3 ready · 1 conflict · 4 subtitles"); a drop zone when the list is empty.
+  Long names are shortened instead of wrapped, scrolling is smooth, and panels
+  slide in and out.
+- The original layout is kept as Classic. Settings → Appearance → Layout (or
+  View → Layout) switches between them without restarting; Modern has options
+  for file list position, row spacing, the details panel and animations.
+  Colours are the same in both.
+- Settings opens with a sidebar in the Modern layout.
+- In Modern, matching mode (automatic or forced TVDB ID) sits in the toolbar
+  instead of being asked on every preview.
+- The window remembers its size and position.
+- Keyboard: F5 preview, Ctrl+O browse, Ctrl+Enter rename, Ctrl+Z undo,
+  Delete removes the selected rows or files.
+- Dropping a mix of files adds only videos and subtitles (not .nfo or .jpg).
 
 **Metadata lookups**
 - Multi-episode files get every episode title from TVMaze ("Part 1 & Part 2"),
