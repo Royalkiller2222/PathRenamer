@@ -1,0 +1,60 @@
+# Changelog
+
+## Unreleased
+
+Renaming fixes, found by running about 1,900 real-world release names (from the
+test data of Sonarr, Radarr, guessit and other release-name parsers) through the
+app offline. With the files in a download folder named "Incoming", 71% of them
+were renamed wrongly before; 6.5% are now. Most of the rest are batch packs,
+reversed or garbled names, or names the reference data numbers differently
+(absolute "512" where the app writes S05E12).
+
+**Titles**
+- A loose file is no longer named after the folder it sits in
+  (`Incoming/The.Office.US.S02E03.mkv` became "Incoming", now "The Office (US)").
+  The folder still decides when the file name has no show name, only an episode
+  title, or an obfuscated name like `abc123.mkv`.
+- Hyphenated titles are kept whole: "Spider-Man", "Obi-Wan Kenobi", "She-Hulk".
+- Numeric titles work: "1923", "1883", "1917", "9", "24".
+- Title words guessit mistakes for tags are kept: "The Last of Us",
+  "It Ends With Us", "The Collector", "Johnny English", "Dune Part Two", "Kill Bill Vol 1".
+- Website prefixes are dropped ("www.Site.org - Show.S01E01...").
+- Foreign season folders ("Saison 6", "Temporada 2", "Staffel 1") lead to the
+  show folder above them; library folders like "Babylon 5" and "The 4400" are
+  read as titles, not episode numbers.
+
+**Seasons and episodes**
+- Multi-episode files are named the Plex way: `S01E01-E03` (was `S01E01`).
+- Daily shows use the air date: `Season 2024/Show 2024-05-17 - Title`
+  (every episode used to become `S01E01` and collide).
+- Season 0 and episode 0 are kept (they used to become 1).
+- A season-pack folder name no longer overrides the episode number in the file name.
+- Anime forms: `[Group] Title - 01`, `Title S2 - 03`, `2nd Season 24`, `(S4-24)`,
+  `Episode 161`, `SP01` (Season 00), absolute numbers.
+- Foreign forms: `Staffel 2 Folge 5`, `Saison 2 Épisode 5`, `Säsong 2 Avsnitt 5`,
+  `Temporada 2 [Cap.201]`, `2×7`, `T02E22`, `第二季 第3集`, `Сезон 3, Эпизод 21`.
+- Years are no longer taken for seasons ("Show (2011) - 141" was Season 2011).
+
+**Movies**
+- No year: `Title/Title.mkv` instead of `Title (Unknown)/...`.
+- The year from the folder is used when the file name has none
+  (`Movie (1998)/Movie.720p.mkv`).
+
+**Safety**
+- Files with no recognisable title or episode number are shown as errors and
+  skipped, instead of being renamed to "Unknown" or `S01E01`.
+- Two files that would get the same name (e.g. 720p and 1080p copies) are flagged;
+  only the first is renamed.
+- Samples and extras folders (`Sample`, `Featurettes`, `Extras`, ...) are skipped
+  when scanning a folder.
+
+**Subtitles**
+- `Show - 1.srt` is no longer attached to `Show - 10.mkv`.
+- Subtitles in a release's `Subs` folder are found even when they are not named
+  after the video (`Subs/2_English.srt`), and per-episode folders in season packs
+  (`Subs/Show.S01E01/2_English.srt`) are picked up.
+
+**Metadata lookups**
+- Multi-episode files get every episode title from TVMaze ("Part 1 & Part 2"),
+  daily shows are looked up by air date, and the show year from the file or
+  folder name is used when TVMaze has none.
