@@ -3,7 +3,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # ── Logging / crash handler ───────────────────────────────────────────────────
 _APPDATA_BASE = Path(os.getenv("APPDATA", Path.home()))

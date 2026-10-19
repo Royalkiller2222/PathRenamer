@@ -53,3 +53,15 @@ The tests feed real-world release names (scene, P2P, anime fansub, foreign and
 daily-show names) through the same code the app uses, and check renaming,
 undo, subtitle pickup and duplicate detection on real files in a temp folder.
 They pass with guessit 3.8 (the version in the 1.2.0 build) and guessit 4.x.
+
+### Making a release
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`) on Windows
+with Python 3.13 and the versions in `src/requirements-lock.txt`:
+
+1. Set `APP_VERSION` in `src/main.py` and update `RELEASE_NOTES.md`.
+2. Commit, then push a matching tag: `git tag v1.3.0` and `git push origin v1.3.0`.
+
+The workflow runs the tests, builds `PathRenamer.exe` with PyInstaller and
+`PathRenamer-Setup-<version>.exe` with Inno Setup (`installer/PathRenamer.iss`),
+and publishes both on the Releases page.
