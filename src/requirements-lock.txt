@@ -1,0 +1,5 @@
+# Exact versions used for release builds (tested together).
+PyQt6==6.11.0
+requests==2.34.2
+guessit==4.4.0
+rapidfuzz==3.14.6

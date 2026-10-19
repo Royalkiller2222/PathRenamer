@@ -1,0 +1,79 @@
+# Builds PathRenamer.exe and the installer on Windows and publishes them as a
+# GitHub Release. Start it by pushing a tag that matches APP_VERSION in
+# src/main.py, e.g.:  git tag v1.3.0 && git push origin v1.3.0
+# On pull requests it only builds (the exe and installer are downloadable
+# from the run's artifacts), so a broken build shows up before release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/requirements-lock.txt pyinstaller==6.22.3 pytest==9.1.1
+
+      - name: Read app version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path src/main.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$v") {
+            throw "Tag ${{ github.ref_name }} does not match APP_VERSION $v in src/main.py"
+          }
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Build PathRenamer.exe
+        working-directory: src
+        run: >
+          python -m PyInstaller --noconfirm --onefile --windowed --name PathRenamer
+          --icon newicon.ico --add-data "newicon.ico;."
+          --collect-all guessit --collect-all rebulk --collect-all babelfish
+          --hidden-import rapidfuzz --hidden-import rapidfuzz.fuzz
+          --distpath ../dist main.py
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc /DAppVersion=${{ steps.ver.outputs.version }} installer/PathRenamer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PathRenamer-${{ steps.ver.outputs.version }}
+          path: |
+            dist/PathRenamer.exe
+            dist/PathRenamer-Setup-*.exe
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: PathRenamer ${{ steps.ver.outputs.version }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/PathRenamer-Setup-*.exe
+            dist/PathRenamer.exe

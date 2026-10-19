@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.3.0
+
+Built with Python 3.13 (1.2.0 used 3.12) and current libraries: PyQt6 6.11,
+guessit 4.4 (was 3.8), rapidfuzz 3.14, requests 2.34.
 
 Renaming fixes, found by running about 1,900 real-world release names (from the
 test data of Sonarr, Radarr, guessit and other release-name parsers) through the
