@@ -41,3 +41,15 @@ inside it. Each recovered file compiles to exactly the bytecode that shipped,
 checked code object by code object, including line and column positions.
 Code, strings and docstrings are therefore original. Comments are not stored
 in bytecode, so the comments in these files were written afresh.
+
+### Running the tests
+
+```
+pip install -r src/requirements.txt pytest
+python -m pytest
+```
+
+The tests feed real-world release names (scene, P2P, anime fansub, foreign and
+daily-show names) through the same code the app uses, and check renaming,
+undo, subtitle pickup and duplicate detection on real files in a temp folder.
+They pass with guessit 3.8 (the version in the 1.2.0 build) and guessit 4.x.
