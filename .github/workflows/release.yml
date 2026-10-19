@@ -1,15 +1,29 @@
 # Builds PathRenamer.exe and the installer on Windows and publishes them as a
-# GitHub Release. Start it by pushing a tag that matches APP_VERSION in
-# src/main.py, e.g.:  git tag v1.3.0 && git push origin v1.3.0
-# On pull requests it only builds (the exe and installer are downloadable
-# from the run's artifacts), so a broken build shows up before release.
+# GitHub Release.
+#
+# The easy way: on GitHub open Actions > Release > "Run workflow" > Run.
+# It reads the version from APP_VERSION in src/main.py, builds, and publishes
+# release "V<version>" with RELEASE_NOTES.md as its text. A tag left behind by
+# a deleted release is moved to the new build.
+#
+# Also works by pushing a tag (git tag V1.3.0 && git push origin V1.3.0) or by
+# publishing a release on the website with a new tag: the installer is then
+# attached to that release a few minutes later.
+#
+# On pull requests it only builds (the exe and installer are downloadable from
+# the run's artifacts), so a broken build shows up before release.
 name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "V*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a release (untick to only build a test installer)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -35,6 +49,7 @@ jobs:
         run: |
           $v = (Select-String -Path src/main.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
           "version=$v" >> $env:GITHUB_OUTPUT
+          # Tags may be v1.3.0 or V1.3.0 (PowerShell compares case-insensitively)
           if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$v") {
             throw "Tag ${{ github.ref_name }} does not match APP_VERSION $v in src/main.py"
           }
@@ -69,11 +84,37 @@ jobs:
             dist/PathRenamer-Setup-*.exe
 
       - name: Publish release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
-        with:
-          name: PathRenamer ${{ steps.ver.outputs.version }}
-          body_path: RELEASE_NOTES.md
-          files: |
-            dist/PathRenamer-Setup-*.exe
-            dist/PathRenamer.exe
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          $files = @("dist/PathRenamer-Setup-$env:VERSION.exe", "dist/PathRenamer.exe")
+          $fromTag = $env:GITHUB_EVENT_NAME -eq "push"
+          $tag = if ($fromTag) { $env:GITHUB_REF_NAME } else { "V$env:VERSION" }
+
+          gh release view $tag --repo $repo *> $null
+          $exists = $LASTEXITCODE -eq 0
+          if ($exists -and $fromTag) {
+            # Release made on the GitHub website: attach the installer to it
+            gh release upload $tag @files --repo $repo --clobber
+          } elseif ($exists) {
+            throw ("Release $tag already exists. To publish a new version, raise APP_VERSION in " +
+                   "src/main.py first, or delete release $tag on GitHub and run this again.")
+          } else {
+            if (-not $fromTag) {
+              # A tag left behind by a deleted release: point it at this build
+              $old = gh api "repos/$repo/git/ref/tags/$tag" --jq ".object.sha" 2>$null
+              if ($LASTEXITCODE -eq 0 -and $old -and $old -ne $env:GITHUB_SHA) {
+                Write-Host "Moving leftover tag $tag from $old to $env:GITHUB_SHA"
+                gh api -X PATCH "repos/$repo/git/refs/tags/$tag" -f sha=$env:GITHUB_SHA -F force=true | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "Could not move tag $tag" }
+              }
+            }
+            gh release create $tag @files --repo $repo --target $env:GITHUB_SHA `
+              --title "Version $env:VERSION" --notes-file RELEASE_NOTES.md
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Publishing release $tag failed" }
+          Write-Host "Published: https://github.com/$repo/releases/tag/$tag"

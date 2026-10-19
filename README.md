@@ -14,15 +14,20 @@ Support me at: https://ko-fi.com/pathrenamer
 
 ## Source code
 
-The Python source for v1.2.0 is in [`src/`](src/):
+The Python source is in [`src/`](src/):
 
 | File | Purpose |
 | --- | --- |
-| `src/main.py` | The app: UI, filename parsing, metadata lookups, renaming |
-| `src/parser.py` | Show-folder name cleanup helpers |
-| `src/scanner.py` | Subtitle language detection and naming helpers |
+| `src/main.py` | The app: window layouts, metadata lookups, renaming, subtitles |
+| `src/parser.py` | Reads title, year, season and episode from release names and folders |
+| `src/scanner.py` | Subtitle language/flag detection and Plex subtitle names |
 | `src/newicon.ico` | App and window icon |
 | `src/build_exe.bat` | Builds `dist\PathRenamer.exe` with PyInstaller |
+
+The window has two layouts, chosen in Settings → Appearance → Layout (or
+View → Layout): **Modern** (default; file list and preview side by side, details
+panel, resizable panes that stack on narrow windows) and **Classic** (the
+original 1.2.0 layout). Both use the same theme colours.
 
 Run from source:
 
@@ -51,17 +56,28 @@ python -m pytest
 
 The tests feed real-world release names (scene, P2P, anime fansub, foreign and
 daily-show names) through the same code the app uses, and check renaming,
-undo, subtitle pickup and duplicate detection on real files in a temp folder.
-They pass with guessit 3.8 (the version in the 1.2.0 build) and guessit 4.x.
+undo, subtitle pickup and naming, and duplicate detection on real files in a
+temp folder. They also build the real window offscreen in both layouts (switching
+layouts, the details panel, Settings, drag & drop). They pass with guessit 3.8
+(the version in the 1.2.0 build) and guessit 4.x.
 
 ### Making a release
 
 Releases are built by GitHub Actions (`.github/workflows/release.yml`) on Windows
-with Python 3.13 and the versions in `src/requirements-lock.txt`:
+with Python 3.13 and the versions in `src/requirements-lock.txt`. Everything is
+done on the GitHub website:
 
-1. Set `APP_VERSION` in `src/main.py` and update `RELEASE_NOTES.md`.
-2. Commit, then push a matching tag: `git tag v1.3.0` and `git push origin v1.3.0`.
+1. Make sure `APP_VERSION` in `src/main.py` is the new version and
+   `RELEASE_NOTES.md` describes it (the release page shows that text).
+2. Open the **Actions** tab, click **Release** on the left, then
+   **Run workflow** → **Run workflow** (branch `main`).
+3. After about five minutes the run turns green and **Releases** has
+   "Version X.Y.Z" with `PathRenamer-Setup-X.Y.Z.exe` and `PathRenamer.exe`.
 
 The workflow runs the tests, builds `PathRenamer.exe` with PyInstaller and
 `PathRenamer-Setup-<version>.exe` with Inno Setup (`installer/PathRenamer.iss`),
-and publishes both on the Releases page.
+and publishes release tag `V<version>`. If that version was already released
+it stops and says so; a tag left behind by a deleted release is moved to the
+new build. Publishing a release on the website with a new tag, or pushing a
+tag (`git tag V1.3.0 && git push origin V1.3.0`), also works: the installer is
+attached a few minutes later.
