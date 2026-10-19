@@ -58,9 +58,8 @@ sys.excepthook = _global_except_hook
 
 
 import requests
-import guessit
 import re
-from parser import clean_show_folder, is_valid_show_name
+from parser import analyse_path
 from rapidfuzz import fuzz
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -130,16 +129,42 @@ def cfg_save(cfg):
 VIDEO_EXT = {".mkv",".mp4",".avi",".mov",".wmv",".m4v",".ts",".m2ts",".flv",".webm",".mpg",".mpeg"}
 SUB_EXT   = {".srt",".sub",".ass",".ssa",".vtt",".idx"}
 
+# Sub-folders holding samples and bonus material, not episodes or movies
+# (Plex's extras folder names plus the usual release-folder ones).
+_SKIP_SCAN_DIRS = {"sample", "samples", "extras", "featurettes", "behind the scenes",
+                   "deleted scenes", "interviews", "trailers", "shorts", "bonus"}
+# "Movie.2019.1080p-sample.mkv", "sample-movie.mkv"
+_SAMPLE_FILE = re.compile(r"(?:^|[\s._-])sample(?:$|[\s._-])", re.IGNORECASE)
+
 def scan_folder(folder, include_subtitles=False):
+    """Video files (and optionally subtitles) under folder. Samples and files in
+    extras/sample sub-folders are skipped: renamed like the main file they would
+    collide with it."""
     result = []
-    for root, _, files in os.walk(folder):
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if d.strip().lower() not in _SKIP_SCAN_DIRS)
         for name in sorted(files):
             p = Path(root) / name
             if p.suffix.lower() in VIDEO_EXT:
+                if _SAMPLE_FILE.search(p.stem):
+                    continue
                 result.append(p)
             elif include_subtitles and p.suffix.lower() in SUB_EXT:
                 result.append(p)
     return result
+
+def _sub_matches_video(sub_stem, video_stem):
+    """True if the subtitle is named after the video: "Movie" -> "Movie.en",
+    "Movie_forced", "Movie (SDH)". "Show - 1" must not match "Show - 10"."""
+    s, v = sub_stem.lower(), video_stem.lower()
+    start = s.find(v)
+    while start >= 0:
+        after = s[start + len(v):start + len(v) + 1]
+        before = s[start - 1:start] if start else ""
+        if (not after or not after.isalnum()) and (not before or not before.isalnum()):
+            return True
+        start = s.find(v, start + 1)
+    return False
 
 def find_subtitle_siblings(video):
     """Find subtitles in same dir and Subs folder."""
@@ -158,13 +183,20 @@ def find_subtitle_siblings(video):
     if parent.exists() and parent.is_dir():
         for f in parent.iterdir():
             if f.is_file() and f.suffix.lower() in SUB_EXT:
-                if f.stem.startswith(video.stem) or f.stem == video.stem:
+                if f.stem.lower().startswith(video.stem.lower()) and _sub_matches_video(f.stem, video.stem):
                     log.debug(f"Found sub in same dir: {f}")
                     _add(f)
 
     # Subtitle sub-folders next to the video (Subs/, Subtitles/, ...)
 
     SUBTITLE_FOLDER_NAMES = ["Subs", "Subtitles", "sub", "subtitle", "subs", "captions", "字幕", "VobSub", "VOBSUB", "English"]
+    # A release folder with a single video: everything in its Subs folder belongs
+    # to that video, whatever the subtitle files are called ("Subs/2_English.srt").
+    try:
+        only_video = sum(1 for f in parent.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXT
+                         and not _SAMPLE_FILE.search(f.stem)) == 1
+    except OSError:
+        only_video = False
     seen_dirs = set()
     for sub_dir_name in SUBTITLE_FOLDER_NAMES:
         sub_dir = parent / sub_dir_name
@@ -172,10 +204,17 @@ def find_subtitle_siblings(video):
         if dir_key in seen_dirs or not sub_dir.is_dir():
             continue
         seen_dirs.add(dir_key)
-        for f in sub_dir.iterdir():
+        for f in sorted(sub_dir.iterdir()):
             if f.is_file() and f.suffix.lower() in SUB_EXT:
-                if video.stem.lower() in f.stem.lower():
+                if only_video or _sub_matches_video(f.stem, video.stem):
                     log.debug(f"Found sub in Sub folder: {f}")
+                    _add(f)
+        # Season packs: Subs/<video name>/2_English.srt
+        nested = sub_dir / video.stem
+        if nested.is_dir():
+            for f in sorted(nested.iterdir()):
+                if f.is_file() and f.suffix.lower() in SUB_EXT:
+                    log.debug(f"Found sub in per-episode Sub folder: {f}")
                     _add(f)
 
     log.debug(f"Total subs found for {video.name}: {len(subs)}")
@@ -202,7 +241,19 @@ def _normalize_rel(rel):
             segments.append(seg)
     return "/".join(segments)
 
-def fmt_tv(show, season, episode, title, ext, template, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", episode_type="dvd", episode_title=None, year=""):
+def _to_int(value, default):
+    """int(value), or default for None / "" / junk. Keeps 0 (Season 00, episode 0)."""
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def fmt_tv(show, season, episode, title, ext, template, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", episode_type="dvd", episode_title=None, year="", episodes=None, air_date=None):
+    """episodes: all episode numbers in the file (multi-episode files become
+    S01E01-E02, Plex's form). air_date: date-based shows become "2024-05-17"
+    inside a "Season 2024" folder, as Plex expects."""
     if isinstance(show, list):
         show = show[0] if show else "Unknown"
     if isinstance(title, list):
@@ -218,25 +269,25 @@ def fmt_tv(show, season, episode, title, ext, template, video_codec="", audio_co
     show_san = sanitize(show)
     title_san = sanitize(episode_title)
 
-    if isinstance(season, str):
-        try:
-            s = int(season)
-        except:
-            s = 1
-    else:
-        s = int(season) if season else 1
-
-    if isinstance(episode, str):
-        try:
-            e = int(episode)
-        except:
-            e = 1
-    else:
-        e = int(episode) if episode else 1
+    if isinstance(episode, (list, tuple)):
+        episodes, episode = list(episode), (episode[0] if episode else None)
+    s = _to_int(season, 1)
+    eps = [n for n in (_to_int(x, None) for x in (episodes or [])) if n is not None]
+    if not eps:
+        eps = [_to_int(episode, 1)]
+    e = eps[0]
 
     s00 = f"{s:02d}"
     e00 = f"{e:02d}"
-    s00e00 = f"S{s00}E{e00}"
+    if len(eps) > 1:
+        s00e00 = f"S{s00}E{e00}-E{eps[-1]:02d}"
+        abs00 = f"{e00}-{eps[-1]:02d}"
+    else:
+        s00e00 = f"S{s00}E{e00}"
+        abs00 = e00
+    if air_date:
+        s00 = str(air_date.year)
+        s00e00 = abs00 = air_date.isoformat()
 
     ctx = {
         "show": show_san,
@@ -245,6 +296,7 @@ def fmt_tv(show, season, episode, title, ext, template, video_codec="", audio_co
         "e": str(e),
         "e00": e00,
         "s00e00": s00e00,
+        "abs00": abs00,
         "title": title_san,
         "year": year,
         "vc": video_codec,
@@ -260,7 +312,7 @@ def fmt_tv(show, season, episode, title, ext, template, video_codec="", audio_co
         template = "{show} ({year})/Season {s00}/{show} {s00e00} - {title}"
 
     if episode_type == "absolute":
-        template = template.replace("{s00e00}", "{e00}")
+        template = template.replace("{s00e00}", "{abs00}")
         template = template.replace("{s00}", "")
 
     try:
@@ -284,7 +336,9 @@ def fmt_movie(title, year, ext, template, video_codec="", audio_codec="", audio_
         year = year[0] if year else None
 
 
-    y = str(year) if year else "Unknown"
+    # No year: leave it out ("Title" rather than "Title (Unknown)", which Plex
+    # would read as part of the title); _normalize_rel drops the empty "()".
+    y = str(year) if year else ""
 
     ctx = {
         "title": sanitize(title),
@@ -610,6 +664,12 @@ class TVMazeClient:
         d = self._get(f"/shows/{show_id}/episodebynumber", season=season, number=episode)
         return {"title": d.get("name", f"Episode {episode}")} if d else None
 
+    def get_episode_by_date(self, show_id, air_date):
+        d = self._get(f"/shows/{show_id}/episodesbydate", date=str(air_date))
+        if isinstance(d, list) and d:
+            return {"title": d[0].get("name") or str(air_date)}
+        return None
+
     def get_show_info(self, show_id: int):
         data = self._get(f"/shows/{show_id}")
         if not data:
@@ -727,45 +787,14 @@ class Candidate:
     media_source: str = ""
     resolution: str = ""
 
-_SEASONISH_FOLDER = re.compile(
-    r"^(season[\s._-]*\d*|s\d{1,2}(e\d{1,4})?|subs?|subtitles?|extras?|specials?|samples?)$",
-    re.IGNORECASE,
-)
-
 def derive_title_for(path: Path, media_type: str = "tv") -> str:
     """Best-guess show/movie title for a file.
 
-    TV/anime: folder-first (episode filenames often lack the show name), then
-    guessit on the filename. Movies: filename-first (movie files usually carry
-    their own name; the parent is often a dump folder like "Plex" or
-    "Downloads"), then the folder."""
-    parts = path.parts
-    parent = parts[-2] if len(parts) >= 2 else ""
-
-    def _folder_title():
-        cleaned = clean_show_folder(parent) if parent else ""
-        if cleaned and is_valid_show_name(cleaned):
-            return cleaned
-        # Parent is a season / extras folder: try the grandparent instead
-        if len(parts) >= 3 and parent and _SEASONISH_FOLDER.match(parent.strip()):
-            gp = clean_show_folder(parts[-3])
-            if gp and is_valid_show_name(gp):
-                return gp
-        return ""
-
-    def _file_title():
-        raw = guessit.guessit(path.name)
-        t = raw.get("title")
-        if isinstance(t, list):
-            t = t[0] if t else None
-        t = str(t).strip() if t else ""
-        return t if t and is_valid_show_name(t) else ""
-
-    if media_type == "movie":
-        title = _file_title() or _folder_title()
-    else:
-        title = _folder_title() or _file_title()
-    return title or "Unknown"
+    The file name wins when it carries the show/movie name itself; the folder
+    (or the show folder above a "Season N" folder) is used when the file name
+    has no title, only an episode title or a scene short name, or when both
+    agree. See parser.analyse_path."""
+    return analyse_path(path, media_type).title or "Unknown"
 
 
 class MatchEngine:
@@ -836,11 +865,9 @@ class MatchEngine:
 
     def search_all_matches(self, path, media_type):
         try:
-            title = derive_title_for(path, media_type)
-            raw = guessit.guessit(path.name)
-            year = raw.get("year")
-            if isinstance(year, list):
-                year = year[0] if year else None
+            guess = analyse_path(path, media_type)
+            title = guess.title or "Unknown"
+            year = guess.year
 
             matches = []
             if media_type == "movie":
@@ -887,38 +914,13 @@ class MatchEngine:
     def match_with_override(self, path, media_type, selected_title=None, selected_id=None):
         try:
             ext = path.suffix.lower()
-            raw = guessit.guessit(path.name)
-
-            # Prefer an explicit SxxExx in the file name
-            ep_match = re.search(r'S(\d+)E(\d+)', path.name, re.IGNORECASE)
-            if ep_match:
-                season = int(ep_match.group(1))
-                episode = int(ep_match.group(2))
-                log.info(f"Used regex for {path.name}: S{season:02d}E{episode:02d}")
-
-                # A parent folder (one or two levels up) carrying SxxExx wins,
-                # e.g. episode files inside per-episode release folders.
-
-                for check_level in (1, 2):
-                    if len(path.parts) > check_level:
-                        check_part = path.parts[-(check_level + 1)]
-                        if check_part != path.name:
-                            parent_ep_match = re.search(r'S(\d+)E(\d+)', check_part, re.IGNORECASE)
-                            if parent_ep_match:
-                                season = int(parent_ep_match.group(1))
-                                episode = int(parent_ep_match.group(2))
-                                log.info(f"Used parent folder (level {check_level}) for episode: S{season:02d}E{episode:02d}")
-                                break
-            else:
-                season = int(self._scalar(raw, "season", None) or 1)
-                try:
-                    episode = int(self._scalar(raw, "episode", 1) or 1)
-                except (TypeError, ValueError):
-                    episode = 1
-
-            title = derive_title_for(path, media_type)
-            tvmaze_log.debug(f"TITLE_DETECT: file='{path.name}' -> '{title}'")
-            year = self._scalar(raw, "year", None)
+            # Title, year, season, episode(s) / air date from the file name and
+            # its folders. The file's own SxxEyy always wins; a folder's only
+            # fills in what the file name lacks (e.g. obfuscated file names).
+            guess = analyse_path(path, media_type)
+            raw = guess.raw
+            title = guess.title
+            tvmaze_log.debug(f"TITLE_DETECT: file='{path.name}' -> '{title}' (from {guess.title_source or 'nothing'})")
             video_codec = self._scalar(raw, "video_codec")
             audio_codec = self._scalar(raw, "audio_codec")
             audio_channels = self._scalar(raw, "audio_channels")
@@ -927,16 +929,46 @@ class MatchEngine:
 
             if selected_title:
                 title = selected_title
+            if not title:
+                return Candidate(path, path.name, media_type, 0.0,
+                                 error="No title found in the file or folder name")
 
             if media_type == "movie":
-                return self._movie_with_title(path, title, year, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id)
-            elif media_type == "anime":
-                return self._anime_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id)
+                return self._movie_with_title(path, title, guess.year, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id)
+
+            if not guess.episodes and not guess.date:
+                # Better to skip than to invent S01E01 (every such file would collide)
+                return Candidate(path, path.name, media_type, 0.0,
+                                 error="No season/episode number in the name")
+            season = guess.season if guess.season is not None else 1
+            episodes = guess.episodes
+            episode = episodes[0] if episodes else None
+            log.info(f"Parsed {path.name}: title='{title}' S{season} E{episodes} date={guess.date} year={guess.year}")
+            extra = dict(year=guess.year, episodes=episodes, air_date=guess.date,
+                         fallback_title=guess.episode_title if guess.date else "")
+            if media_type == "anime":
+                return self._anime_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id, **extra)
             else:
-                return self._tv_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id)
+                return self._tv_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id, **extra)
         except Exception as e:
             log.exception(f"match_with_override failed for {path.name}: {e}")
             return Candidate(path, path.name, media_type, 0.0, error=str(e))
+
+    def _episode_titles(self, client, show_id, season, episodes, air_date):
+        """Episode title(s) from TVMaze / AniDB. Multi-episode files get the
+        distinct titles joined ("Part 1 & Part 2"); date-based shows look the
+        episode up by air date."""
+        if air_date:
+            getter = getattr(client, "get_episode_by_date", None)
+            e = getter(show_id, air_date) if getter else None
+            return e.get("title") if e else None
+        titles = []
+        for n in episodes[:3]:
+            e = client.get_episode(show_id, season, n)
+            t = e.get("title") if e else None
+            if t and t not in titles:
+                titles.append(t)
+        return " & ".join(titles) if titles else None
 
     @staticmethod
     def _split_selected_id(selected_id):
@@ -948,8 +980,10 @@ class MatchEngine:
             return selected_id[0], selected_id[1]
         return "tvmaze", selected_id
 
-    def _tv_with_title(self, path, title, season, episode, ext, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", selected_id=None):
-        show, ep_title, conf = title, f"Episode {episode}", 0.95
+    def _tv_with_title(self, path, title, season, episode, ext, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", selected_id=None, year=None, episodes=None, air_date=None, fallback_title=""):
+        episodes = list(episodes) if episodes else ([episode] if episode is not None else [])
+        default_title = fallback_title or (air_date.isoformat() if air_date else f"Episode {episode}")
+        show, ep_title, conf = title, default_title, 0.95
         show_year = ""
         id_src, sid = self._split_selected_id(selected_id)
 
@@ -962,9 +996,9 @@ class MatchEngine:
                 show = show_info.get("show", title)
                 show_year = show_info.get("year", "")
                 log.debug(f"TVMaze show info: {show}, year: '{show_year}'")
-            e = self.tvmaze.get_episode(sid, season, episode)
-            if e:
-                ep_title = e.get("title", f"Episode {episode}")
+            t = self._episode_titles(self.tvmaze, sid, season, episodes, air_date)
+            if t:
+                ep_title = t
                 log.debug(f"TVMaze episode title: {ep_title}")
         elif self.tvmaze:
             # Automatic match
@@ -975,9 +1009,9 @@ class MatchEngine:
                 show_year = s.get("year", "")
                 tvmaze_log.debug(f"TVMAZE_FOUND: show='{show}', year='{show_year}', id={s['id']}")
                 log.debug(f"TVMaze found: {show}, year: '{show_year}'")
-                e = self.tvmaze.get_episode(s["id"], season, episode)
-                if e:
-                    ep_title = e.get("title", f"Episode {episode}")
+                t = self._episode_titles(self.tvmaze, s["id"], season, episodes, air_date)
+                if t:
+                    ep_title = t
                     conf = 0.95
                     log.debug(f"TVMaze episode: {ep_title}")
             else:
@@ -987,8 +1021,10 @@ class MatchEngine:
         else:
             conf = 0.5
 
+        if not show_year and year:
+            show_year = str(year)       # year from the file/folder name, e.g. "Doctor Who (2005)"
         ep_type = self.cfg.get("episode_tv", "dvd")
-        rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_tv",""), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year)
+        rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_tv",""), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
         c = Candidate(path, rel, "tv", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution)
         if ext not in SUB_EXT:
             self._subs(path, rel, c)
@@ -1032,8 +1068,10 @@ class MatchEngine:
             self._subs(path, rel, c)
         return c
 
-    def _anime_with_title(self, path, title, season, episode, ext, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", selected_id=None):
-        show, ep_title, conf = title, f"Episode {episode}", 0.90
+    def _anime_with_title(self, path, title, season, episode, ext, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", selected_id=None, year=None, episodes=None, air_date=None, fallback_title=""):
+        episodes = list(episodes) if episodes else ([episode] if episode is not None else [])
+        default_title = fallback_title or (air_date.isoformat() if air_date else f"Episode {episode}")
+        show, ep_title, conf = title, default_title, 0.90
         show_year = ""
         id_src, sid = self._split_selected_id(selected_id)
 
@@ -1043,15 +1081,15 @@ class MatchEngine:
                 show = show_info.get("show", title)
                 show_year = show_info.get("year", "")
                 log.debug(f"TVMaze anime show info: {show}, year: '{show_year}'")
-            e = self.tvmaze.get_episode(sid, season, episode)
-            if e:
-                ep_title = e.get("title", f"Episode {episode}")
+            t = self._episode_titles(self.tvmaze, sid, season, episodes, air_date)
+            if t:
+                ep_title = t
                 conf = 0.95
                 log.debug(f"TVMaze anime episode: {ep_title}")
         elif sid and id_src == "anidb" and self.anidb:
-            e = self.anidb.get_episode(sid, season, episode)
-            if e:
-                ep_title = e.get("title", f"Episode {episode}")
+            t = self._episode_titles(self.anidb, sid, season, episodes, air_date)
+            if t:
+                ep_title = t
                 conf = 0.95
         elif not sid:
             # Automatic match: TVMaze first, AniDB as fallback
@@ -1061,20 +1099,22 @@ class MatchEngine:
                 if s:
                     show = s["show"]
                     show_year = s.get("year", "")
-                    e = self.tvmaze.get_episode(s["id"], season, episode)
-                    if e:
-                        ep_title = e.get("title", f"Episode {episode}")
+                    t = self._episode_titles(self.tvmaze, s["id"], season, episodes, air_date)
+                    if t:
+                        ep_title = t
                         conf = 0.90
             if conf < 0.9 and self.anidb:
                 s = self.anidb.search_anime(title)
                 if s:
                     show, conf = s["show"], 0.90
-                    e = self.anidb.get_episode(s["id"], season, episode)
-                    if e:
-                        ep_title = e.get("title", f"Episode {episode}")
+                    t = self._episode_titles(self.anidb, s["id"], season, episodes, air_date)
+                    if t:
+                        ep_title = t
 
+        if not show_year and year:
+            show_year = str(year)
         ep_type = self.cfg.get("episode_anime", "dvd")
-        rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_anime", self.cfg.get("format_tv","")), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year)
+        rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_anime", self.cfg.get("format_tv","")), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
         c = Candidate(path, rel, "anime", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution)
         if ext not in SUB_EXT:
             self._subs(path, rel, c)
@@ -1736,6 +1776,7 @@ class ScanWorker(QObject):
         self.media_type = media_type; self.dest_root = dest_root
         self.selected_overrides = selected_overrides or {}
         self._sub_output_counts = {}
+        self._dest_owner = {}     # normalised destination -> first source file renamed to it
 
     def run(self):
         log.info(f"Scan started: {len(self.files)} file(s), type={self.media_type}, dest={self.dest_root}")
@@ -1766,6 +1807,14 @@ class ScanWorker(QObject):
                 if dest.exists() and not _same_path(dest, f):
                     cand.conflict = True
                     log.warning(f"  CONFLICT: {dest}")
+                if not cand.error:
+                    # e.g. a 720p and a 1080p copy of the same episode: only the
+                    # first one can take the name, so flag the others now
+                    key = os.path.normcase(os.path.normpath(str(dest)))
+                    owner = self._dest_owner.setdefault(key, f)
+                    if not _same_path(owner, f):
+                        cand.error = f"Same new name as {owner.name}"
+                        log.warning(f"  DUPLICATE: {f.name} and {owner.name} -> {dest}")
                 self.candidate_ready.emit(cand)
             except Exception as e:
                 log.exception(f"Error matching {f.name}: {e}")
