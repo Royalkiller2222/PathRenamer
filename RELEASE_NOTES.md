@@ -1,31 +1,23 @@
-PathRenamer 1.3.0 has a new look and renames files much more reliably. About 1,900 real release names were run through the app: 71% used to be renamed wrongly, now 6.5% are.
+PathRenamer 1.4.0 adds tools to fix single files, safer ways to place files, rename history and new themes.
 
-**New look**
-- A new Modern layout: your files and the new names side by side, a details panel that shows exactly where each file and subtitle will go, and one-click TV Shows / Movies / Anime buttons.
-- Panels resize as you drag them and stack on smaller windows. Colors are unchanged.
-- Prefer the old layout? Settings → Appearance → Layout → Classic (or View → Layout).
-- The window remembers its size. Shortcuts: F5 preview, Ctrl+Enter rename, Ctrl+Z undo.
+**Fix any row by hand**
+- Right-click a row (or use **Fix ▾** in the Modern layout): Edit New Name (F2), Change Episode, Choose a Different Match, Number in Order.
+- Move rows up and down (Ctrl+↑ / Ctrl+↓). Then use Number in Order to give files without episode numbers (`Pilot.mkv`, `Part 2.mkv`) S01E01, E02, …
 
-**Better renaming**
-- Files are no longer named after the folder they happen to sit in (`Incoming/The.Office.US.S02E03.mkv` was renamed to "Incoming").
-- Titles like "Spider-Man", "1923", "The Last of Us" and "Dune Part Two" come out right.
-- Multi-episode files are named `S01E01-E03`, and daily shows by air date (`Season 2024/Show 2024-05-17`).
-- Specials (Season 00) and episode 0 are kept.
-- Anime and foreign names are understood: `[Group] Title - 01`, `Title S2 - 03`, `Staffel 2 Folge 5`, `Temporada 2 [Cap.201]` and more.
-- Movies with no year are no longer named "Title (Unknown)".
+**Keep torrents seeding**
+- Settings → Options → When renaming: Move, Copy, or Hard-link. Hard links put the file in your library without moving the download or using extra space (same drive only; otherwise the file is copied).
 
-**Safer renaming**
-- Files with no recognisable title or episode number are flagged instead of renamed to "Unknown" or S01E01.
-- Two files that would get the same name are flagged.
-- Sample files and extras folders are skipped.
+**Rename history**
+- Edit → Rename History (Ctrl+H) lists every rename, also after closing the app. Any of them can be undone.
 
-**Subtitles**
-- More subtitles are found: `Subs/2_English.srt`, `English.srt` next to a movie, season-pack `Subs` folders, `.sup` and `.smi` files.
-- Languages are labelled correctly: French, German, Brazilian Portuguese, Latin American Spanish, Chinese and others were often labelled English before.
-- Two subtitles in the same language both keep their language in Plex.
-- `Show - 1.srt` no longer gets attached to `Show - 10.mkv`.
+**Movie editions**
+- Director's Cut, Extended, IMAX, Final Cut and others are named the Plex way: `Aliens (1986) {edition-Special Edition}`. Two cuts of a movie no longer get the same name.
 
-**Under the hood**
-- Built with Python 3.13 and current versions of PyQt6, guessit, rapidfuzz and requests.
+**Presets**
+- Presets menu (or **Presets ▾** in the toolbar): save your naming formats, library folders, data sources and rename mode, and switch between them in one click.
 
-Install with **PathRenamer-Setup-1.3.0.exe**. It upgrades an existing installation and keeps your settings. **PathRenamer.exe** is the same app without an installer.
+**Themes**
+- Dark is now neutral dark grey. The old green theme is called **Emerald**.
+- New **Custom** theme: View → Edit Custom Theme lets you change every color, with a live preview. Themes can be exported and imported.
+
+Install with **PathRenamer-Setup-1.4.0.exe**. It upgrades an existing installation and keeps your settings. **PathRenamer.exe** is the same app without an installer.

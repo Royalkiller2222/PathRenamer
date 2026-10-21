@@ -4,58 +4,7 @@ import time
 
 import pytest
 
-from conftest import make_files
-
-
-@pytest.fixture
-def make_window(main, qapp, tmp_path, monkeypatch):
-    """Build real main windows (offline, nothing written to the real config)."""
-    from PyQt6.QtWidgets import QMessageBox
-    saved = {}
-    windows = []
-    monkeypatch.setattr(main, "cfg_save", lambda c: saved.update(c))
-    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
-
-    def factory(**overrides):
-        cfg = dict(main.DEFAULTS, first_run=False, media_type="movie", root_movie=str(tmp_path / "lib"),
-                   use_tvmaze=False, use_anidb=False, use_cinemeta=False, last_source_folder="")
-        cfg.update(overrides)
-        monkeypatch.setattr(main, "cfg_load", lambda: dict(cfg))
-        w = main.MainWindow()
-        windows.append(w)
-        return w
-    factory.saved = saved
-    yield factory
-    for w in windows:
-        w.close()
-
-
-def _preview(main, w, files):
-    """Run the matcher like Preview does, without the network or dialogs."""
-    w._add_files_to_list(files)
-    worker = main.ScanWorker(files, main.MatchEngine(cfg=w.cfg), w._media_type(), w._get_destination())
-    worker.candidate_ready.connect(w._on_candidate)
-    w._scanning = True
-    worker.run()
-    w._on_scan_done()
-
-
-def _wait(qapp, ms):
-    end = time.monotonic() + ms / 1000
-    while time.monotonic() < end:
-        qapp.processEvents()
-        time.sleep(0.01)
-
-
-def _wait_until(qapp, condition, timeout=3.0):
-    """Process events until condition() is true (animations run on a timer)."""
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        qapp.processEvents()
-        if condition():
-            return True
-        time.sleep(0.01)
-    return condition()
+from conftest import make_files, run_preview as _preview, wait as _wait, wait_until as _wait_until
 
 
 def test_modern_is_the_default_layout(main, make_window):
@@ -234,3 +183,20 @@ def test_restoring_the_window_keeps_pane_sizes(main, make_window, qapp):
     before = w._split_main.sizes()
     w.hide(); _wait(qapp, 20); w.show(); _wait(qapp, 50)
     assert w._split_main.sizes() == before
+
+
+def test_presets_save_and_apply(main, make_window, tmp_path):
+    w = make_window(media_type="movie", root_movie=str(tmp_path / "movies"), rename_action="move")
+    w._save_preset("Plex movies")
+    w.cfg.update(media_type="tv", root_tv=str(tmp_path / "tv"), format_movie="{title}", rename_action="hardlink")
+    w.combo.setCurrentIndex(0)
+    w._save_preset("Seeding TV")
+    w._apply_preset("Plex movies")
+    assert w._media_type() == "movie" and w.cfg["format_movie"] == main.DEFAULTS["format_movie"]
+    assert w.cfg["rename_action"] == "move" and str(tmp_path / "movies") in w.lib_label.text()
+    w._apply_preset("Seeding TV")
+    assert w._media_type() == "tv" and w.cfg["rename_action"] == "hardlink"
+    assert sorted(make_window.saved["presets"]) == ["Plex movies", "Seeding TV"]
+    w._fill_presets_menu()
+    texts = [a.text() for a in w.presets_menu.actions()]
+    assert "Use “Plex movies”" in texts and "Save Current Settings as Preset…" in texts

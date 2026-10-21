@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -50,3 +51,55 @@ def make_files(root: Path, *rel_paths: str) -> list:
         p.write_bytes(b"")
         out.append(p)
     return out
+
+
+@pytest.fixture
+def make_window(main, qapp, tmp_path, monkeypatch):
+    """Build real main windows (offline, nothing written to the real config)."""
+    from PyQt6.QtWidgets import QMessageBox
+    saved = {}
+    windows = []
+    monkeypatch.setattr(main, "cfg_save", lambda c: saved.update(c))
+    monkeypatch.setattr(main, "HISTORY_PATH", tmp_path / "history.json")
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+
+    def factory(**overrides):
+        cfg = dict(main.DEFAULTS, first_run=False, media_type="movie", root_movie=str(tmp_path / "lib"),
+                   use_tvmaze=False, use_anidb=False, use_cinemeta=False, last_source_folder="")
+        cfg.update(overrides)
+        monkeypatch.setattr(main, "cfg_load", lambda: dict(cfg))
+        w = main.MainWindow()
+        windows.append(w)
+        return w
+    factory.saved = saved
+    yield factory
+    for w in windows:
+        w.close()
+
+
+def run_preview(main, w, files):
+    """Run the matcher like Preview does, without the network or dialogs."""
+    w._add_files_to_list(files)
+    worker = main.ScanWorker(files, main.MatchEngine(cfg=w.cfg), w._media_type(), w._get_destination())
+    worker.candidate_ready.connect(w._on_candidate)
+    w._scanning = True
+    worker.run()
+    w._on_scan_done()
+
+
+def wait(qapp, ms):
+    end = time.monotonic() + ms / 1000
+    while time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(0.01)
+
+
+def wait_until(qapp, condition, timeout=5.0):
+    """Process events until condition() is true (animations run on a timer)."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        qapp.processEvents()
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()

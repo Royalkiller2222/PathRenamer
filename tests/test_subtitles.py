@@ -172,6 +172,7 @@ def window(main, qapp, tmp_path, monkeypatch):
                use_tvmaze=False, use_anidb=False, use_cinemeta=False, last_source_folder="")
     monkeypatch.setattr(main, "cfg_load", lambda: dict(cfg))
     monkeypatch.setattr(main, "cfg_save", lambda c: None)
+    monkeypatch.setattr(main, "HISTORY_PATH", tmp_path / "history.json")
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)
     w = main.MainWindow()
