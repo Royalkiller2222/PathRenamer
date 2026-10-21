@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.0
+
+- Fix single rows in the preview: edit the new name (F2), change the episode
+  (Ctrl+E), choose a different match (Ctrl+M), move rows up/down
+  (Ctrl+Up/Down) and number selected rows in list order (Ctrl+N). Right-click
+  menu, double-click, and a Fix button in the Modern layout.
+- Rename mode: move, copy, or hard-link (falls back to copying across drives).
+- Rename history saved to `history.json`; Edit → Rename History undoes any
+  past rename, also after a restart. Copies are only deleted on undo while the
+  original still exists and the copy is unchanged.
+- Movie editions as Plex `{edition-...}` tags (`{edition}` variable, now in
+  the default movie format; the 1.3.0 default is upgraded automatically).
+- Presets of naming formats, library folders, data sources and rename mode.
+- Themes are palettes (src/themes.py). Dark is neutral grey; the former green
+  Dark is Emerald (unchanged, checked against a 1.3.0 snapshot); new Custom
+  theme with an editor for every colour, live preview, import/export.
+
 ## 1.3.0
 
 Built with Python 3.13 (1.2.0 used 3.12) and current libraries: PyQt6 6.11,

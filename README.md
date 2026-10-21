@@ -21,6 +21,8 @@ The Python source is in [`src/`](src/):
 | `src/main.py` | The app: window layouts, metadata lookups, renaming, subtitles |
 | `src/parser.py` | Reads title, year, season and episode from release names and folders |
 | `src/scanner.py` | Subtitle language/flag detection and Plex subtitle names |
+| `src/themes.py` | Colour themes (palettes) and the stylesheets built from them |
+| `src/history.py` | Rename history kept on disk, for undo |
 | `src/newicon.ico` | App and window icon |
 | `src/build_exe.bat` | Builds `dist\PathRenamer.exe` with PyInstaller |
 

@@ -52,3 +52,48 @@ def test_movie_without_year_has_no_unknown_placeholder(main):
     rel = main.fmt_movie("Inception", None, ".mkv", MOVIE, resolution="1080p")
     assert rel == "Inception/Inception 1080p.mkv"
     assert "Unknown" not in rel
+
+
+def test_movie_edition_uses_the_plex_tag(main):
+    rel = main.fmt_movie("Aliens", 1986, ".mkv", main.DEFAULTS["format_movie"], resolution="1080p",
+                         edition="Special Edition")
+    assert rel == "Aliens (1986)/Aliens (1986) {edition-Special Edition} 1080p.mkv"
+    assert main.fmt_movie("Aliens", 1986, ".mkv", main.DEFAULTS["format_movie"]) == "Aliens (1986)/Aliens (1986).mkv"
+
+
+import pytest
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("Aliens.1986.Special.Edition.1080p.BluRay.x264-GRP", "Special Edition"),
+    ("Alien.1979.Directors.Cut.1080p", "Director's Cut"),
+    ("The.Lord.of.the.Rings.2001.EXTENDED.1080p.BluRay", "Extended Edition"),
+    ("Dune.2021.IMAX.2160p.WEB-DL", "IMAX"),
+    ("Blade.Runner.1982.The.Final.Cut.1080p", "Final Cut"),
+    ("Apocalypse.Now.1979.Redux.720p", "Redux"),
+    ("Movie.2019.25th.Anniversary.Edition.1080p", "25th Anniversary Edition"),
+    ("Movie (2019) {edition-My Cut}", "My Cut"),
+    ("The.Final.Cut.2004.1080p", ""),            # a title, not an edition
+    ("Movie.2019.LIMITED.1080p", ""),            # a release type
+    ("Movie.2019.1080p.BluRay", ""),
+])
+def test_detect_edition(main, name, expected):
+    import guessit
+    raw = dict(guessit.guessit(name + ".mkv", {"type": "movie"}))
+    assert main.detect_edition(name, raw) == expected
+
+
+def test_two_cuts_of_a_movie_get_different_names(main, tmp_path):
+    from conftest import make_files
+    plain, special = make_files(tmp_path, "Aliens.1986.1080p.mkv", "Aliens.1986.1080p.Special.Edition.mkv")
+    engine = main.MatchEngine(cfg=dict(main.DEFAULTS))
+    assert engine.match(plain, "movie").dest_rel == "Aliens (1986)/Aliens (1986) 1080p.mkv"
+    assert engine.match(special, "movie").dest_rel == "Aliens (1986)/Aliens (1986) {edition-Special Edition} 1080p.mkv"
+
+
+def test_old_default_movie_format_is_upgraded(main, tmp_path, monkeypatch):
+    import json
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"format_movie": "{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}"}))
+    monkeypatch.setattr(main, "CONFIG_PATH", cfg_path)
+    assert main.cfg_load()["format_movie"] == main.DEFAULTS["format_movie"]

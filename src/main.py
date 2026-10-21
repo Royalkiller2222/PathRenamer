@@ -1,9 +1,10 @@
 import sys, os, json, re, shutil, gzip, time, xml.etree.ElementTree as ET, logging, traceback, html, functools
+import dataclasses
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # ── Logging / crash handler ───────────────────────────────────────────────────
 _APPDATA_BASE = Path(os.getenv("APPDATA", Path.home()))
@@ -57,9 +58,11 @@ def _global_except_hook(exc_type, exc_value, exc_tb):
 sys.excepthook = _global_except_hook
 
 
+import errno
 import requests
 import re
 from parser import analyse_path
+from history import RenameHistory, describe as describe_batch
 from scanner import (SUBTITLE_EXTENSIONS, detect_subtitle_language, is_language_only_name,
                      unique_subtitle_filename)
 from rapidfuzz import fuzz
@@ -82,6 +85,7 @@ from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QObject, QUrl, QTimer, QVaria
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════════
 CONFIG_PATH = _APP_DIR / "config.json"
+HISTORY_PATH = _APP_DIR / "history.json"
 DEFAULTS = {
     "tmdb_api_key": "",
     "last_source_folder": "",
@@ -90,7 +94,7 @@ DEFAULTS = {
     "root_anime": "",
     "media_type": "tv",
     "format_tv": "{show} ({year})/Season {s00}/{show} {s00e00} - {title}",
-    "format_movie": "{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}",
+    "format_movie": "{title} ({year})/{title} ({year}) {edition} {res} {vc} {ach} {c}",
     "format_anime": "{show} ({year})/Season {s00}/{show} {s00e00} - {title}",
     "episode_tv": "dvd",
     "episode_anime": "dvd",
@@ -108,7 +112,14 @@ DEFAULTS = {
     "show_details": True,          # modern: details panel under the preview
     "animations": True,            # modern: smooth panel animations
     "files_ratio": 0.3,            # modern: share of the window for the file list
+    "rename_action": "move",       # "move" | "copy" | "hardlink" (keeps torrents seeding)
+    "presets": {},                 # name -> saved settings (PRESET_KEYS)
 }
+
+# What a preset remembers
+PRESET_KEYS = ("media_type", "format_tv", "format_movie", "format_anime", "episode_tv", "episode_anime",
+               "root_tv", "root_movie", "root_anime", "rename_action", "rename_subtitles",
+               "use_tvmaze", "use_anidb", "use_cinemeta")
 
 LAYOUTS = ("modern", "classic")
 PANEL_MODES = ("auto", "side", "stacked")
@@ -119,6 +130,7 @@ DENSITIES = ("comfortable", "compact")
 _OLD_MOVIE_DEFAULTS = {
     "{title} ({year})/{title} ({year})",
     "{title} ({year})/{title} ({year}).{ext}",
+    "{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}",     # 1.3.0, before editions
 }
 
 def cfg_load():
@@ -395,6 +407,8 @@ def fmt_tv(show, season, episode, title, ext, template, video_codec="", audio_co
         "abs00": abs00,
         "title": title_san,
         "year": year,
+        "edition": "",
+        "edition_name": "",
         "vc": video_codec,
         "c": audio_codec,
         "ach": audio_channels,
@@ -425,9 +439,52 @@ def fmt_tv(show, season, episode, title, ext, template, video_codec="", audio_co
 
     return rel
 
-def fmt_movie(title, year, ext, template, video_codec="", audio_codec="", audio_channels="", media_source="", resolution=""):
+# Movie editions, written the Plex way: "Aliens (1986) {edition-Special Edition}.mkv".
+# Plex then shows both cuts of a movie under one title.
+_EDITION_NAMES = {
+    "special": "Special Edition", "extended": "Extended Edition", "collector": "Collector's Edition",
+    "criterion": "Criterion Collection", "deluxe": "Deluxe Edition", "theatrical": "Theatrical Cut",
+    "ultimate": "Ultimate Edition", "fan": "Fan Edit", "imax": "IMAX",
+}
+_EDITION_SKIP = {"limited", "festival"}          # release types, not cuts of the film
+_PLEX_EDITION = re.compile(r"\{edition-([^}]+)\}", re.IGNORECASE)
+_EDITION_EXTRA = [   # names guessit doesn't know; only looked for after the year
+    (re.compile(r"(?i)(?<![a-z])final[ ._-]cut(?![a-z])"), "Final Cut"),
+    (re.compile(r"(?i)(?<![a-z])redux(?![a-z])"), "Redux"),
+    (re.compile(r"(?i)(?<![a-z])(?:(\d{1,3}(?:st|nd|rd|th))[ ._-])?anniversary[ ._-]edition(?![a-z])"),
+     "Anniversary Edition"),
+]
+_YEAR_IN_NAME = re.compile(r"(?<!\d)(?:19|20)\d\d(?!\d)")
+
+def detect_edition(name, raw=None):
+    """The edition of a movie from its file name ("" if none): a Plex
+    {edition-...} tag already in the name, else what guessit found
+    ("Director's Cut", "Extended Edition", "IMAX", ...)."""
+    m = _PLEX_EDITION.search(name)
+    if m:
+        return m.group(1).strip()
+    found = []
+    ed = (raw or {}).get("edition")
+    for e in (ed if isinstance(ed, list) else [ed] if ed else []):
+        key = str(e).lower()
+        if key not in _EDITION_SKIP:
+            label = _EDITION_NAMES.get(key, str(e))
+            if label not in found:
+                found.append(label)
+    year = _YEAR_IN_NAME.search(name)
+    if year:                                       # "The.Final.Cut.2004" is a title, not an edition
+        after = name[year.end():]
+        for rx, label in _EDITION_EXTRA:
+            m = rx.search(after)
+            if m:
+                label = f"{m.group(1)} {label}" if m.lastindex and m.group(1) else label
+                if label not in found:
+                    found.append(label)
+    return " ".join(found)
+
+def fmt_movie(title, year, ext, template, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", edition=""):
     if not template or not template.strip():
-        template = "{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}"
+        template = DEFAULTS["format_movie"]
     if isinstance(year, list):
         year = year[0] if year else None
 
@@ -439,6 +496,8 @@ def fmt_movie(title, year, ext, template, video_codec="", audio_codec="", audio_
     ctx = {
         "title": sanitize(title),
         "year": y,
+        "edition": f"{{edition-{sanitize(edition)}}}" if edition else "",
+        "edition_name": sanitize(edition) if edition else "",
         "vc": video_codec,
         "c": audio_codec,
         "ach": audio_channels,
@@ -466,6 +525,8 @@ def fmt_movie(title, year, ext, template, video_codec="", audio_codec="", audio_
 @dataclass
 class RenameOp:
     src: Path; dst: Path; success: bool = False; error: str = ""
+    method: str = "move"      # how the file was placed: move | copy | hardlink | none
+    note: str = ""            # e.g. why a hard link became a copy
 
 @dataclass
 class RenameResult:
@@ -485,68 +546,132 @@ def _is_inside(child: Path, root: Path) -> bool:
     root_n = os.path.normcase(os.path.normpath(str(root)))
     return child_n != root_n and child_n.startswith(root_n + os.sep)
 
+RENAME_ACTIONS = ("move", "copy", "hardlink")
+
+def _cross_device(e):
+    """os.link failed because the two paths are on different drives."""
+    return getattr(e, "errno", None) == errno.EXDEV or getattr(e, "winerror", None) == 17
+
 class Renamer:
-    def __init__(self): self._history = []
+    """Puts files at their new names — moving, copying or hard-linking them —
+    and undoes that. Every batch goes into a RenameHistory; with a history
+    file, renames can still be undone after the app was closed."""
+
+    def __init__(self, history=None):
+        self.history = history if history is not None else RenameHistory(None)
+        self.last_batch_id = None
 
     @staticmethod
-    def _move(src, dst):
-        op = RenameOp(src=src, dst=dst)
+    def _place(src, dst, action="move"):
+        op = RenameOp(src=src, dst=dst, method=action)
         try:
             if not src.exists():
                 raise FileNotFoundError(f"Source no longer exists: {src}")
-            if dst.exists() and not _same_path(dst, src):
+            same = _same_path(dst, src)
+            if dst.exists() and not same:
                 raise FileExistsError(f"Exists: {dst}")
+            if same and action != "move":
+                op.method, op.success = "none", True      # already there: nothing to copy
+                return op
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
+            if action == "copy":
+                shutil.copy2(str(src), str(dst))
+            elif action == "hardlink":
+                try:
+                    os.link(str(src), str(dst))
+                except OSError as e:
+                    # Other drive, FAT/exFAT or a share without hard links: copy instead
+                    log.info(f"Hard link not possible ({e}); copying {src.name}")
+                    shutil.copy2(str(src), str(dst))
+                    op.method = "copy"
+                    op.note = ("copied: hard links only work on the same drive"
+                               if _cross_device(e) else "copied: this drive can't hard-link")
+            else:
+                shutil.move(str(src), str(dst))
             op.success = True
         except Exception as e:
             op.error = str(e)
         return op
 
-    def execute(self, ops, dest_root=None):
-        """Move each (src, dst) pair on its own; one undo step for all."""
-        return self.execute_groups([(op, []) for op in ops], dest_root)
+    def execute(self, ops, dest_root=None, action="move", source="manual"):
+        """Place each (src, dst) pair on its own; one undo step for all."""
+        return self.execute_groups([(op, []) for op in ops], dest_root, action, source)
 
-    def execute_groups(self, groups, dest_root=None):
+    def execute_groups(self, groups, dest_root=None, action="move", source="manual"):
         """groups: [((video src, dst), [(subtitle src, dst), ...]), ...].
-        A video's subtitles are moved only if the video was, so a failed move
+        A video's subtitles are placed only if the video was, so a failure
         never leaves its subtitles alone in the library. One undo step for all."""
-        result, batch = RenameResult(), []
+        result, done = RenameResult(), []
         for (src, dst), sub_ops in groups:
-            op = self._move(src, dst)
+            op = self._place(src, dst, action)
             result.ops.append(op)
             if op.success:
-                batch.append(op)
+                done.append(op)
             for s, d in sub_ops:
                 if not op.success:
                     result.ops.append(RenameOp(src=s, dst=d, error="Skipped: its video was not moved"))
                     continue
-                sop = self._move(s, d)
+                sop = self._place(s, d, action)
                 result.ops.append(sop)
                 if sop.success:
-                    batch.append(sop)
-        if batch: self._history.append((batch, dest_root))
-        return result
-    def can_undo(self): return bool(self._history)
-    def undo_last(self):
-        if not self._history: return RenameResult()
-        batch, dest_root = self._history.pop()
-        result = RenameResult()
-        for op in reversed(batch):
-            undo = RenameOp(src=op.dst, dst=op.src)
+                    done.append(sop)
+        self.last_batch_id = None
+        if done:
             try:
-                if not op.dst.exists():
-                    raise FileNotFoundError(f"File not found: {op.dst}")
-                if op.src.exists():
-                    raise FileExistsError(f"Original location occupied: {op.src}")
-                op.src.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(op.dst), str(op.src))
+                self.last_batch_id = self.history.add([(o.src, o.dst, o.method) for o in done],
+                                                      dest_root, source)["id"]
+            except OSError as e:
+                log.warning(f"Could not save the rename history: {e}")
+        return result
+
+    def can_undo(self):
+        return self.history.last_undoable() is not None
+
+    def undo_last(self):
+        batch = self.history.last_undoable()
+        return self.undo_batch(batch["id"]) if batch else RenameResult()
+
+    def undo_batch(self, batch_id):
+        """Put a batch back: moved files go back where they were; copies and
+        hard links are deleted (the originals never moved). A copy is only
+        deleted while its original still exists and it wasn't changed."""
+        batch = self.history.get(batch_id)
+        result = RenameResult()
+        if not batch or batch.get("undone"):
+            return result
+        dest_root = batch.get("dest_root") or None
+        for entry in reversed(batch["ops"]):
+            src, dst, method = Path(entry["src"]), Path(entry["dst"]), entry.get("method", "move")
+            undo = RenameOp(src=dst, dst=src, method=method)
+            try:
+                if method == "download":          # a subtitle downloaded after the rename
+                    if dst.exists():
+                        dst.unlink()
+                elif method == "none":
+                    pass
+                elif method == "move":
+                    if not dst.exists():
+                        raise FileNotFoundError(f"File not found: {dst}")
+                    if src.exists() and not _same_path(src, dst):
+                        raise FileExistsError(f"Original location occupied: {src}")
+                    src.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(dst), str(src))
+                else:
+                    if not dst.exists():
+                        raise FileNotFoundError(f"File not found: {dst}")
+                    if not src.exists():
+                        raise FileNotFoundError(f"The original is gone, so the copy was kept: {dst}")
+                    if method == "copy" and dst.stat().st_size != src.stat().st_size:
+                        raise ValueError(f"The copy was changed since, so it was kept: {dst}")
+                    dst.unlink()
                 undo.success = True
                 if dest_root:
-                    _cleanup_empty_dirs(op.dst.parent, stop=Path(dest_root))
+                    _cleanup_empty_dirs(dst.parent, stop=Path(dest_root))
             except Exception as e:
                 undo.error = str(e)
             result.ops.append(undo)
+        if not result.ops or any(o.success for o in result.ops):
+            self.history.mark_undone(batch_id)
         return result
 
 def detect_conflicts(ops):
@@ -904,6 +1029,11 @@ class Candidate:
     audio_channels: str = ""
     media_source: str = ""
     resolution: str = ""
+    # What the name was built from, so one row can be fixed by hand
+    title: str = ""                       # show or movie title used
+    season: Optional[int] = None
+    episodes: List[int] = field(default_factory=list)
+    manual: bool = False                  # new name typed by the user
 
 def derive_title_for(path: Path, media_type: str = "tv") -> str:
     """Best-guess show/movie title for a file.
@@ -944,9 +1074,14 @@ class MatchEngine:
     def search_all_matches(self, path, media_type):
         try:
             guess = analyse_path(path, media_type)
-            title = guess.title or "Unknown"
-            year = guess.year
+            return self.search_title(guess.title or "Unknown", media_type, guess.year)
+        except Exception as e:
+            log.exception(f"search_all_matches failed for {path.name}: {e}")
+            return []
 
+    def search_title(self, title, media_type, year=None):
+        """Shows or movies matching a title, for the match chooser."""
+        try:
             matches = []
             if media_type == "movie":
                 if self.tmdb:
@@ -978,7 +1113,7 @@ class MatchEngine:
                     log.debug(f"Using TVMaze for TV show search: {title}")
             return matches
         except Exception as e:
-            log.exception(f"search_all_matches failed for {path.name}: {e}")
+            log.exception(f"search_title failed for {title!r}: {e}")
             return []
 
     @staticmethod
@@ -989,13 +1124,21 @@ class MatchEngine:
             v = v[0] if v else default
         return v
 
-    def match_with_override(self, path, media_type, selected_title=None, selected_id=None):
+    def match_with_override(self, path, media_type, selected_title=None, selected_id=None,
+                            season=None, episodes=None):
+        """season / episodes: numbers chosen by the user for this file (Change
+        Episode, Number in Order); they replace what the name says."""
         try:
             ext = path.suffix.lower()
             # Title, year, season, episode(s) / air date from the file name and
             # its folders. The file's own SxxEyy always wins; a folder's only
             # fills in what the file name lacks (e.g. obfuscated file names).
             guess = analyse_path(path, media_type)
+            if episodes:
+                guess.episodes = [int(e) for e in episodes]
+                guess.date = None
+                if season is not None:
+                    guess.season = int(season)
             raw = guess.raw
             title = guess.title
             tvmaze_log.debug(f"TITLE_DETECT: file='{path.name}' -> '{title}' (from {guess.title_source or 'nothing'})")
@@ -1012,7 +1155,8 @@ class MatchEngine:
                                  error="No title found in the file or folder name")
 
             if media_type == "movie":
-                return self._movie_with_title(path, title, guess.year, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id)
+                return self._movie_with_title(path, title, guess.year, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id,
+                                              edition=detect_edition(path.stem, raw))
 
             if not guess.episodes and not guess.date:
                 # Better to skip than to invent S01E01 (every such file would collide)
@@ -1103,12 +1247,13 @@ class MatchEngine:
             show_year = str(year)       # year from the file/folder name, e.g. "Doctor Who (2005)"
         ep_type = self.cfg.get("episode_tv", "dvd")
         rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_tv",""), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
-        c = Candidate(path, rel, "tv", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution)
+        c = Candidate(path, rel, "tv", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
+                      title=show, season=season, episodes=list(episodes))
         if ext not in SUB_EXT:
             self._subs(path, rel, c)
         return c
 
-    def _movie_with_title(self, path, title, year, ext, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", selected_id=None):
+    def _movie_with_title(self, path, title, year, ext, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", selected_id=None, edition=""):
         conf = 0.9 if year else 0.6
         id_src, sid = self._split_selected_id(selected_id)
         matched = False
@@ -1140,8 +1285,9 @@ class MatchEngine:
                 title = m.get("title") or title
                 year = m.get("year") or year
                 conf, matched = 0.9, True
-        rel = fmt_movie(title, year, ext, self.cfg.get("format_movie",""), video_codec, audio_codec, audio_channels, media_source, resolution)
-        c = Candidate(path, rel, "movie", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution)
+        rel = fmt_movie(title, year, ext, self.cfg.get("format_movie",""), video_codec, audio_codec, audio_channels, media_source, resolution, edition)
+        c = Candidate(path, rel, "movie", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
+                      title=title)
         if ext not in SUB_EXT:
             self._subs(path, rel, c)
         return c
@@ -1193,7 +1339,8 @@ class MatchEngine:
             show_year = str(year)
         ep_type = self.cfg.get("episode_anime", "dvd")
         rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_anime", self.cfg.get("format_tv","")), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
-        c = Candidate(path, rel, "anime", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution)
+        c = Candidate(path, rel, "anime", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
+                      title=show, season=season, episodes=list(episodes))
         if ext not in SUB_EXT:
             self._subs(path, rel, c)
         return c
@@ -1215,232 +1362,10 @@ class MatchEngine:
             cand.subtitles.append((sub, str(dest.parent / name).replace("\\", "/")))
 
 # ═══════════════════════════════════════════════════════════════════
-#  THEMES
+#  THEMES  (palettes and stylesheets live in themes.py)
 # ═══════════════════════════════════════════════════════════════════
-# Dark (green accents), Midnight (blue accents), Light (indigo accents)
-DARK = """
-QMainWindow,QWidget{background:#0b100b;color:#c2dcc2;font-family:'Segoe UI',Arial,sans-serif;font-size:13px}
-QGroupBox{border:1px solid #234023;border-radius:6px;margin-top:8px;padding-top:8px;font-weight:bold;color:#4ade80}
-QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 4px}
-QLineEdit,QComboBox{background:#131b13;border:1px solid #234023;border-radius:4px;padding:5px 8px;color:#c2dcc2}
-QLineEdit:focus,QComboBox:focus{border:1px solid #4ade80}
-QComboBox::drop-down{border:none}
-QTextEdit{background:#131b13;border:1px solid #234023;color:#c2dcc2}
-QPushButton{background:#162116;border:1px solid #2a4d2a;border-radius:5px;padding:6px 16px;color:#c2dcc2;font-weight:bold}
-QPushButton:hover{background:#1e2e1e}
-QPushButton:pressed{background:#274027}
-QPushButton:disabled{color:#4a5f4a;background:#0f150f}
-QPushButton#btn_preview{background:#0e2416;border-color:#4ade80;color:#4ade80}
-QPushButton#btn_preview:hover{background:#123120}
-QPushButton#btn_rename{background:#123c1e;border-color:#86efac;color:#86efac}
-QPushButton#btn_rename:hover{background:#174d27}
-QPushButton#btn_rename:disabled{background:#0d1f12;color:#3f5f4a;border-color:#1e3a26}
-QPushButton#btn_remove{background:#3d1414;border-color:#f87171;color:#f87171}
-QPushButton#btn_remove:hover{background:#4e1a1a}
-QPushButton#btn_remove:disabled{background:#241010;color:#6a3a3a;border-color:#3a1a1a}
-QPushButton#btn_undo{background:#3a2a10;border-color:#fbbf24;color:#fbbf24}
-QPushButton#btn_undo:hover{background:#4a3615}
-QPushButton#btn_undo:disabled{background:#241d0a;color:#6a5a2a;border-color:#3a2f14}
-QStatusBar{background:#080c08;color:#7ba37b;border-top:1px solid #1a281a}
-QProgressBar{border:1px solid #234023;border-radius:4px;background:#131b13;text-align:center;color:#c2dcc2;height:16px}
-QProgressBar::chunk{background:#4ade80;border-radius:3px}
-QMenuBar{background:#080c08;color:#c2dcc2}
-QMenuBar::item:selected{background:#162116}
-QMenu{background:#0b100b;border:1px solid #234023}
-QMenu::item:selected{background:#162116}
-QTableWidget{gridline-color:#182418;border:1px solid #182418}
-QHeaderView::section{background:#0b100b;color:#c2dcc2;padding:6px;border:none;border-bottom:2px solid #234023;font-weight:bold}
-QTableWidget::item{padding:4px 8px}
-QListWidget{background:#0b100b;border:1px solid #234023;border-radius:4px}
-QListWidget::item{padding:6px 8px;border-radius:2px;color:#c2dcc2}
-QListWidget::item:selected{background:#162116;color:#c2dcc2}
-QListWidget::item:hover{background:#101710}
-QLabel#preview_label{background:#131b13;border:1px solid #234023;border-radius:4px;padding:8px;font-size:13px}
-"""
-
-# Midnight
-MIDNIGHT = """
-QMainWindow,QWidget{background:#060a12;color:#bcd0f0;font-family:'Segoe UI',Arial,sans-serif;font-size:13px}
-QGroupBox{border:1px solid #1b2b4a;border-radius:6px;margin-top:8px;padding-top:8px;font-weight:bold;color:#4d9fff}
-QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 4px}
-QLineEdit,QComboBox{background:#0d1524;border:1px solid #1b2b4a;border-radius:4px;padding:5px 8px;color:#bcd0f0}
-QLineEdit:focus,QComboBox:focus{border:1px solid #4d9fff}
-QComboBox::drop-down{border:none}
-QTextEdit{background:#0d1524;border:1px solid #1b2b4a;color:#bcd0f0}
-QPushButton{background:#101a2e;border:1px solid #22355c;border-radius:5px;padding:6px 16px;color:#bcd0f0;font-weight:bold}
-QPushButton:hover{background:#16233d}
-QPushButton:pressed{background:#1d2f52}
-QPushButton:disabled{color:#44577e;background:#0a1120}
-QPushButton#btn_preview{background:#0d2138;border-color:#4d9fff;color:#4d9fff}
-QPushButton#btn_preview:hover{background:#122c4a}
-QPushButton#btn_rename{background:#0f2f1e;border-color:#3fb950;color:#3fb950}
-QPushButton#btn_rename:hover{background:#143d28}
-QPushButton#btn_rename:disabled{background:#0b1f16;color:#2d5a3f;border-color:#1a3a2a}
-QPushButton#btn_remove{background:#331116;border-color:#f85149;color:#f85149}
-QPushButton#btn_remove:hover{background:#43161d}
-QPushButton#btn_remove:disabled{background:#220e12;color:#6a3038;border-color:#3a1a20}
-QPushButton#btn_undo{background:#332508;border-color:#d29922;color:#d29922}
-QPushButton#btn_undo:hover{background:#43310c}
-QPushButton#btn_undo:disabled{background:#221a08;color:#6a5424;border-color:#3a2e12}
-QStatusBar{background:#04070d;color:#5d739e;border-top:1px solid #131e33}
-QProgressBar{border:1px solid #1b2b4a;border-radius:4px;background:#0d1524;text-align:center;color:#bcd0f0;height:16px}
-QProgressBar::chunk{background:#4d9fff;border-radius:3px}
-QMenuBar{background:#04070d;color:#bcd0f0}
-QMenuBar::item:selected{background:#101a2e}
-QMenu{background:#060a12;border:1px solid #1b2b4a}
-QMenu::item:selected{background:#101a2e}
-QTableWidget{gridline-color:#111c30;border:1px solid #111c30}
-QHeaderView::section{background:#060a12;color:#bcd0f0;padding:6px;border:none;border-bottom:2px solid #1b2b4a;font-weight:bold}
-QTableWidget::item{padding:4px 8px}
-QListWidget{background:#060a12;border:1px solid #1b2b4a;border-radius:4px}
-QListWidget::item{padding:6px 8px;border-radius:2px;color:#bcd0f0}
-QListWidget::item:selected{background:#101a2e;color:#bcd0f0}
-QListWidget::item:hover{background:#0b1220}
-QLabel#preview_label{background:#0d1524;border:1px solid #1b2b4a;border-radius:4px;padding:8px;font-size:13px}
-"""
-
-# Light
-LIGHT = """
-QMainWindow,QWidget{background:#faf9f7;color:#262421;font-family:'Segoe UI',Arial,sans-serif;font-size:13px}
-QGroupBox{border:1px solid #ddd8d0;border-radius:6px;margin-top:8px;padding-top:8px;font-weight:bold;color:#5b5bd6}
-QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 4px}
-QLineEdit,QComboBox{background:#ffffff;border:1px solid #ddd8d0;border-radius:4px;padding:5px 8px;color:#262421}
-QLineEdit:focus,QComboBox:focus{border:1px solid #5b5bd6}
-QComboBox::drop-down{border:none}
-QTextEdit{background:#ffffff;border:1px solid #ddd8d0;color:#262421}
-QPushButton{background:#f1efec;border:1px solid #ddd8d0;border-radius:5px;padding:6px 16px;color:#262421;font-weight:bold}
-QPushButton:hover{background:#e9e6e1}
-QPushButton:pressed{background:#ddd8d0}
-QPushButton:disabled{color:#a8a29a;background:#f1efec}
-QPushButton#btn_preview{background:#eceafd;border-color:#5b5bd6;color:#4a3fc4}
-QPushButton#btn_preview:hover{background:#dedafb}
-QPushButton#btn_rename{background:#e3f6e6;border-color:#1a7f37;color:#177a33}
-QPushButton#btn_rename:hover{background:#d0efd6}
-QPushButton#btn_rename:disabled{background:#eef7f0;color:#8fbf9c;border-color:#c4e2cc}
-QPushButton#btn_remove{background:#fdecea;border-color:#c2352b;color:#c2352b}
-QPushButton#btn_remove:hover{background:#fbdcd8}
-QPushButton#btn_remove:disabled{background:#fbf1f0;color:#dc9a94;border-color:#efccc8}
-QPushButton#btn_undo{background:#fdf4d7;border-color:#96660a;color:#96660a}
-QPushButton#btn_undo:hover{background:#fbecba}
-QPushButton#btn_undo:disabled{background:#fbf6e6;color:#c9ab6e;border-color:#ecdcb4}
-QStatusBar{background:#f1efec;color:#706a5f;border-top:1px solid #ddd8d0}
-QProgressBar{border:1px solid #ddd8d0;border-radius:4px;background:#ffffff;text-align:center;color:#262421;height:16px}
-QProgressBar::chunk{background:#5b5bd6;border-radius:3px}
-QMenuBar{background:#f1efec;color:#262421}
-QMenuBar::item:selected{background:#e9e6e1}
-QMenu{background:#faf9f7;border:1px solid #ddd8d0}
-QMenu::item:selected{background:#e9e6e1}
-QTableWidget{gridline-color:#e5e1da;border:1px solid #e5e1da}
-QHeaderView::section{background:#faf9f7;color:#262421;padding:6px;border:none;border-bottom:2px solid #ddd8d0;font-weight:bold}
-QTableWidget::item{padding:4px 8px}
-QListWidget{background:#ffffff;border:1px solid #ddd8d0;border-radius:4px}
-QListWidget::item{padding:6px 8px;border-radius:2px;color:#262421}
-QListWidget::item:selected{background:#e9e6e1;color:#262421}
-QListWidget::item:hover{background:#f1efec}
-QLabel#preview_label{background:#f1efec;border:1px solid #ddd8d0;border-radius:4px;padding:8px;font-size:13px}
-"""
-
-THEMES = {"dark": DARK, "midnight": MIDNIGHT, "light": LIGHT}
-
-# Each theme's colours (all taken from the stylesheets above), for the
-# Modern layout and the details panel. Layouts change shapes and spacing,
-# never colours.
-PALETTES = {
-    "dark": dict(bg="#0b100b", surface="#131b13", border="#234023", text="#c2dcc2",
-                 accent="#4ade80", button="#162116", button_border="#2a4d2a", hover="#1e2e1e",
-                 pressed="#274027", bar="#080c08", muted="#7ba37b", grid="#182418",
-                 disabled="#4a5f4a", soft="#101710"),
-    "midnight": dict(bg="#060a12", surface="#0d1524", border="#1b2b4a", text="#bcd0f0",
-                     accent="#4d9fff", button="#101a2e", button_border="#22355c", hover="#16233d",
-                     pressed="#1d2f52", bar="#04070d", muted="#5d739e", grid="#111c30",
-                     disabled="#44577e", soft="#0b1220"),
-    "light": dict(bg="#faf9f7", surface="#ffffff", border="#ddd8d0", text="#262421",
-                  accent="#5b5bd6", button="#f1efec", button_border="#ddd8d0", hover="#e9e6e1",
-                  pressed="#ddd8d0", bar="#f1efec", muted="#706a5f", grid="#e5e1da",
-                  disabled="#a8a29a", soft="#f1efec"),
-}
-
-# Rules for the Modern layout and the sidebar Settings window. Every rule is
-# scoped to #modernRoot / #settingsModern, so the Classic layout is untouched.
-_MODERN_QSS = """
-QWidget#modernRoot{background:%(bg)s}
-#modernRoot QFrame#topBar{background:%(bar)s;border:none;border-bottom:1px solid %(border)s}
-#modernRoot QFrame#card{background:%(bg)s;border:1px solid %(border)s;border-radius:10px}
-#modernRoot QFrame#actionBar{background:%(bg)s;border:none;border-top:1px solid %(border)s}
-#modernRoot QLabel#paneTitle{color:%(accent)s;font-weight:bold;font-size:12px;letter-spacing:1px;background:transparent}
-#modernRoot QLabel#paneCount,#modernRoot QLabel#muted{color:%(muted)s;background:transparent}
-#modernRoot QLabel#summary{color:%(muted)s;background:transparent;padding-left:2px}
-#modernRoot QLineEdit#srcEdit{padding:7px 10px;border-radius:8px}
-#modernRoot QComboBox{border-radius:8px;padding:6px 10px}
-#modernRoot QPushButton{border-radius:8px;padding:7px 16px}
-#modernRoot QPushButton#flat{background:transparent;border:1px solid transparent;color:%(muted)s;padding:4px 8px;font-weight:normal}
-#modernRoot QPushButton#flat:hover{background:%(hover)s;border-color:%(button_border)s;color:%(text)s}
-#modernRoot QPushButton#flat:disabled{color:%(disabled)s}
-#modernRoot QPushButton#link{background:transparent;border:none;color:%(accent)s;padding:0 4px;font-weight:normal;text-decoration:underline}
-#modernRoot QPushButton#seg{padding:7px 14px}
-#modernRoot QPushButton#seg:checked{background:%(pressed)s;color:%(accent)s;border-color:%(accent)s}
-#modernRoot QFrame#dropZone{background:%(bg)s;border:2px dashed %(border)s;border-radius:10px}
-#modernRoot QFrame#dropZone[hover="true"]{border-color:%(accent)s;background:%(soft)s}
-#modernRoot QLabel#dropTitle{color:%(text)s;font-size:15px;font-weight:bold;background:transparent}
-#modernRoot QLabel#dropHint{color:%(muted)s;background:transparent}
-#modernRoot QLabel#emptyHint{color:%(muted)s;background:transparent;font-size:13px}
-#modernRoot QListWidget{border:none;background:%(bg)s;border-radius:6px}
-#modernRoot QListWidget::item{padding:%(list_pad)s;border-radius:6px;margin:1px 0}
-#modernRoot QTableWidget{border:none;background:%(bg)s}
-#modernRoot QHeaderView::section{background:%(bg)s}
-#modernRoot QLabel#details{background:transparent;color:%(text)s}
-#modernRoot QSplitter::handle{background:transparent}
-#modernRoot QSplitter::handle:hover{background:%(border)s}
-#modernRoot QProgressBar#slimProgress{border:none;border-radius:2px;background:%(surface)s;max-height:4px;min-height:4px}
-#modernRoot QProgressBar#slimProgress::chunk{background:%(accent)s;border-radius:2px}
-#modernRoot QScrollBar:vertical{background:transparent;width:10px;margin:2px}
-#modernRoot QScrollBar:horizontal{background:transparent;height:10px;margin:2px}
-#modernRoot QScrollBar::handle:vertical{background:%(border)s;border-radius:3px;min-height:28px}
-#modernRoot QScrollBar::handle:horizontal{background:%(border)s;border-radius:3px;min-width:28px}
-#modernRoot QScrollBar::handle:hover{background:%(button_border)s}
-#modernRoot QScrollBar::add-line,#modernRoot QScrollBar::sub-line{width:0;height:0;border:none;background:none}
-#modernRoot QScrollBar::add-page,#modernRoot QScrollBar::sub-page{background:none}
-QDialog#settingsModern QListWidget#settingsNav{background:%(bar)s;border:none;border-right:1px solid %(border)s;padding:8px 6px;outline:0}
-QDialog#settingsModern QListWidget#settingsNav::item{padding:9px 14px;border-radius:8px;margin:1px 0;color:%(text)s}
-QDialog#settingsModern QListWidget#settingsNav::item:selected{background:%(pressed)s;color:%(accent)s}
-QDialog#settingsModern QListWidget#settingsNav::item:hover:!selected{background:%(hover)s}
-QDialog#settingsModern QGroupBox{border-radius:10px;margin-top:12px;padding-top:12px}
-QDialog#settingsModern QPushButton{border-radius:8px}
-QDialog#settingsModern QLineEdit,QDialog#settingsModern QComboBox{border-radius:8px}
-"""
-
-def modern_qss(theme, density="comfortable"):
-    pal = dict(PALETTES.get(theme, PALETTES["dark"]))
-    pal["list_pad"] = "3px 8px" if density == "compact" else "7px 10px"
-    return _MODERN_QSS % pal
-
-def app_stylesheet(theme, density="comfortable"):
-    """The theme's stylesheet plus the (scoped) Modern rules."""
-    return THEMES.get(theme, DARK) + modern_qss(theme, density)
-
-def tab_style_for(theme):
-    """QTabWidget/QTabBar styling matched to each theme's palette."""
-    if theme == "midnight":
-        return """
-            QTabWidget::pane { border: 1px solid #1b2b4a; background: #060a12; }
-            QTabBar::tab { background: #0d1524; color: #bcd0f0; padding: 8px 16px; border: 1px solid #1b2b4a; border-bottom: none; }
-            QTabBar::tab:selected { background: #060a12; color: #4d9fff; }
-            QTabBar::tab:hover:!selected { background: #16233d; }
-        """
-    elif theme == "light":
-        return """
-            QTabWidget::pane { border: 1px solid #ddd8d0; background: #faf9f7; }
-            QTabBar::tab { background: #f1efec; color: #262421; padding: 8px 16px; border: 1px solid #ddd8d0; border-bottom: none; }
-            QTabBar::tab:selected { background: #faf9f7; color: #5b5bd6; }
-            QTabBar::tab:hover:!selected { background: #e9e6e1; }
-        """
-    else:
-        return """
-            QTabWidget::pane { border: 1px solid #234023; background: #0b100b; }
-            QTabBar::tab { background: #162116; color: #c2dcc2; padding: 8px 16px; border: 1px solid #234023; border-bottom: none; }
-            QTabBar::tab:selected { background: #0b100b; color: #4ade80; }
-            QTabBar::tab:hover:!selected { background: #1e2e1e; }
-        """
+from themes import (THEMES, THEME_NAMES, BASE_THEMES, ROLES, palette_for, custom_palette,
+                    is_color, app_stylesheet, base_stylesheet, tab_stylesheet)
 
 # ═══════════════════════════════════════════════════════════════════
 #  SETTINGS DIALOG
@@ -1483,7 +1408,7 @@ class SettingsDialog(QDialog):
             L.addLayout(body, 1)
         else:
             tabs = QTabWidget()
-            tabs.setStyleSheet(self._get_tab_style(theme))
+            tabs.setStyleSheet(tab_stylesheet(palette_for(self.cfg)))
             for name, page in pages:
                 tabs.addTab(page, name)
             L.addWidget(tabs)
@@ -1497,7 +1422,17 @@ class SettingsDialog(QDialog):
             L.addWidget(btns)
 
     def _get_tab_style(self, theme):
-        return tab_style_for(theme)
+        return tab_stylesheet(palette_for(self.cfg))
+
+    def _edit_custom_theme(self):
+        main_window = self.parent()
+        preview = getattr(main_window, "_apply_theme", None)
+        dlg = CustomThemeDialog(self.cfg, self, preview=preview)
+        if dlg.exec():
+            self.cfg["custom_theme"] = dlg.result_theme()
+            self.theme_combo.setCurrentIndex([k for k, _ in THEME_NAMES].index("custom"))
+        if preview:
+            preview(palette_for(main_window.cfg))   # the window keeps its theme until OK
 
     def _build_folders_tab(self, theme):
         w = QWidget()
@@ -1553,7 +1488,7 @@ class SettingsDialog(QDialog):
         gl.addRow("TV Shows:", self.fmt_tv)
 
         self.fmt_movie = QLineEdit(self.cfg.get("format_movie", ""))
-        self.fmt_movie.setPlaceholderText("{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}")
+        self.fmt_movie.setPlaceholderText(DEFAULTS["format_movie"])
         gl.addRow("Movies:", self.fmt_movie)
 
         self.fmt_anime = QLineEdit(self.cfg.get("format_anime", ""))
@@ -1603,10 +1538,18 @@ class SettingsDialog(QDialog):
         gl = QFormLayout(grp)
 
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["Dark", "Midnight", "Light"])
-        theme_map = {"dark": 0, "midnight": 1, "light": 2}
-        self.theme_combo.setCurrentIndex(theme_map.get(self.cfg.get("theme", "dark"), 0))
-        gl.addRow("Color Scheme:", self.theme_combo)
+        for key, label in THEME_NAMES:
+            self.theme_combo.addItem(label, key)
+        keys = [k for k, _ in THEME_NAMES]
+        current = self.cfg.get("theme", "dark")
+        self.theme_combo.setCurrentIndex(keys.index(current) if current in keys else 0)
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(self.theme_combo, 1)
+        btn_custom = QPushButton("Edit Custom Theme…")
+        btn_custom.setToolTip("Choose every color of the Custom theme yourself")
+        btn_custom.clicked.connect(self._edit_custom_theme)
+        theme_row.addWidget(btn_custom)
+        gl.addRow("Color Scheme:", theme_row)
 
         L.addWidget(grp)
 
@@ -1673,6 +1616,18 @@ class SettingsDialog(QDialog):
 
         grp = QGroupBox("File Operations")
         gl = QFormLayout(grp)
+
+        self.action_combo = QComboBox()
+        for key, label in (("move", "Move the files (default)"),
+                           ("copy", "Copy the files (originals stay)"),
+                           ("hardlink", "Hard-link the files (torrents keep seeding)")):
+            self.action_combo.addItem(label, key)
+        self.action_combo.setCurrentIndex(max(0, self.action_combo.findData(self.cfg.get("rename_action", "move"))))
+        self.action_combo.setToolTip(
+            "Hard links put the file in your library without using extra space and without\n"
+            "moving the download, so your torrent client keeps seeding. They only work when the\n"
+            "downloads and the library are on the same drive; otherwise the file is copied.")
+        gl.addRow("When renaming:", self.action_combo)
 
         self.rename_subs = QCheckBox("Rename subtitle files alongside video")
         self.rename_subs.setChecked(self.cfg.get("rename_subtitles", True))
@@ -1788,7 +1743,6 @@ class SettingsDialog(QDialog):
         return w
 
     def _save(self):
-        theme_map = {0: "dark", 1: "midnight", 2: "light"}
         ep_map = {0: "dvd", 1: "absolute", 2: "streaming"}
 
         self.cfg.update({
@@ -1801,7 +1755,7 @@ class SettingsDialog(QDialog):
             "format_anime": self.fmt_anime.text().strip(),
             "episode_tv": ep_map[self.episode_tv.currentIndex()],
             "episode_anime": ep_map[self.episode_anime.currentIndex()],
-            "theme": theme_map[self.theme_combo.currentIndex()],
+            "theme": self.theme_combo.currentData(),
             "layout": LAYOUTS[self.layout_combo.currentIndex()],
             "panel_mode": PANEL_MODES[self.panel_combo.currentIndex()],
             "density": DENSITIES[self.density_combo.currentIndex()],
@@ -1810,6 +1764,7 @@ class SettingsDialog(QDialog):
             "show_full_path": self.show_new_path.isChecked(),
             "show_detected": self.show_detected.isChecked(),
             "rename_subtitles": self.rename_subs.isChecked(),
+            "rename_action": self.action_combo.currentData(),
             "cleanup_empty_folders": self.cleanup_folders.isChecked(),
             "confirm_rename": self.confirm_rename.isChecked(),
             "confirm_conflicts": self.confirm_conflicts.isChecked(),
@@ -1828,18 +1783,28 @@ class SettingsDialog(QDialog):
 #  RENAME TABLE
 # ═══════════════════════════════════════════════════════════════════
 # Row colours per status: (background, foreground)
-ROW_COLORS_DARK = {
-    "ok":       (QColor("#1d4023"), QColor("#a8f0a8")),
-    "conflict": (QColor("#4a1d1d"), QColor("#ff9090")),
-    "low":      (QColor("#3d3517"), QColor("#f0d890")),
-    "error":    (QColor("#33203d"), QColor("#cc80ff")),
-}
-ROW_COLORS_LIGHT = {
-    "ok":       (QColor("#e3f6e6"), QColor("#14662b")),
-    "conflict": (QColor("#fdecea"), QColor("#a72a20")),
-    "low":      (QColor("#fdf4d7"), QColor("#7a5605")),
-    "error":    (QColor("#f3e8fd"), QColor("#6d28d9")),
-}
+DUPLICATE_PREFIX = "Same new name as "
+
+def mark_duplicates(cands, dest_root):
+    """Flag every candidate whose new path an earlier one already takes
+    (e.g. a 720p and a 1080p copy of the same episode); the first keeps it."""
+    for c in cands:
+        if c.error.startswith(DUPLICATE_PREFIX):
+            c.error = ""
+    owners = {}
+    for c in cands:
+        if c.error:
+            continue
+        key = os.path.normcase(os.path.normpath(str(Path(dest_root or ".") / c.dest_rel)))
+        owner = owners.setdefault(key, c)
+        if owner is not c:
+            c.error = f"{DUPLICATE_PREFIX}{owner.source.name}"
+
+def row_colors(pal):
+    """Preview row colours per status, (background, text), from a theme palette."""
+    return {k: (QColor(pal[f"row_{k}_bg"]), QColor(pal[f"row_{k}_fg"]))
+            for k in ("ok", "conflict", "low", "error")}
+
 COLUMNS     = ["Original Filename","Detected Match","New Path","Subtitles","Status"]
 STATUS_COL  = 4
 
@@ -1862,7 +1827,7 @@ class RenameTable(QTableWidget):
         self._modern = False
         self._elide_middle = _ElideDelegate(Qt.TextElideMode.ElideMiddle, self)
         self._elide_left = _ElideDelegate(Qt.TextElideMode.ElideLeft, self)
-        self._row_colors = ROW_COLORS_DARK
+        self._row_colors = row_colors(THEMES["dark"])
         self.setColumnCount(len(COLUMNS))
         self.setHorizontalHeaderLabels(COLUMNS)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1923,8 +1888,8 @@ class RenameTable(QTableWidget):
         if self._cands:
             self.populate(self._cands, self._dest_root)
 
-    def set_light_mode(self, light: bool):
-        self._row_colors = ROW_COLORS_LIGHT if light else ROW_COLORS_DARK
+    def set_palette(self, pal):
+        self._row_colors = row_colors(pal)
         if self._cands:
             self.populate(self._cands, self._dest_root)
 
@@ -1983,6 +1948,40 @@ class RenameTable(QTableWidget):
         self.setRowCount(row + 1)
         self._fill_row(row, c)
 
+    def replace_candidate(self, row, c, dest_root):
+        self._dest_root = dest_root
+        self._cands[row] = c
+        self._fill_row(row, c)
+
+    def refresh_rows(self):
+        """Redraw every row (after duplicates / conflicts were re-checked)."""
+        rows = self.selected_rows()
+        self.populate(self._cands, self._dest_root)
+        self._select_rows(rows)
+
+    def move_rows(self, rows, delta):
+        """Move the given rows up (-1) or down (+1) together; returns their new rows."""
+        rows = sorted(set(rows))
+        if not rows or rows[0] + delta < 0 or rows[-1] + delta >= len(self._cands):
+            return rows
+        moving = [self._cands[r] for r in rows]
+        rest = [c for i, c in enumerate(self._cands) if i not in set(rows)]
+        at = rows[0] + delta
+        self._cands = rest[:at] + moving + rest[at:]
+        self.populate(self._cands, self._dest_root)
+        new_rows = list(range(at, at + len(moving)))
+        self._select_rows(new_rows)
+        return new_rows
+
+    def _select_rows(self, rows):
+        self.clearSelection()
+        mode = self.selectionMode()
+        self.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        for r in rows:
+            if 0 <= r < self.rowCount():
+                self.selectRow(r)
+        self.setSelectionMode(mode)
+
     def clear_all(self): self._cands = []; self.setRowCount(0)
     def get_cands(self): return self._cands
     def conflict_count(self): return sum(1 for c in self._cands if c.conflict)
@@ -2033,11 +2032,13 @@ class ScanWorker(QObject):
     candidate_ready = pyqtSignal(object)
     finished       = pyqtSignal()
 
-    def __init__(self, files, engine, media_type, dest_root, selected_overrides=None):
+    def __init__(self, files, engine, media_type, dest_root, selected_overrides=None,
+                 episode_overrides=None):
         super().__init__()
         self.files = files; self.engine = engine
         self.media_type = media_type; self.dest_root = dest_root
-        self.selected_overrides = selected_overrides or {}
+        self.selected_overrides = selected_overrides or {}       # str(path) -> (title, id)
+        self.episode_overrides = episode_overrides or {}         # str(path) -> (season, [episodes])
         self._sub_output_counts = {}
         self._dest_owner = {}     # normalised destination -> first source file renamed to it
 
@@ -2066,7 +2067,9 @@ class ScanWorker(QObject):
                 if key in self.selected_overrides:
                     selected_title, selected_id = self.selected_overrides[key]
 
-                cand = self.engine.match_with_override(f, self.media_type, selected_title, selected_id)
+                season, episodes = self.episode_overrides.get(key, (None, None))
+                cand = self.engine.match_with_override(f, self.media_type, selected_title, selected_id,
+                                                       season=season, episodes=episodes)
 
                 # Subtitle files picked directly: give them Plex subtitle names
                 src_ext = f.suffix.lower()
@@ -2084,7 +2087,7 @@ class ScanWorker(QObject):
                     key = os.path.normcase(os.path.normpath(str(dest)))
                     owner = self._dest_owner.setdefault(key, f)
                     if not _same_path(owner, f):
-                        cand.error = f"Same new name as {owner.name}"
+                        cand.error = f"{DUPLICATE_PREFIX}{owner.name}"
                         log.warning(f"  DUPLICATE: {f.name} and {owner.name} -> {dest}")
                     else:
                         claimed.update(os.path.normcase(str(s)) for s, _ in cand.subtitles)
@@ -2269,6 +2272,368 @@ class MatchSelectorDialog(QDialog):
         self.accept()
 
 # ═══════════════════════════════════════════════════════════════════
+#  CUSTOM THEME EDITOR
+# ═══════════════════════════════════════════════════════════════════
+class CustomThemeDialog(QDialog):
+    """Every colour of the Custom theme, grouped, with a live preview in the
+    main window. Starts from a built-in theme; themes can be exported and
+    imported as small JSON files."""
+
+    def __init__(self, cfg, parent=None, preview=None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Theme")
+        self.setMinimumSize(600, 640)
+        self._preview = preview
+        custom = cfg.get("custom_theme")
+        if isinstance(custom, dict) and custom.get("colors"):
+            self._base = custom.get("base") if custom.get("base") in THEMES else "dark"
+            self._pal = custom_palette(custom)
+        else:            # first time: start from the theme in use
+            current = cfg.get("theme", "dark")
+            self._base = current if current in THEMES else "dark"
+            self._pal = dict(THEMES[self._base])
+        self._rows = {}
+        self._labels = {role: label for role, label, _ in ROLES}
+
+        L = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Start from:"))
+        self.base_combo = QComboBox()
+        for key, label in THEME_NAMES:
+            if key in THEMES:
+                self.base_combo.addItem(label, key)
+        self.base_combo.setCurrentIndex(max(0, self.base_combo.findData(self._base)))
+        top.addWidget(self.base_combo)
+        btn_load = QPushButton("Use Its Colors")
+        btn_load.setToolTip("Replace every color below with the chosen theme's colors")
+        btn_load.clicked.connect(self._load_base)
+        top.addWidget(btn_load)
+        top.addStretch()
+        btn_import = QPushButton("Import…"); btn_import.clicked.connect(self._import)
+        btn_export = QPushButton("Export…"); btn_export.clicked.connect(self._export)
+        top.addWidget(btn_import); top.addWidget(btn_export)
+        L.addLayout(top)
+
+        hint = QLabel("Click a color square to pick a color, or type a hex code like #1e1e24. "
+                      "The window shows your changes as you make them.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888;font-size:11px")
+        L.addWidget(hint)
+
+        body = QWidget()
+        bl = QVBoxLayout(body); bl.setContentsMargins(0, 0, 6, 0)
+        groups = []
+        for role, label, group in ROLES:
+            if not groups or groups[-1][0] != group:
+                groups.append((group, []))
+            groups[-1][1].append((role, label))
+        for group, roles in groups:
+            box = QGroupBox(group)
+            form = QFormLayout(box)
+            for role, label in roles:
+                swatch = QPushButton()
+                swatch.setFixedSize(40, 24)
+                swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+                swatch.setToolTip(f"Pick the color for “{label}”")
+                swatch.clicked.connect(lambda _=False, r=role: self._pick(r))
+                edit = QLineEdit()
+                edit.setFixedWidth(96)
+                edit.setMaxLength(7)
+                edit.editingFinished.connect(lambda r=role: self._typed(r))
+                row = QHBoxLayout()
+                row.addWidget(swatch); row.addWidget(edit); row.addStretch()
+                form.addRow(label + ":", row)
+                self._rows[role] = (swatch, edit)
+            bl.addWidget(box)
+        bl.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(body)
+        L.addWidget(scroll, 1)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
+        L.addWidget(btns)
+        for role in self._rows:
+            self._show(role)
+        self._apply_preview()
+
+    def result_theme(self):
+        """What the settings keep: {"base": theme, "colors": every role}."""
+        return {"base": self._base, "colors": dict(self._pal)}
+
+    def palette(self):
+        return dict(self._pal)
+
+    def set_color(self, role, value):
+        if role in self._pal and is_color(value):
+            self._pal[role] = value.lower()
+            self._show(role)
+            self._apply_preview()
+            return True
+        return False
+
+    def _show(self, role):
+        swatch, edit = self._rows[role]
+        color = self._pal[role]
+        swatch.setStyleSheet(f"QPushButton{{background:{color};border:1px solid #808080;border-radius:4px;padding:0}}")
+        edit.setText(color)
+
+    def _apply_preview(self):
+        if self._preview:
+            try:
+                self._preview(dict(self._pal))
+            except Exception as e:           # a preview must never break editing
+                log.debug(f"Theme preview failed: {e}")
+
+    def _pick(self, role):
+        from PyQt6.QtWidgets import QColorDialog
+        color = QColorDialog.getColor(QColor(self._pal[role]), self, self._labels[role])
+        if color.isValid():
+            self.set_color(role, color.name())
+
+    def _typed(self, role):
+        _, edit = self._rows[role]
+        text = edit.text().strip()
+        if text and not text.startswith("#"):
+            text = "#" + text
+        if not self.set_color(role, text):
+            edit.setText(self._pal[role])          # not a colour: put the old one back
+
+    def _load_base(self):
+        self._base = self.base_combo.currentData()
+        self._pal = dict(THEMES[self._base])
+        for role in self._rows:
+            self._show(role)
+        self._apply_preview()
+
+    def _export(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Theme", "PathRenamer theme.json",
+                                              "Theme files (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"pathrenamer_theme": 1, **self.result_theme()}, f, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, "Export Theme", f"Couldn't save the theme:\n{e}")
+
+    def _import(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Theme", "", "Theme files (*.json)")
+        if path:
+            self.import_file(path)
+
+    def import_file(self, path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or not isinstance(data.get("colors"), dict):
+                raise ValueError("not a PathRenamer theme file")
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Import Theme", f"Couldn't read the theme:\n{e}")
+            return False
+        self._base = data.get("base") if data.get("base") in THEMES else self._base
+        self._pal = custom_palette({"base": self._base, "colors": data["colors"]})
+        self.base_combo.setCurrentIndex(max(0, self.base_combo.findData(self._base)))
+        for role in self._rows:
+            self._show(role)
+        self._apply_preview()
+        return True
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  RENAME HISTORY
+# ═══════════════════════════════════════════════════════════════════
+class HistoryDialog(QDialog):
+    """Past renames (kept between sessions); any of them can be undone."""
+
+    def __init__(self, renamer, parent=None):
+        super().__init__(parent)
+        self.renamer = renamer
+        self.undo_results = []
+        self.setWindowTitle("Rename History")
+        self.setMinimumSize(820, 520)
+        L = QVBoxLayout(self)
+        hint = QLabel("Every rename is listed here, newest first, also after closing the app. "
+                      "Select one to see its files; Undo puts them back.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888;font-size:11px")
+        L.addWidget(hint)
+        split = QSplitter(Qt.Orientation.Vertical)
+        self.batch_list = QTableWidget(0, 3)
+        self.batch_list.setHorizontalHeaderLabels(["When", "What", "Status"])
+        self.batch_list.verticalHeader().setVisible(False)
+        self.batch_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.batch_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.batch_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        hh = self.batch_list.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.batch_list.itemSelectionChanged.connect(self._show_files)
+        split.addWidget(self.batch_list)
+        self.files = QTableWidget(0, 2)
+        self.files.setHorizontalHeaderLabels(["From", "To"])
+        self.files.verticalHeader().setVisible(False)
+        self.files.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.files.setTextElideMode(Qt.TextElideMode.ElideLeft)
+        for col in (0, 1):
+            self.files.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        split.addWidget(self.files)
+        L.addWidget(split, 1)
+        row = QHBoxLayout()
+        self.btn_clear = QPushButton("Clear History")
+        self.btn_clear.setToolTip("Forget every entry (files are not touched)")
+        self.btn_clear.clicked.connect(self._clear)
+        row.addWidget(self.btn_clear)
+        row.addStretch()
+        self.btn_undo = QPushButton("↩  Undo This Rename")
+        self.btn_undo.setObjectName("btn_undo")
+        self.btn_undo.clicked.connect(self._undo_selected)
+        row.addWidget(self.btn_undo)
+        close = QPushButton("Close"); close.clicked.connect(self.accept)
+        row.addWidget(close)
+        L.addLayout(row)
+        self._fill()
+
+    def _fill(self):
+        self._batches = self.renamer.history.batches()
+        self.batch_list.setRowCount(len(self._batches))
+        for i, b in enumerate(self._batches):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(b.get("time", 0)))
+            what = describe_batch(b) + ("  (watch folder)" if b.get("source") == "watch" else "")
+            status = "Undone" if b.get("undone") else "Done"
+            for col, text in enumerate((when, what, status)):
+                self.batch_list.setItem(i, col, QTableWidgetItem(text))
+        if self._batches:
+            self.batch_list.selectRow(0)
+        else:
+            self.files.setRowCount(0)
+        self.btn_clear.setEnabled(bool(self._batches))
+        self._update_button()
+
+    def _selected(self):
+        rows = sorted({i.row() for i in self.batch_list.selectedItems()})
+        return self._batches[rows[0]] if rows and rows[0] < len(self._batches) else None
+
+    def _show_files(self):
+        b = self._selected()
+        ops = b["ops"] if b else []
+        self.files.setRowCount(len(ops))
+        for i, op in enumerate(ops):
+            for col, text in enumerate((op["src"], op["dst"])):
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                self.files.setItem(i, col, item)
+        self._update_button()
+
+    def _update_button(self):
+        b = self._selected()
+        self.btn_undo.setEnabled(bool(b) and not b.get("undone"))
+
+    def _undo_selected(self):
+        b = self._selected()
+        if not b or b.get("undone"):
+            return
+        verb = "removes the copies" if all(op.get("method") in ("copy", "hardlink", "none") for op in b["ops"]) \
+            else "moves the files back"
+        reply = QMessageBox.question(self, "Undo Rename",
+                                     f"Undo “{describe_batch(b)}”? This {verb}.",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        result = self.renamer.undo_batch(b["id"])
+        self.undo_results.append(result)
+        if result.failed:
+            details = "\n".join(f"{o.src.name}: {o.error}" for o in result.failed[:10])
+            QMessageBox.warning(self, "Some Undos Failed", details)
+        row = self.batch_list.currentRow()
+        self._fill()
+        if 0 <= row < self.batch_list.rowCount():
+            self.batch_list.selectRow(row)
+
+    def _clear(self):
+        reply = QMessageBox.question(self, "Clear History",
+                                     "Forget all past renames? Your files stay where they are, "
+                                     "but these renames can't be undone afterwards.",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.renamer.history.clear()
+            self._fill()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  EPISODE NUMBER DIALOG
+# ═══════════════════════════════════════════════════════════════════
+class EpisodeNumbersDialog(QDialog):
+    """Season and episode for one file ("Change Episode…"), or a show name,
+    season and first episode to number several files in list order
+    ("Number in Order…")."""
+
+    def __init__(self, parent=None, title="", season=1, first=1, last=None, count=1, number_mode=False):
+        super().__init__(parent)
+        from PyQt6.QtWidgets import QSpinBox
+        self.number_mode = number_mode
+        self.count = count
+        self.setWindowTitle("Number in Order" if number_mode else "Change Episode")
+        self.setMinimumWidth(420)
+        L = QVBoxLayout(self)
+        if number_mode:
+            hint = QLabel(f"The {count} selected file(s) get consecutive episode numbers in the "
+                          "order shown in the list. Use Move Up / Move Down (Ctrl+↑ / Ctrl+↓) "
+                          "to put them in the right order first.")
+        else:
+            hint = QLabel("Use this when the file name has the wrong episode number, or none.")
+        hint.setWordWrap(True)
+        L.addWidget(hint)
+        form = QFormLayout()
+        self.title_edit = QLineEdit(title)
+        self.title_edit.setPlaceholderText("Show name")
+        form.addRow("Show:", self.title_edit)
+        self.season_spin = QSpinBox(); self.season_spin.setRange(0, 999)
+        self.season_spin.setValue(season if season is not None else 1)
+        form.addRow("Season:", self.season_spin)
+        self.first_spin = QSpinBox(); self.first_spin.setRange(0, 9999); self.first_spin.setValue(first or 1)
+        form.addRow("First episode:" if number_mode else "Episode:", self.first_spin)
+        self.last_spin = None
+        if not number_mode:
+            self.last_spin = QSpinBox(); self.last_spin.setRange(0, 9999)
+            self.last_spin.setValue(last if last else self.first_spin.value())
+            self.last_spin.setToolTip("For a file with two or more episodes (S01E01-E02)")
+            form.addRow("Last episode:", self.last_spin)
+            self.first_spin.valueChanged.connect(
+                lambda v: self.last_spin.setValue(max(v, self.last_spin.value())))
+        L.addLayout(form)
+        self.preview = QLabel(); self.preview.setStyleSheet("color:#888")
+        L.addWidget(self.preview)
+        for w in (self.season_spin, self.first_spin) + ((self.last_spin,) if self.last_spin else ()):
+            w.valueChanged.connect(self._update_preview)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
+        L.addWidget(btns)
+        self._update_preview()
+
+    def _update_preview(self):
+        s, first = self.season_spin.value(), self.first_spin.value()
+        if self.number_mode:
+            last = first + self.count - 1
+            self.preview.setText(f"S{s:02d}E{first:02d}" + (f" … S{s:02d}E{last:02d}" if self.count > 1 else ""))
+        else:
+            last = max(first, self.last_spin.value())
+            self.preview.setText(f"S{s:02d}E{first:02d}" + (f"-E{last:02d}" if last > first else ""))
+
+    def values(self):
+        """(show name, season, [episodes per file]) — one list per file."""
+        s, first = self.season_spin.value(), self.first_spin.value()
+        if self.number_mode:
+            eps = [[first + i] for i in range(self.count)]
+        else:
+            eps = [list(range(first, max(first, self.last_spin.value()) + 1))]
+        return self.title_edit.text().strip(), s, eps
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  FORMAT EDITOR
 # ═══════════════════════════════════════════════════════════════════
 # Template editor with live preview (opened from Settings → Formats)
@@ -2283,6 +2648,7 @@ class FormatEditorDialog(QDialog):
         ("{s00e00}", "Plex format (S01E01)", "S01E01", False),
         ("{title}", "Episode/Movie title", "Episode Title", True),
         ("{year}", "Release year", "2024", True),
+        ("{edition}", "Plex edition tag, when the name has one", "{edition-Director's Cut}", True),
         ("{vc}", "Video codec", "H.264", True),
         ("{c}", "Audio codec", "AAC", True),
         ("{ach}", "Audio channels", "2.0", True),
@@ -2432,8 +2798,8 @@ class FormatEditorDialog(QDialog):
         grp2 = QGroupBox("Template")
         gl2 = QFormLayout(grp2)
 
-        self.movie_template = QLineEdit(self.cfg.get("format_movie", "{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}"))
-        self.movie_template.setPlaceholderText("{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}")
+        self.movie_template = QLineEdit(self.cfg.get("format_movie", DEFAULTS["format_movie"]))
+        self.movie_template.setPlaceholderText(DEFAULTS["format_movie"])
         self.movie_template.textChanged.connect(self._update_movie_preview)
         gl2.addRow("Template:", self.movie_template)
 
@@ -2462,8 +2828,7 @@ class FormatEditorDialog(QDialog):
             btn.clicked.connect(lambda checked, v=var: self._insert_var(v))
             gl.addWidget(btn, row, col)
 
-        accent = {"dark": "#4ade80", "midnight": "#4d9fff", "light": "#5b5bd6"}.get(
-            self.cfg.get("theme", "dark"), "#4ade80")
+        accent = palette_for(self.cfg)["accent"]
         link = QLabel(f'<a href="#variables" style="color:{accent}">Variable List</a> '
                       '— view all usable variables')
         link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
@@ -2572,7 +2937,7 @@ class FormatEditorDialog(QDialog):
         self.anime_example.setText(result)
 
     def _update_movie_preview(self):
-        template = self.movie_template.text() or "{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}"
+        template = self.movie_template.text() or DEFAULTS["format_movie"]
         result = self._format_movie_preview(template)
         self.movie_example.setText(result)
 
@@ -2604,6 +2969,8 @@ class FormatEditorDialog(QDialog):
         values = {
             "title": "Dandadan",
             "year": "2024",
+            "edition": "{edition-Director's Cut}",
+            "edition_name": "Director's Cut",
             "vc": "H.264",
             "c": "AAC",
             "ach": "2.0",
@@ -2634,12 +3001,9 @@ class FormatEditorDialog(QDialog):
         self._apply()
         self.accept()
 
-    def _get_tab_style(self, theme):
-        return tab_style_for(theme)
-
     def _apply_theme(self):
-        theme_name = self.cfg.get("theme", "dark")
-        self.setStyleSheet(THEMES.get(theme_name, DARK) + self._get_tab_style(theme_name))
+        pal = palette_for(self.cfg)
+        self.setStyleSheet(base_stylesheet(pal) + tab_stylesheet(pal))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2732,7 +3096,7 @@ class DetailsPanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("card")
-        self.pal = PALETTES["dark"]
+        self.pal = THEMES["dark"]
         lay = QVBoxLayout(self); lay.setContentsMargins(14, 10, 14, 10); lay.setSpacing(4)
         title = QLabel("DETAILS"); title.setObjectName("paneTitle")
         lay.addWidget(title)
@@ -2786,12 +3150,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.cfg = cfg_load()
-        self.renamer = Renamer()
+        self.renamer = Renamer(RenameHistory(HISTORY_PATH))
         self._cands = []
         self._thread = self._worker = None
         self._scanning = False
         self._layout_name = None
         self._anims = {}              # running panel animations by kind
+        self._replace_rows = {}       # rows being re-matched in place
+        self._title_overrides = {}    # str(path) -> (title, id) chosen for that file
+        self._episode_overrides = {}  # str(path) -> (season, [episodes]) chosen for that file
         self._shown_once = False
         self._split_main = self._split_preview = None
         self._files_stack = self._preview_stack = None
@@ -2819,6 +3186,7 @@ class MainWindow(QMainWindow):
         self._restore_geometry()
         self.status.showMessage("Ready — select a source folder and click Preview Renames.")
         self._refresh_clients()
+        self._update_undo_buttons()        # renames saved from earlier sessions can be undone
 
         if self.cfg.get("first_run", True):
             self._first_run_wizard()
@@ -2843,25 +3211,27 @@ class MainWindow(QMainWindow):
         self.act_undo.triggered.connect(self._undo); self.act_undo.setEnabled(False)
         self.act_undo.setShortcut(QKeySequence("Ctrl+Z"))
         em.addAction(self.act_undo)
+        act_hist = QAction("Rename History…", self)
+        act_hist.setShortcut(QKeySequence("Ctrl+H"))
+        act_hist.triggered.connect(self._show_history)
+        em.addAction(act_hist)
 
         vm = mb.addMenu("View")
-        self.act_theme_dark = QAction("Dark Theme", self)
-        self.act_theme_dark.setCheckable(True)
-        self.act_theme_dark.setChecked(self.cfg.get("theme", "dark") == "dark")
-        self.act_theme_dark.triggered.connect(lambda: self._set_theme("dark"))
-        vm.addAction(self.act_theme_dark)
+        theme_group = QActionGroup(self); theme_group.setExclusive(True)
+        self.act_theme = {}
+        for key, label in THEME_NAMES:
+            act = QAction(f"{label} Theme", self); act.setCheckable(True)
+            act.setChecked(self.cfg.get("theme", "dark") == key)
+            act.triggered.connect(lambda _=False, k=key: self._set_theme(k))
+            theme_group.addAction(act); vm.addAction(act)
+            self.act_theme[key] = act
+        act_edit = QAction("Edit Custom Theme…", self)
+        act_edit.triggered.connect(self._edit_custom_theme)
+        vm.addAction(act_edit)
 
-        self.act_theme_midnight = QAction("Midnight Theme", self)
-        self.act_theme_midnight.setCheckable(True)
-        self.act_theme_midnight.setChecked(self.cfg.get("theme", "dark") == "midnight")
-        self.act_theme_midnight.triggered.connect(lambda: self._set_theme("midnight"))
-        vm.addAction(self.act_theme_midnight)
-
-        self.act_theme_light = QAction("Light Theme", self)
-        self.act_theme_light.setCheckable(True)
-        self.act_theme_light.setChecked(self.cfg.get("theme", "dark") == "light")
-        self.act_theme_light.triggered.connect(lambda: self._set_theme("light"))
-        vm.addAction(self.act_theme_light)
+        self.presets_menu = QMenu("Presets", self)
+        self.presets_menu.aboutToShow.connect(self._fill_presets_menu)
+        mb.addMenu(self.presets_menu)
 
         vm.addSeparator()
         lm = vm.addMenu("Layout")
@@ -2927,7 +3297,7 @@ class MainWindow(QMainWindow):
             self.cfg.get("show_detected", True),
             self.cfg.get("show_full_path", True),
         )
-        self.table.set_light_mode(self.cfg.get("theme", "dark") == "light")
+        self.table.set_palette(palette_for(self.cfg))
 
         self.btn_remove = QPushButton("✕ Remove Selected")
         self.btn_remove.setObjectName("btn_remove")
@@ -2939,6 +3309,39 @@ class MainWindow(QMainWindow):
         self.btn_undo.setObjectName("btn_undo"); self.btn_undo.setEnabled(False)
         self.btn_undo.setToolTip("Put the last renamed files back (Ctrl+Z)")
         self.btn_undo.clicked.connect(self._undo)
+        # Fixing single rows: right-click menu, double-click, shortcuts, Fix button
+        def _action(text, slot, shortcut=None, tip=""):
+            act = QAction(text, self)
+            act.triggered.connect(slot)
+            if shortcut:
+                act.setShortcut(QKeySequence(shortcut))
+                act.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                self.table.addAction(act)
+            if tip:
+                act.setToolTip(tip)
+            return act
+        self.act_edit_name = _action("Edit New Name…", self._edit_name, "F2")
+        self.act_change_episode = _action("Change Episode…", self._change_episode, "Ctrl+E")
+        self.act_choose_match = _action("Choose a Different Match…", self._choose_match, "Ctrl+M")
+        self.act_number = _action("Number in Order…", self._number_in_order, "Ctrl+N")
+        self.act_move_up = _action("Move Up", lambda: self._move_rows(-1), "Ctrl+Up")
+        self.act_move_down = _action("Move Down", lambda: self._move_rows(1), "Ctrl+Down")
+        self.table.customContextMenuRequested.disconnect()
+        self.table.customContextMenuRequested.connect(self._table_menu)
+        self.table.cellDoubleClicked.connect(self._on_table_double_click)
+        self.table.itemSelectionChanged.connect(self._update_fix_actions)
+        self.btn_fix = QPushButton("Fix ▾")
+        self.btn_fix.setObjectName("flat")
+        self.btn_fix.setToolTip("Fix the selected rows: edit the name, change the episode,\n"
+                                "choose a different match, reorder or number them in order.\n"
+                                "(Also on right-click.)")
+        fix_menu = QMenu(self.btn_fix)
+        for act in (self.act_edit_name, self.act_change_episode, self.act_choose_match, self.act_number):
+            fix_menu.addAction(act)
+        fix_menu.addSeparator()
+        fix_menu.addAction(self.act_move_up); fix_menu.addAction(self.act_move_down)
+        self.btn_fix.setMenu(fix_menu)
+
         self.btn_rename = QPushButton("✔  Rename Files")
         self.btn_rename.setObjectName("btn_rename"); self.btn_rename.setEnabled(False)
         self.btn_rename.setToolTip("Move the files to their new names (Ctrl+Enter)")
@@ -2949,6 +3352,10 @@ class MainWindow(QMainWindow):
         self.details = DetailsPanel()
         self.summary = QLabel(); self.summary.setObjectName("summary")
         self.lib_label = ElidedLabel(); self.lib_label.setObjectName("muted")
+        self.btn_presets = QPushButton("Presets ▾"); self.btn_presets.setObjectName("flat")
+        self.btn_presets.setToolTip("Saved combinations of naming formats, library folders,\n"
+                                    "data sources and how files are placed")
+        self.btn_presets.setMenu(self.presets_menu)
         self.btn_change_lib = QPushButton("Change…"); self.btn_change_lib.setObjectName("link")
         self.btn_change_lib.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_change_lib.clicked.connect(self._settings)
@@ -2966,7 +3373,7 @@ class MainWindow(QMainWindow):
             self.tvdb_edit, self.file_list, self.btn_sel_all, self.btn_rem_files, self.btn_clear_files,
             self.pbar, self.table, self.btn_remove, self.btn_undo, self.btn_rename, self.drop_zone,
             self.details, self.summary, self.lib_label, self.btn_change_lib, self.files_count,
-            self.preview_count, self.preview_empty,
+            self.preview_count, self.preview_empty, self.btn_fix, self.btn_presets,
         ]
 
         # Keyboard shortcuts (all layouts)
@@ -3006,6 +3413,7 @@ class MainWindow(QMainWindow):
         self._update_files_ui()
         self._update_summary()
         self._update_library_label()
+        self._update_fix_actions()
         if self.isVisible():
             QTimer.singleShot(0, self._apply_split_sizes)
 
@@ -3104,6 +3512,7 @@ class MainWindow(QMainWindow):
         r2.addWidget(self.match_combo); r2.addWidget(self.tvdb_edit)
         r2.addSpacing(10)
         r2.addWidget(self.lib_label, 1); r2.addWidget(self.btn_change_lib)
+        r2.addSpacing(6); r2.addWidget(self.btn_presets)
         tl.addLayout(r2)
         outer.addWidget(top)
         outer.addWidget(self.pbar)
@@ -3130,6 +3539,7 @@ class MainWindow(QMainWindow):
         ph = QHBoxLayout()
         t2 = QLabel("PREVIEW"); t2.setObjectName("paneTitle")
         ph.addWidget(t2); ph.addSpacing(4); ph.addWidget(self.preview_count); ph.addStretch()
+        ph.addWidget(self.btn_fix)
         pl.addLayout(ph)
         self._preview_stack = QStackedWidget()
         self._preview_stack.addWidget(self.preview_empty); self._preview_stack.addWidget(self.table)
@@ -3156,7 +3566,7 @@ class MainWindow(QMainWindow):
         for w in (self.src, self.btn_browse, self.btn_preview, self.seg, self.match_combo,
                   self.lib_label, self.btn_change_lib, self.files_count, self.preview_count,
                   self.btn_sel_all, self.btn_rem_files, self.btn_clear_files, self.summary,
-                  self.btn_remove, self.btn_undo, self.btn_rename):
+                  self.btn_remove, self.btn_undo, self.btn_rename, self.btn_fix, self.btn_presets):
             w.show()
         self._update_panel_orientation()
 
@@ -3477,23 +3887,35 @@ class MainWindow(QMainWindow):
         self._update_summary()
 
     def _set_theme(self, theme):
+        if theme == "custom" and not self.cfg.get("custom_theme"):
+            return self._edit_custom_theme()     # nothing to show yet: make it first
         self.cfg["theme"] = theme
         cfg_save(self.cfg)
         self._apply_theme()
         self._update_theme_menu()
 
-    def _apply_theme(self):
-        theme = self.cfg.get("theme", "dark")
-        self.setStyleSheet(app_stylesheet(theme, self.cfg.get("density", "comfortable")))
-        self.table.set_light_mode(theme == "light")
-        self.details.pal = PALETTES.get(theme, PALETTES["dark"])
+    def _edit_custom_theme(self):
+        dlg = CustomThemeDialog(self.cfg, self, preview=self._apply_theme)
+        if dlg.exec():
+            self.cfg["custom_theme"] = dlg.result_theme()
+            self.cfg["theme"] = "custom"
+            cfg_save(self.cfg)
+        self._apply_theme()
+        self._update_theme_menu()
+
+    def _apply_theme(self, pal=None):
+        """Style the window with the chosen theme (or with pal, e.g. while the
+        Custom theme is being edited)."""
+        pal = pal or palette_for(self.cfg)
+        self.setStyleSheet(app_stylesheet(pal, self.cfg.get("density", "comfortable")))
+        self.table.set_palette(pal)
+        self.details.pal = pal
         self._update_details()
 
     def _update_theme_menu(self):
         theme = self.cfg.get("theme", "dark")
-        self.act_theme_dark.setChecked(theme == "dark")
-        self.act_theme_midnight.setChecked(theme == "midnight")
-        self.act_theme_light.setChecked(theme == "light")
+        for key, act in self.act_theme.items():
+            act.setChecked(key == theme)
 
     def _on_media_type_changed(self):
         self.cfg["media_type"] = self._media_type()
@@ -3674,9 +4096,23 @@ class MainWindow(QMainWindow):
                     for ff in group_files:
                         selected_overrides[str(ff)] = (selected_title, (selected_src, selected_id))
 
-        # Reset the table and run the matcher in a worker thread.
-        self._cands = []
-        self.table.clear_all()
+        # Per-file choices start fresh with every preview
+        self._title_overrides = dict(selected_overrides)
+        self._episode_overrides = {}
+        self._start_scan(files, engine, media_type, dst, selected_overrides)
+
+    def _engine(self):
+        return MatchEngine(cfg=self.cfg, tvmaze=self.tvmaze, anidb=self.anidb,
+                           tmdb=self.tmdb, cinemeta=self.cinemeta)
+
+    def _start_scan(self, files, engine, media_type, dst, selected_overrides=None,
+                    episode_overrides=None, replace=None):
+        """Match files in a worker thread. replace: {normcase path: row} to
+        re-match those rows in place (fixing single rows) instead of a new preview."""
+        self._replace_rows = dict(replace or {})
+        if not replace:
+            self._cands = []
+            self.table.clear_all()
         self.table.set_display_options(
             self.cfg.get("show_detected", True),
             self.cfg.get("show_full_path", True),
@@ -3690,9 +4126,10 @@ class MainWindow(QMainWindow):
         self.btn_preview.setEnabled(False)
         self._update_summary()
         self._update_details()
+        self._update_fix_actions()
 
         self._thread = QThread()
-        self._worker = ScanWorker(files, engine, media_type, dst, selected_overrides)
+        self._worker = ScanWorker(files, engine, media_type, dst, selected_overrides, episode_overrides)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(lambda c, t: self.pbar.setValue(c))
@@ -3701,8 +4138,12 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     def _on_candidate(self, cand):
-        self._cands.append(cand)
-        self.table.append_candidate(cand, self._get_destination())
+        row = self._replace_rows.pop(os.path.normcase(str(cand.source)), None) if self._replace_rows else None
+        if row is not None and row < self.table.rowCount():
+            self.table.replace_candidate(row, cand, self._get_destination())
+        else:
+            self.table.append_candidate(cand, self._get_destination())
+        self._cands = self.table.get_cands()
         self._update_summary()
 
     def _on_scan_done(self):
@@ -3710,9 +4151,14 @@ class MainWindow(QMainWindow):
             self._thread.quit()
             self._thread.wait(2000)
         self._scanning = False
+        self._replace_rows = {}
         self.pbar.setVisible(False)
         self.btn_preview.setEnabled(True)
+        mark_duplicates(self.table.get_cands(), self._get_destination())
+        self.table.refresh_rows()
+        self._cands = self.table.get_cands()
         self._update_summary()
+        self._update_fix_actions()
         if self.table.rowCount() and not self.table.selectedItems() and self._layout_name == "modern":
             self.table.selectRow(0)       # fills the details panel
 
@@ -3730,21 +4176,28 @@ class MainWindow(QMainWindow):
         can_rename = total > 0 and (total - errors) > 0
         self.btn_rename.setEnabled(can_rename)
 
+    ACTION_WORDS = {  # rename action -> (verb, past tense)
+        "move": ("Move", "Renamed"), "copy": ("Copy", "Copied"), "hardlink": ("Hard-link", "Hard-linked"),
+    }
+
+    def _rename_groups(self, cands, dst):
+        """(video op, [subtitle ops]) per renameable candidate, so subtitles follow their video."""
+        groups = []
+        for cand in cands:
+            if cand.error:
+                continue
+            main_op = (cand.source, Path(dst) / cand.dest_rel)
+            sub_ops = [(s, Path(dst) / rel) for s, rel in cand.subtitles]
+            groups.append((main_op, sub_ops))
+        return groups
+
     def _rename(self):
         dst = self._get_destination()
         if not dst:
             QMessageBox.warning(self, "PathRenamer", "No destination folder set.")
             return
 
-        # Each group is (video op, [subtitle ops]) so subtitles follow their video.
-        groups = []
-        for cand in self._cands:
-            if cand.error:
-                continue
-            main_op = (cand.source, Path(dst) / cand.dest_rel)
-            sub_ops = [(s, Path(dst) / rel) for s, rel in cand.subtitles]
-            groups.append((main_op, sub_ops))
-
+        groups = self._rename_groups(self._cands, dst)
         if not groups:
             QMessageBox.warning(self, "PathRenamer", "No files to rename.")
             return
@@ -3765,20 +4218,15 @@ class MainWindow(QMainWindow):
                     return
             skip = {id(g) for g in conflicted}
             groups = [g for g in groups if id(g) not in skip]
-
-        # A subtitle whose new name already exists stays where it is
-        sub_skipped = sum(1 for _, sub_ops in groups for s in sub_ops if detect_conflicts([s]))
-        groups = [(main_op, [s for s in sub_ops if not detect_conflicts([s])])
-                  for main_op, sub_ops in groups]
-
         if not groups:
             self.status.showMessage("Nothing to rename after skipping conflicts.")
             return
 
+        action = self.cfg.get("rename_action", "move")
         if self.cfg.get("confirm_rename", True):
             n_vids = len(groups)
-            n_subs = sum(len(sub_ops) for _, sub_ops in groups)
-            msg = f"Move {n_vids} file(s)"
+            n_subs = sum(1 for _, sub_ops in groups for s in sub_ops if not detect_conflicts([s]))
+            msg = f"{self.ACTION_WORDS.get(action, self.ACTION_WORDS['move'])[0]} {n_vids} file(s)"
             if n_subs:
                 msg += f" and {n_subs} subtitle(s)"
             msg += f" into:\n{dst}\n\nProceed?"
@@ -3789,45 +4237,63 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        result = self.renamer.execute_groups(groups, dest_root=dst)
-        ok_count = len(result.succeeded)
-        fail_count = len(result.failed)
-        ok_subs = sum(1 for op in result.succeeded if op.src.suffix.lower() in SUB_EXT)
-
-        # Remove folders left empty in the source tree.
-        if self.cfg.get("cleanup_empty_folders", True):
-            src_root = self.src.text().strip()
-            if src_root and os.path.isdir(src_root):
-                for op in result.succeeded:
-                    _cleanup_empty_dirs(op.src.parent, stop=Path(src_root))
-
-        msg = f"Renamed {ok_count - ok_subs} file(s)"
-        if ok_subs:
-            msg += f" and {ok_subs} subtitle(s)"
-        if fail_count:
-            msg += f", {fail_count} failed"
-        if sub_skipped:
-            msg += f" · {sub_skipped} subtitle(s) left in place (new name already exists)"
+        result, msg = self._place_groups(groups, dst, source="manual")
         self.status.showMessage(msg)
-        if fail_count:
+        if result.failed:
             details = "\n".join(f"{o.src.name}: {o.error}" for o in result.failed[:10])
             QMessageBox.warning(self, "Some Renames Failed", details)
-
-        # Moved files are gone from their old location; drop them from the list.
-        moved = [op.src for op in result.succeeded]
-        self._purge_files_from_list(moved)
 
         self._cands = []
         self.table.clear_all()
         self.btn_rename.setEnabled(False)
-        self._update_undo_buttons()
         self._update_summary()
         self._update_details()
+
+    def _place_groups(self, groups, dst, source="manual"):
+        """Rename (move / copy / hard-link) the groups and clean up.
+        Returns (result, status message)."""
+        # A subtitle whose new name already exists stays where it is
+        sub_skipped = sum(1 for _, sub_ops in groups for s in sub_ops if detect_conflicts([s]))
+        groups = [(main_op, [s for s in sub_ops if not detect_conflicts([s])])
+                  for main_op, sub_ops in groups]
+        action = self.cfg.get("rename_action", "move")
+        if action not in RENAME_ACTIONS:
+            action = "move"
+        result = self.renamer.execute_groups(groups, dest_root=dst, action=action, source=source)
+        ok_subs = sum(1 for op in result.succeeded if op.src.suffix.lower() in SUB_EXT)
+        ok_files = len(result.succeeded) - ok_subs
+        fallbacks = sum(1 for op in result.succeeded if op.note)
+
+        # Remove folders left empty in the source tree (only moving empties them)
+        if action == "move" and self.cfg.get("cleanup_empty_folders", True):
+            root = self.src.text().strip()
+            if root and os.path.isdir(root):
+                for op in result.succeeded:
+                    if _is_inside(op.src, Path(root)):
+                        _cleanup_empty_dirs(op.src.parent, stop=Path(root))
+
+        msg = f"{self.ACTION_WORDS.get(action, self.ACTION_WORDS['move'])[1]} {ok_files} file(s)"
+        if ok_subs:
+            msg += f" and {ok_subs} subtitle(s)"
+        if result.failed:
+            msg += f", {len(result.failed)} failed"
+        if fallbacks:
+            msg += f" · {fallbacks} copied instead (hard links only work on the same drive)"
+        if sub_skipped:
+            msg += f" · {sub_skipped} subtitle(s) left in place (new name already exists)"
+
+        # Placed files are done; drop them from the list
+        self._purge_files_from_list([op.src for op in result.succeeded])
+        self._update_undo_buttons()
+        return result, msg
 
     def _undo(self):
         if not self.renamer.can_undo():
             return
         result = self.renamer.undo_last()
+        self._report_undo(result)
+
+    def _report_undo(self, result):
         ok_count = len(result.succeeded)
         fail_count = len(result.failed)
         self.status.showMessage(
@@ -3837,6 +4303,13 @@ class MainWindow(QMainWindow):
         if fail_count:
             details = "\n".join(f"{o.src.name}: {o.error}" for o in result.failed[:10])
             QMessageBox.warning(self, "Some Undos Failed", details)
+        self._update_undo_buttons()
+
+    def _show_history(self):
+        dlg = HistoryDialog(self.renamer, self)
+        dlg.exec()
+        if dlg.undo_results:
+            self._report_undo(dlg.undo_results[-1])
         self._update_undo_buttons()
 
     def _update_undo_buttons(self):
@@ -3886,6 +4359,225 @@ class MainWindow(QMainWindow):
     def _remove_selected_files(self):
         for item in self.file_list.selectedItems():
             self.file_list.takeItem(self.file_list.row(item))
+
+    # ── Presets ──────────────────────────────────────────────────────
+    def _fill_presets_menu(self):
+        menu = self.presets_menu
+        menu.clear()
+        presets = self.cfg.get("presets") or {}
+        if presets:
+            for name in sorted(presets, key=str.lower):
+                act = menu.addAction(f"Use “{name}”")
+                act.triggered.connect(lambda _=False, n=name: self._apply_preset(n))
+        else:
+            none = menu.addAction("No presets yet")
+            none.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Save Current Settings as Preset…").triggered.connect(self._save_preset)
+        if presets:
+            delete = menu.addMenu("Delete Preset")
+            for name in sorted(presets, key=str.lower):
+                delete.addAction(name).triggered.connect(lambda _=False, n=name: self._delete_preset(n))
+
+    def _save_preset(self, name=None):
+        if name is None:
+            name, ok = QInputDialog.getText(
+                self, "Save Preset",
+                "Name for these settings (naming formats, library folders, data sources,\n"
+                "media type and how files are placed):", QLineEdit.EchoMode.Normal, "")
+            name = name.strip()
+            if not ok or not name:
+                return
+            if name in (self.cfg.get("presets") or {}):
+                reply = QMessageBox.question(self, "Save Preset", f"Replace the preset “{name}”?",
+                                             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+        self.cfg.setdefault("presets", {})[name] = {k: self.cfg.get(k, DEFAULTS.get(k)) for k in PRESET_KEYS}
+        cfg_save(self.cfg)
+        self.status.showMessage(f"Saved preset “{name}”.")
+
+    def _apply_preset(self, name):
+        preset = (self.cfg.get("presets") or {}).get(name)
+        if not preset:
+            return
+        for key in PRESET_KEYS:
+            if key in preset:
+                self.cfg[key] = preset[key]
+        cfg_save(self.cfg)
+        self._refresh_clients()
+        idx = {"tv": 0, "movie": 1, "anime": 2}.get(self.cfg.get("media_type"), 0)
+        if self.combo.currentIndex() != idx:
+            self.combo.setCurrentIndex(idx)
+        self._update_library_label()
+        msg = f"Using preset “{name}”."
+        if self.table.rowCount():
+            msg += " Click Preview to see the names with it."
+        self.status.showMessage(msg)
+
+    def _delete_preset(self, name):
+        reply = QMessageBox.question(self, "Delete Preset", f"Delete the preset “{name}”?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            (self.cfg.get("presets") or {}).pop(name, None)
+            cfg_save(self.cfg)
+
+    # ── Fixing single rows ───────────────────────────────────────────
+    def _rows_for_action(self):
+        """Selected rows, top to bottom (none while a preview is running)."""
+        if self._scanning:
+            self.status.showMessage("Wait for the preview to finish first.")
+            return []
+        return sorted(self.table.selected_rows())
+
+    def _update_fix_actions(self):
+        try:
+            cands = self.table.get_cands()
+            rows = sorted(self.table.selected_rows())
+        except RuntimeError:              # window is being destroyed
+            return
+        has = bool(rows) and not self._scanning
+        episodic = has and all(cands[r].media_type != "movie" for r in rows if r < len(cands))
+        for act, ok in ((self.act_edit_name, has and len(rows) == 1),
+                        (self.act_change_episode, episodic and len(rows) == 1),
+                        (self.act_choose_match, has),
+                        (self.act_number, episodic),
+                        (self.act_move_up, has and rows[0] > 0),
+                        (self.act_move_down, has and rows[-1] < len(cands) - 1)):
+            act.setEnabled(bool(ok))
+        self.btn_fix.setEnabled(has)
+
+    def _table_menu(self, pos):
+        menu = QMenu(self)
+        for act in (self.act_edit_name, self.act_change_episode, self.act_choose_match, self.act_number):
+            menu.addAction(act)
+        menu.addSeparator()
+        menu.addAction(self.act_move_up); menu.addAction(self.act_move_down)
+        menu.addSeparator()
+        rm = QAction("Remove From List", menu); rm.triggered.connect(self._remove_selected_rows)
+        rm.setEnabled(bool(self.table.selectedItems()) and not self._scanning)
+        menu.addAction(rm)
+        cp = QAction("Copy", menu); cp.triggered.connect(self.table._copy_selection)
+        menu.addAction(cp)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _on_table_double_click(self, row, col):
+        if col == 1:
+            self._choose_match()
+        elif col != STATUS_COL:
+            self._edit_name()
+
+    def _edit_name(self):
+        rows = self._rows_for_action()
+        if len(rows) != 1:
+            return
+        row = rows[0]
+        cand = self.table.get_cands()[row]
+        text, ok = QInputDialog.getText(
+            self, "Edit New Name",
+            "New name inside your library folder (use / between folders):",
+            QLineEdit.EchoMode.Normal, cand.dest_rel)
+        if not ok or not text.strip():
+            return
+        rel = _normalize_rel(text.strip().replace("\\", "/"))
+        if not rel:
+            return
+        ext = cand.source.suffix
+        if ext and not rel.lower().endswith(ext.lower()):
+            rel += ext
+        new = dataclasses.replace(cand, dest_rel=rel, error="", conflict=False, confidence=1.0,
+                                  manual=True, subtitles=[])
+        if cand.source.suffix.lower() not in SUB_EXT:
+            self._engine()._subs(cand.source, rel, new)       # subtitles follow the new name
+        dest = Path(self._get_destination()) / rel
+        new.conflict = dest.exists() and not _same_path(dest, cand.source)
+        self.table.replace_candidate(row, new, self._get_destination())
+        self._after_rows_changed()
+
+    def _change_episode(self):
+        rows = self._rows_for_action()
+        if len(rows) != 1:
+            return
+        cand = self.table.get_cands()[rows[0]]
+        eps = cand.episodes or []
+        dlg = EpisodeNumbersDialog(self, title=cand.title, season=cand.season if cand.season is not None else 1,
+                                   first=eps[0] if eps else 1, last=eps[-1] if eps else None)
+        if dlg.exec():
+            title, season, episodes = dlg.values()
+            self._rematch(rows, title=title, season=season, episodes=episodes)
+
+    def _number_in_order(self):
+        rows = self._rows_for_action()
+        if not rows:
+            return
+        first = self.table.get_cands()[rows[0]]
+        eps = first.episodes or []
+        dlg = EpisodeNumbersDialog(self, title=first.title, season=first.season if first.season is not None else 1,
+                                   first=eps[0] if eps else 1, count=len(rows), number_mode=True)
+        if dlg.exec():
+            title, season, episodes = dlg.values()
+            self._rematch(rows, title=title, season=season, episodes=episodes)
+
+    def _choose_match(self):
+        rows = self._rows_for_action()
+        if not rows:
+            return
+        cands = self.table.get_cands()
+        first = cands[rows[0]]
+        media_type = self._media_type()
+        start = first.title or derive_title_for(first.source, media_type)
+        title, ok = QInputDialog.getText(self, "Choose a Different Match",
+                                         "Search for the show or movie:", QLineEdit.EchoMode.Normal, start)
+        if not ok or not title.strip():
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            matches = self._engine().search_title(title.strip(), media_type)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not matches:
+            QMessageBox.information(self, "Choose a Different Match", f"Nothing found for “{title.strip()}”.")
+            return
+        dlg = MatchSelectorDialog(f"{title.strip()} — {len(rows)} file(s)", matches, self)
+        if dlg.exec() and dlg.selected_match:
+            sel = dlg.selected_match
+            chosen = (sel.get("show", sel.get("title", "")), (sel.get("src", "tvmaze"), sel.get("id")))
+            self._rematch(rows, match=chosen)
+
+    def _rematch(self, rows, title=None, match=None, season=None, episodes=None):
+        """Look the given rows up again with the user's choices, in place.
+        title: a show name typed by the user; match: (title, (source, id)) picked
+        in the match chooser; episodes: one list of episode numbers per row."""
+        cands = self.table.get_cands()
+        paths = [cands[r].source for r in rows]
+        for i, (row, path) in enumerate(zip(rows, paths)):
+            key = str(path)
+            if match:
+                self._title_overrides[key] = match
+            elif title and title != cands[row].title:
+                self._title_overrides[key] = (title, None)
+            if episodes:
+                self._episode_overrides[key] = (season, episodes[min(i, len(episodes) - 1)])
+        sel = {str(p): self._title_overrides[str(p)] for p in paths if str(p) in self._title_overrides}
+        eps = {str(p): self._episode_overrides[str(p)] for p in paths if str(p) in self._episode_overrides}
+        replace = {os.path.normcase(str(p)): r for p, r in zip(paths, rows)}
+        self._start_scan(paths, self._engine(), self._media_type(), self._get_destination(),
+                         sel, eps, replace=replace)
+
+    def _move_rows(self, delta):
+        rows = self._rows_for_action()
+        if rows:
+            self.table.move_rows(rows, delta)
+            self._after_rows_changed()
+
+    def _after_rows_changed(self):
+        mark_duplicates(self.table.get_cands(), self._get_destination())
+        self.table.refresh_rows()
+        self._cands = self.table.get_cands()
+        self.btn_rename.setEnabled(any(not c.error for c in self._cands))
+        self._update_summary()
+        self._update_details()
+        self._update_fix_actions()
 
     # ── Drag & drop ─────────────────────────────────────────────────
     def dragEnterEvent(self, event):
