@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1
+
+- Preview table: every column is resizable in both layouts; long text wraps
+  onto more lines instead of being cut to "…", and rows grow to fit.
+- README is for users; developer notes moved to DEVELOPMENT.md.
+
 ## 1.4.0
 
 - Fix single rows in the preview: edit the new name (F2), change the episode
