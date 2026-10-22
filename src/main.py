@@ -79,7 +79,7 @@ from PyQt6.QtGui import (QColor, QAction, QActionGroup, QDesktopServices, QDragE
                          QDropEvent, QKeySequence, QShortcut, QPainter, QPalette)
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QObject, QUrl, QTimer, QVariantAnimation,
-                          QEasingCurve, QByteArray)
+                          QEasingCurve, QByteArray, QEvent)
 
 # ═══════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -1808,14 +1808,23 @@ def row_colors(pal):
 COLUMNS     = ["Original Filename","Detected Match","New Path","Subtitles","Status"]
 STATUS_COL  = 4
 
-class _ElideDelegate(QStyledItemDelegate):
-    """Cut long text at a chosen end: paths keep their (informative) end."""
-    def __init__(self, mode, parent=None):
-        super().__init__(parent)
-        self._mode = mode
-    def initStyleOption(self, option, index):
-        super().initStyleOption(option, index)
-        option.textElideMode = self._mode
+class _WrapDelegate(QStyledItemDelegate):
+    """Rows tall enough for every wrapped line plus the cell padding, so the
+    last line is never cut to "…"."""
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        width = self.parent().columnWidth(index.column()) - 34      # minus padding and margins
+        text = index.data() or ""
+        if width > 20 and text:
+            fm = option.fontMetrics
+            # Qt breaks at spaces and, for long words such as paths, anywhere:
+            # measure both ways and keep the taller
+            needed = max(fm.boundingRect(0, 0, width, 100000, int(flags), text).height()
+                         for flags in (Qt.TextFlag.TextWordWrap,
+                                       Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere))
+            size.setHeight(max(size.height(), needed + 12))
+        return size
+
 
 class RenameTable(QTableWidget):
     def __init__(self, parent=None):
@@ -1825,8 +1834,6 @@ class RenameTable(QTableWidget):
         self._show_detected = True
         self._show_full_path = True
         self._modern = False
-        self._elide_middle = _ElideDelegate(Qt.TextElideMode.ElideMiddle, self)
-        self._elide_left = _ElideDelegate(Qt.TextElideMode.ElideLeft, self)
         self._row_colors = row_colors(THEMES["dark"])
         self.setColumnCount(len(COLUMNS))
         self.setHorizontalHeaderLabels(COLUMNS)
@@ -1835,12 +1842,11 @@ class RenameTable(QTableWidget):
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.verticalHeader().setVisible(False)
         hh = self.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setStretchLastSection(True)
+        self._user_sized = False
+        self._wrap = _WrapDelegate(self)
+        self.viewport().installEventFilter(self)
+        hh.sectionResized.connect(self._on_section_resized)
+        self.set_modern(False)
 
         self.cellClicked.connect(self._on_cell_clicked)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1850,43 +1856,93 @@ class RenameTable(QTableWidget):
         self._show_detected = show_detected
         self._show_full_path = show_full_path
         self.setColumnHidden(1, not show_detected)
+        if not getattr(self, "_user_sized", False):
+            self._fit_columns()
+
+    # Starting share of the width for each column; every column can be
+    # resized by dragging its header edge, and text wraps to fit.
+    COLUMN_SHARES = (0.28, 0.17, 0.33, 0.11, 0.11)
 
     def set_modern(self, modern: bool, density: str = "comfortable"):
-        """Modern layout: one line per row (no wrapping), long paths cut at the
-        start, smooth scrolling, subtitle counts instead of names. Classic
-        keeps the original wrapped rows."""
+        """Modern layout: smooth scrolling, no grid, subtitle counts instead of
+        names. In both layouts all columns are resizable and long text wraps
+        onto more lines instead of being cut off."""
         self._modern = modern
         hh, vh = self.horizontalHeader(), self.verticalHeader()
+        self.setWordWrap(True)
+        self.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.setItemDelegate(self._wrap)
+        for col in range(len(COLUMNS)):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        hh.setStretchLastSection(False)
+        hh.setMinimumSectionSize(60)
+        hh.setDefaultSectionSize(80)          # also the stretched last column's minimum
+        vh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         if modern:
-            self.setWordWrap(False)
             self.setShowGrid(False)
             self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
             self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-            self.setItemDelegateForColumn(0, self._elide_middle)
-            self.setItemDelegateForColumn(2, self._elide_left)
-            vh.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-            vh.setDefaultSectionSize(26 if density == "compact" else 34)
-            hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-            hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            vh.setMinimumSectionSize(24 if density == "compact" else 32)
             hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self.horizontalHeaderItem(STATUS_COL).setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.setColumnWidth(1, 200)
         else:
-            self.setWordWrap(True)
             self.setShowGrid(True)
             self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerItem)
             self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerItem)
-            for col in (0, 2):
-                self.setItemDelegateForColumn(col, None)
-            vh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-            vh.setDefaultSectionSize(30)
-            hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-            hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            vh.setMinimumSectionSize(30)
             hh.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._user_sized = False
+        self._fit_columns()
         if self._cands:
             self.populate(self._cands, self._dest_root)
+
+    def _fit_columns(self):
+        """Share the width between the columns until the user resizes one."""
+        width = self.viewport().width()
+        visible = [c for c in range(len(COLUMNS)) if not self.isColumnHidden(c)]
+        if width < 100 or not visible:
+            return
+        if self.verticalScrollBar().isVisible():
+            width = self.viewport().width()
+        width -= 2
+        total = sum(self.COLUMN_SHARES[c] for c in visible)
+        last = visible[-1]                  # the last one stretches to fill what's left
+        last_w = max(int(width * self.COLUMN_SHARES[last] / total),
+                     self.horizontalHeader().sectionSizeHint(last),
+                     self.horizontalHeader().defaultSectionSize())
+        rest = sum(self.COLUMN_SHARES[c] for c in visible[:-1]) or 1
+        self._fitting = True
+        try:
+            used = 0
+            for c in visible[:-1]:
+                w = max(60, int((width - last_w) * self.COLUMN_SHARES[c] / rest))
+                self.setColumnWidth(c, w)
+                used += w
+            self.setColumnWidth(last, max(60, width - used))
+        finally:
+            self._fitting = False
+
+    def _on_section_resized(self, *_):
+        # Only a drag on a header edge counts as the user choosing widths
+        if not getattr(self, "_fitting", False) and QApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            self._user_sized = True
+        self.resizeRowsToContents()
+
+    def resizeEvent(self, event):
+        self._fitting = True
+        try:
+            super().resizeEvent(event)
+        finally:
+            self._fitting = False
+        if not getattr(self, "_user_sized", False):
+            self._fit_columns()
+
+    def eventFilter(self, obj, event):
+        # The visible area also shrinks when a scroll bar appears: refit then too
+        if obj is self.viewport() and event.type() == QEvent.Type.Resize \
+                and not getattr(self, "_user_sized", False) and not getattr(self, "_fitting", False):
+            QTimer.singleShot(0, self._fit_columns)
+        return super().eventFilter(obj, event)
 
     def set_palette(self, pal):
         self._row_colors = row_colors(pal)
@@ -1930,8 +1986,7 @@ class RenameTable(QTableWidget):
                 item.setToolTip(tips[col])
             if col == STATUS_COL: item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.setItem(row, col, item)
-        if not self._modern:
-            self.resizeRowToContents(row)
+        self.resizeRowToContents(row)
 
     def populate(self, cands, dest_root):
         self._cands = cands

@@ -130,7 +130,7 @@ def test_layout_options_apply_without_switching(main, make_window, qapp):
     w.show(); w.resize(1200, 760); _wait(qapp, 50)
     w.cfg.update(density="compact", panel_mode="stacked", show_details=False)
     w._apply_layout_options()
-    assert w.table.verticalHeader().defaultSectionSize() == 26
+    assert w.table.verticalHeader().minimumSectionSize() == 24
     assert _wait_until(qapp, lambda: w._split_main.orientation() == Qt.Orientation.Vertical)
     assert _wait_until(qapp, w.details.isHidden)
     assert not w.act_details.isChecked()
