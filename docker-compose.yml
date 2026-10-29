@@ -1,0 +1,23 @@
+# PathRenamer on a server, NAS or any computer with Docker. See DOCKER.md.
+#
+# 1. Change the folders on the left side of each ":" to yours.
+# 2. Start it:            docker compose up -d
+# 3. See what it does:    docker compose logs -f pathrenamer
+services:
+  pathrenamer:
+    image: ghcr.io/royalkiller2222/pathrenamer:latest
+    container_name: pathrenamer
+    restart: unless-stopped
+    environment:
+      PUID: "1000"                       # your user ID (run: id -u), so renamed files are yours
+      PGID: "1000"                       # your group ID (run: id -g)
+      TZ: "Etc/UTC"                      # your time zone, for the log, e.g. Europe/Amsterdam
+      PATHRENAMER_WATCH: /data/downloads
+      PATHRENAMER_MOVIES: /data/media/movies
+      PATHRENAMER_TV: /data/media/tv
+      PATHRENAMER_ANIME: /data/media/anime
+      PATHRENAMER_ACTION: hardlink       # move, copy or hardlink (hardlink keeps torrents seeding)
+      # PATHRENAMER_LICENSE_KEY: "your Pro license key"
+    volumes:
+      - ./pathrenamer-config:/config     # settings, rename history, license
+      - /srv/data:/data                  # ONE folder holding downloads and media, so hard links work

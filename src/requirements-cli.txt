@@ -1,0 +1,4 @@
+# The command line and Docker version: no window, so no PyQt6.
+requests==2.34.2
+guessit==4.4.0
+rapidfuzz==3.14.6

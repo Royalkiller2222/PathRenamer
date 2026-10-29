@@ -24,6 +24,30 @@ def main():
 
 
 @pytest.fixture(autouse=True)
+def no_registry(monkeypatch):
+    """The trial's second copy goes to the Windows registry in the app; keep
+    the tests away from it (each License gets an empty one)."""
+    import licensing
+    monkeypatch.setattr(licensing, "trial_backup", licensing.MemoryBackup)
+
+
+@pytest.fixture(autouse=True)
+def no_update_checks(monkeypatch):
+    """Windows built by a test may check GitHub for updates after a few
+    seconds; never from the tests (tests that need it patch updates.check)."""
+    import updates
+    monkeypatch.setattr(updates, "check", lambda current, session=None: None)
+
+
+def ended_trial():
+    """Config values for a Pro trial that ended long ago, sealed like the app does."""
+    import licensing
+    lic = licensing.License({}, organization_id="org", clock=lambda: 1_000.0, backup=licensing.MemoryBackup())
+    lic.start_trial()
+    return {licensing.STATE_KEY: lic.cfg[licensing.STATE_KEY]}
+
+
+@pytest.fixture(autouse=True)
 def fail_on_slot_errors(monkeypatch):
     """Errors raised inside Qt slots don't reach pytest (and the app's own
     handler would open a message box); collect them and fail the test."""
@@ -65,7 +89,8 @@ def make_window(main, qapp, tmp_path, monkeypatch):
 
     def factory(**overrides):
         cfg = dict(main.DEFAULTS, first_run=False, media_type="movie", root_movie=str(tmp_path / "lib"),
-                   use_tvmaze=False, use_anidb=False, use_cinemeta=False, last_source_folder="")
+                   use_tvmaze=False, use_anidb=False, use_cinemeta=False, last_source_folder="",
+                   check_updates=False)
         cfg.update(overrides)
         monkeypatch.setattr(main, "cfg_load", lambda: dict(cfg))
         w = main.MainWindow()
@@ -74,6 +99,7 @@ def make_window(main, qapp, tmp_path, monkeypatch):
     factory.saved = saved
     yield factory
     for w in windows:
+        w._quitting = True                 # (not to the tray)
         w.close()
 
 

@@ -9,9 +9,9 @@ name: Website
 on:
   push:
     branches: [main]
-    paths: ["website/**", "src/main.py", "RELEASE_NOTES.md", ".github/workflows/pages.yml"]
+    paths: ["website/**", "src/version.py", "RELEASE_NOTES.md", ".github/workflows/pages.yml"]
   pull_request:
-    paths: ["website/**", "src/main.py", "RELEASE_NOTES.md", ".github/workflows/pages.yml"]
+    paths: ["website/**", "src/version.py", "RELEASE_NOTES.md", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import make_files, run_preview, wait, wait_until
+from conftest import ended_trial, make_files, run_preview, wait, wait_until
 from test_automation import FakePlex, FakeSubs
 from opensubs import SubtitleResult
 
@@ -70,7 +70,7 @@ def test_episodes_are_detected_by_name(watch_window, qapp, tmp_path):
 def test_automatic_renaming_needs_pro_after_licensing_starts(watch_window, qapp, tmp_path, monkeypatch):
     import licensing
     monkeypatch.setattr(licensing, "POLAR_ORGANIZATION_ID", "org")
-    w = watch_window(trial_started=1.0)                                  # trial long over
+    w = watch_window(**ended_trial())
     _watching(w, qapp, tmp_path / "dl")
     (tmp_path / "dl" / "Heat.1995.mkv").write_bytes(b"x")
     assert wait_until(qapp, lambda: w.table.rowCount() == 1, timeout=10)
@@ -82,7 +82,7 @@ def test_after_rename_downloads_subtitles_and_scans_plex(make_window, qapp, tmp_
     w = make_window(subs_auto=True, plex_auto_scan=True, subs_languages="English, Spanish")
     subs, plex = FakeSubs([SubtitleResult(5, "spa")]), FakePlex()
     w._subtitle_client = lambda: subs
-    w._plex_client = lambda: plex
+    w._media_server = lambda: plex
     video, _ = make_files(tmp_path / "dl", "Heat.1995.mkv", "Heat.1995.en.srt")
     run_preview(__import__("main"), w, [video])
     w._rename()
@@ -99,7 +99,7 @@ def test_after_rename_downloads_subtitles_and_scans_plex(make_window, qapp, tmp_
 def test_switches_off_means_nothing_runs(make_window, qapp, tmp_path):
     w = make_window()
     w._subtitle_client = lambda: pytest.fail("no subtitles without the switch")
-    w._plex_client = lambda: pytest.fail("no Plex without the switch")
+    w._media_server = lambda: pytest.fail("no media server without the switch")
     run_preview(__import__("main"), w, make_files(tmp_path / "dl", "Heat.1995.mkv"))
     w._rename()
     wait(qapp, 100)
@@ -129,7 +129,7 @@ def test_tools_need_setting_up_first(make_window, monkeypatch):
     monkeypatch.setattr(w, "_settings", lambda page=None: opened.append(page))
     monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
     w._toggle_watch(True)
-    w._scan_plex_now()
+    w._scan_server_now()
     assert opened == ["Automation", "Automation"] and not w.watcher.is_running()
 
 
@@ -154,13 +154,13 @@ def test_settings_save_automation(main, qapp, monkeypatch, tmp_path):
     assert (c["watch_enabled"], c["watch_media_type"], c["watch_auto_rename"]) == (True, "movie", True)
     assert c["subs_languages"] == "English, Spanish" and c["plex_url"] == "http://localhost:32400"
     assert main.unprotect(c["plex_token"]) == "tok"
-    assert c["trial_started"] and "trial has started" in shown[0]
+    assert main.License(c).trial_active() and "trial has started" in shown[0]
 
 
 def test_pro_switches_lock_after_the_trial(main, qapp, monkeypatch):
     import licensing
     monkeypatch.setattr(licensing, "POLAR_ORGANIZATION_ID", "org")
-    d = main.SettingsDialog(dict(main.DEFAULTS, trial_started=1.0, watch_auto_rename=True))
+    d = main.SettingsDialog(dict(main.DEFAULTS, watch_auto_rename=True, **ended_trial()))
     assert not d.watch_auto.isEnabled() and not d.watch_auto.isChecked()
     assert "trial has ended" in d.pro_status.text()
     early = main.SettingsDialog(dict(main.DEFAULTS))

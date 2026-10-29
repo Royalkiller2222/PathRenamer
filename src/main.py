@@ -1,86 +1,7 @@
-import sys, os, json, re, shutil, gzip, time, xml.etree.ElementTree as ET, logging, traceback, html, functools
-import dataclasses
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple, Any
-
-APP_VERSION = "1.5.0"
-
-# ── Logging / crash handler ───────────────────────────────────────────────────
-_APPDATA_BASE = Path(os.getenv("APPDATA", Path.home()))
-_OLD_APP_DIR = _APPDATA_BASE / ("Plex" + "Renamer")
-_APP_DIR = _APPDATA_BASE / "PathRenamer"
-if _OLD_APP_DIR.exists() and not _APP_DIR.exists():
-    try:
-        _OLD_APP_DIR.rename(_APP_DIR)
-    except OSError:
-        pass
-
-
-_LOG_DIR = _APP_DIR
-_LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_PATH = _LOG_DIR / "pathrenamer.log"
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ]
-)
-log = logging.getLogger("PathRenamer")
-tvmaze_log = logging.getLogger("TVMaze")
-tvmaze_log.setLevel(logging.DEBUG)
-tvmaze_handler = logging.FileHandler(_LOG_DIR / "tvmaze_debug.log", encoding="utf-8")
-tvmaze_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-tvmaze_log.addHandler(tvmaze_handler)
-tvmaze_log.info("=== TVMaze Debug Log ===")
-log.info("=== PathRenamer starting up ===")
-log.info(f"Log file: {LOG_PATH}")
-log.info(f"Python: {sys.version}")
-
-def _global_except_hook(exc_type, exc_value, exc_tb):
-    msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-    log.critical(f"UNHANDLED EXCEPTION:\n{msg}")
-    try:
-        from PyQt6.QtWidgets import QMessageBox, QApplication
-        from PyQt6.QtCore import QThread
-        app = QApplication.instance()
-
-        if app and QThread.currentThread() is app.thread():
-            QMessageBox.critical(None, "PathRenamer Crashed",
-                f"An error occurred:\n\n{exc_value}\n\nFull log saved to:\n{LOG_PATH}")
-    except Exception:
-        pass
-    sys.__excepthook__(exc_type, exc_value, exc_tb)
-
-sys.excepthook = _global_except_hook
-
-
-import errno
-import threading
-import uuid
-import requests
-import re
-from parser import analyse_path
-from history import RenameHistory, describe as describe_batch
-from mediainfo import read_media_info
-from automation import after_rename as run_after_rename, fetch_subtitles
-from licensing import (License, PRO_FEATURES, STATE_KEYS as LICENSE_KEYS,
-                       BUY_URL, MANAGE_URL)
-from opensubs import OpenSubtitlesClient, OpenSubtitlesError, parse_languages
-from plex import PlexClient, PlexSignIn
-from secret import protect, unprotect
-try:
-    import build_info                    # written by the release build: the app's own API keys
-except ImportError:
-    build_info = None
-OPENSUBTITLES_APP_KEY = getattr(build_info, "OPENSUBTITLES_API_KEY", "") or ""
-WEBSITE_URL = "https://royalkiller2222.github.io/PathRenamer/"
-from scanner import (SUBTITLE_EXTENSIONS, detect_subtitle_language, is_language_only_name,
-                     unique_subtitle_filename)
-from rapidfuzz import fuzz
+"""PathRenamer for Windows: the window, dialogs and tray. The engine
+(scanning, matching, naming, renaming) lives in core.py."""
+from core import *  # noqa: F401,F403  (the engine; see core.py)
+from core import (_cleanup_empty_dirs, _is_inside, _normalize_rel, _same_path, _skip_watch_dir, _watchable)  # noqa: F401
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QComboBox, QFileDialog, QStatusBar,
@@ -89,1331 +10,16 @@ from PyQt6.QtWidgets import (
     QGroupBox, QTabWidget, QListWidget, QListWidgetItem, QScrollArea,
     QGridLayout, QFrame, QScrollBar, QSizePolicy, QTextEdit,
     QMenu, QInputDialog, QStyledItemDelegate, QSplitter, QStackedWidget, QButtonGroup,
+    QTextBrowser, QSystemTrayIcon,
 )
 from PyQt6.QtGui import (QColor, QAction, QActionGroup, QDesktopServices, QDragEnterEvent,
                          QDropEvent, QKeySequence, QShortcut, QPainter, QPalette)
-from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QLocalServer, QLocalSocket
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QObject, QUrl, QTimer, QVariantAnimation,
                           QEasingCurve, QByteArray, QEvent)
 from watchfolder import FolderWatcher
-
-# ═══════════════════════════════════════════════════════════════════
-#  CONFIG
-# ═══════════════════════════════════════════════════════════════════
-CONFIG_PATH = _APP_DIR / "config.json"
-HISTORY_PATH = _APP_DIR / "history.json"
-DEFAULTS = {
-    "tmdb_api_key": "",
-    "last_source_folder": "",
-    "root_tv": "",
-    "root_movie": "",
-    "root_anime": "",
-    "media_type": "tv",
-    "format_tv": "{show} ({year})/Season {s00}/{show} {s00e00} - {title}",
-    # Each edition gets its own folder, as Plex wants when movies have folders
-    "format_movie": "{title} ({year}) {edition}/{title} ({year}) {edition} {res} {vc} {ach} {c}",
-    "format_anime": "{show} ({year})/Season {s00}/{show} {s00e00} - {title}",
-    "episode_tv": "dvd",
-    "episode_anime": "dvd",
-    "rename_subtitles": True,
-    "use_cinemeta": True,
-    "theme": "dark",
-    "show_media_info": True,
-    "cleanup_empty_folders": True,
-    "confirm_rename": True,
-    "first_run": True,
-    # Window layout (Settings → Appearance → Layout)
-    "layout": "modern",            # "modern" | "classic"
-    "panel_mode": "auto",          # modern: "auto" (by window width) | "side" | "stacked"
-    "density": "comfortable",      # modern: "comfortable" | "compact"
-    "show_details": True,          # modern: details panel under the preview
-    "animations": True,            # modern: smooth panel animations
-    "files_ratio": 0.3,            # modern: share of the window for the file list
-    "rename_action": "move",       # "move" | "copy" | "hardlink" (keeps torrents seeding)
-    "read_media_info": True,       # fill {res} {vc} {c} {ach} from the video when the name lacks them
-    "presets": {},                 # name -> saved settings (PRESET_KEYS)
-    # Automation (Settings → Automation and Subtitles). The automatic parts are Pro.
-    "watch_enabled": False,
-    "watch_folder": "",
-    "watch_media_type": "auto",    # "auto" (TV or movie by name) | "tv" | "movie" | "anime"
-    "watch_auto_rename": False,    # Pro: rename sure matches without asking
-    "watch_include_existing": False,
-    "plex_url": "",
-    "plex_token": "",              # encrypted (secret.protect)
-    "plex_client_id": "",
-    "plex_auto_scan": False,       # Pro: ask Plex to scan after renaming
-    "subs_languages": "English",
-    "subs_auto": False,            # Pro: download missing subtitles after renaming
-    "subs_hearing_impaired": False,
-    "opensubtitles_api_key": "",   # the user's own key (releases have one built in)
-    "opensubtitles_username": "",
-    "opensubtitles_password": "",  # encrypted
-}
-
-# What a preset remembers
-PRESET_KEYS = ("media_type", "format_tv", "format_movie", "format_anime", "episode_tv", "episode_anime",
-               "root_tv", "root_movie", "root_anime", "rename_action", "rename_subtitles",
-               "use_tvmaze", "use_anidb", "use_cinemeta")
-
-LAYOUTS = ("modern", "classic")
-PANEL_MODES = ("auto", "side", "stacked")
-DENSITIES = ("comfortable", "compact")
-
-# Previous default movie templates. cfg_load() upgrades configs that still
-# use one of them to the current default.
-_OLD_MOVIE_DEFAULTS = {
-    "{title} ({year})/{title} ({year})",
-    "{title} ({year})/{title} ({year}).{ext}",
-    "{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}",     # 1.3.0, before editions
-    "{title} ({year})/{title} ({year}) {edition} {res} {vc} {ach} {c}",   # 1.4: editions shared a folder
-}
-
-def cfg_load():
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = {**DEFAULTS, **json.load(f)}
-            if cfg.get("format_movie") in _OLD_MOVIE_DEFAULTS:
-                cfg["format_movie"] = DEFAULTS["format_movie"]
-            return cfg
-        except Exception:
-            pass
-    return dict(DEFAULTS)
-
-def cfg_save(cfg):
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-# ═══════════════════════════════════════════════════════════════════
-#  SCANNER
-# ═══════════════════════════════════════════════════════════════════
-VIDEO_EXT = {".mkv",".mp4",".avi",".mov",".wmv",".m4v",".ts",".m2ts",".flv",".webm",".mpg",".mpeg"}
-SUB_EXT   = set(SUBTITLE_EXTENSIONS)     # .srt .sub .idx .ass .ssa .vtt .sup .smi
-
-# Sub-folders holding samples and bonus material, not episodes or movies
-# (Plex's extras folder names plus the usual release-folder ones).
-_SKIP_SCAN_DIRS = {"sample", "samples", "extras", "featurettes", "behind the scenes",
-                   "deleted scenes", "interviews", "trailers", "shorts", "bonus"}
-# "Movie.2019.1080p-sample.mkv", "sample-movie.mkv"
-_SAMPLE_FILE = re.compile(r"(?:^|[\s._-])sample(?:$|[\s._-])", re.IGNORECASE)
-
-def scan_folder(folder, include_subtitles=False):
-    """Video files (and optionally subtitles) under folder. Samples and files in
-    extras/sample sub-folders are skipped: renamed like the main file they would
-    collide with it."""
-    result = []
-    for root, dirs, files in os.walk(folder):
-        dirs[:] = sorted(d for d in dirs if d.strip().lower() not in _SKIP_SCAN_DIRS)
-        for name in sorted(files):
-            p = Path(root) / name
-            if p.suffix.lower() in VIDEO_EXT:
-                if _SAMPLE_FILE.search(p.stem):
-                    continue
-                result.append(p)
-            elif include_subtitles and p.suffix.lower() in SUB_EXT:
-                result.append(p)
-    return result
-
-def _watchable(path):
-    """A video the watch folder should report (not a sample)."""
-    return path.suffix.lower() in VIDEO_EXT and not _SAMPLE_FILE.search(path.stem)
-
-def _skip_watch_dir(name):
-    return name.strip().lower() in _SKIP_SCAN_DIRS
-
-def _sub_matches_video(sub_stem, video_stem):
-    """True if the subtitle is named after the video: "Movie" -> "Movie.en",
-    "Movie_forced", "Movie (SDH)". "Show - 1" must not match "Show - 10"."""
-    s, v = sub_stem.lower(), video_stem.lower()
-    start = s.find(v)
-    while start >= 0:
-        after = s[start + len(v):start + len(v) + 1]
-        before = s[start - 1:start] if start else ""
-        if (not after or not after.isalnum()) and (not before or not before.isalnum()):
-            return True
-        start = s.find(v, start + 1)
-    return False
-
-# Folders next to a video that hold its subtitles (compared lower-case)
-SUBTITLE_DIR_NAMES = {"subs", "subtitles", "subtitle", "sub", "captions", "vobsub", "english", "字幕"}
-# S01E02 / 1x02, with the text before it (the show name)
-_EPISODE_TAG = re.compile(r"(?i)(?<![a-z0-9])s(\d{1,2})[ ._-]?e(\d{1,3})(?!\d)|(?<![0-9])(\d{1,2})x(\d{2,3})(?!\d)")
-
-@functools.lru_cache(maxsize=8192)
-def _episode_tag(stem):
-    """(show name squashed to lower-case letters/digits, (season, episode)) or None."""
-    m = _EPISODE_TAG.search(stem)
-    if not m:
-        return None
-    season, episode = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
-    return re.sub(r"[\W_]+", "", stem[:m.start()].lower()), (int(season), int(episode))
-
-# What may follow a show name and still be the same show: a year or a country
-# ("doctorwho" / "doctorwho2005", "theoffice" / "theofficeus"), not more words
-# ("lost" / "lostgirl" are different shows).
-_SAME_SHOW_SUFFIX = re.compile(r"(?:19|20)\d\d|us|uk|au|nz|ca")
-
-def _same_show(a, b):
-    if a == b:
-        return True
-    short, long_ = sorted((a, b), key=len)
-    return bool(short) and long_.startswith(short) and bool(_SAME_SHOW_SUFFIX.fullmatch(long_[len(short):]))
-
-def _list_dir(folder):
-    """(file names, folder names) in folder, sorted case-insensitively.
-    os.scandir gives the entry types with the listing, which keeps this fast
-    in download folders with thousands of entries."""
-    files, dirs = [], []
-    try:
-        with os.scandir(folder) as it:
-            for e in it:
-                try:
-                    if e.is_file():
-                        files.append(e.name)
-                    elif e.is_dir():
-                        dirs.append(e.name)
-                except OSError:
-                    pass
-    except OSError:
-        return [], []
-    files.sort(key=str.lower)
-    dirs.sort(key=str.lower)
-    return files, dirs
-
-def _split_name(name):
-    """("Movie.en", ".srt") like Path.stem / Path.suffix, for a bare file name."""
-    i = name.rfind(".")
-    return (name[:i], name[i:].lower()) if i > 0 else (name, "")
-
-def find_subtitle_siblings(video):
-    """Subtitles that belong to a video: next to it, in a Subs/Subtitles folder
-    beside it, or in a per-episode folder inside that (season packs:
-    "Subs/<video name>/2_English.srt").
-
-    A subtitle belongs to the video when
-      - it is named after the video ("Movie.en.srt"), unless another video in
-        the folder has a longer name it also matches ("Movie.Extended.en.srt");
-      - the video is the only one in its folder and the subtitle is named only
-        by language ("English.srt"), or sits in the Subs folder (any name);
-      - (season packs) it has the same SxxEyy and show name as the video and no
-        other video in the folder has that episode.
-    """
-    parent = video.parent
-    vstem = video.stem
-    names, dirnames = _list_dir(parent)
-    own = os.path.normcase(video.name)
-    others = []                          # names (without extension) of the other videos
-    for n in names:
-        stem, ext = _split_name(n)
-        if ext in VIDEO_EXT and os.path.normcase(n) != own and not _SAMPLE_FILE.search(stem):
-            others.append(stem)
-    only_video = not others
-    tag = _episode_tag(vstem)
-    episode_unique = tag is not None and not any(
-        (t := _episode_tag(o)) and t[1] == tag[1] for o in others)
-
-    def same_episode(stem, in_sub_dir):
-        if not episode_unique:
-            return False
-        t = _episode_tag(stem)
-        if not t or t[1] != tag[1]:
-            return False
-        if not t[0]:                     # "Subs/S01E02.eng.srt"
-            return in_sub_dir
-        return bool(tag[0]) and _same_show(t[0], tag[0])
-
-    def other_episode(stem):
-        # Named for another episode: e.g. one episode downloaded from a season
-        # pack whose Subs folder still has every episode's subtitles
-        t = _episode_tag(stem)
-        return t is not None and tag is not None and t[1] != tag[1]
-
-    def belongs(stem, in_sub_dir, folder=False):
-        if _sub_matches_video(stem, vstem):
-            # "Movie.Extended.en.srt" belongs to "Movie.Extended.mkv", not "Movie.mkv"
-            return not any(len(o) > len(vstem) and _sub_matches_video(stem, o) for o in others)
-        if other_episode(stem):
-            return False
-        lone = only_video and ((in_sub_dir and not folder) or is_language_only_name(stem))
-        if not (lone or same_episode(stem, in_sub_dir)):
-            return False
-        return not any(_sub_matches_video(stem, o) for o in others)   # named after another video
-
-    subs = []
-    def _add(folder, name, where):
-        f = folder / name
-        subs.append(f)
-        log.debug(f"Found sub ({where}): {f}")
-
-    for n in names:
-        stem, ext = _split_name(n)
-        if ext in SUB_EXT and belongs(stem, False):
-            _add(parent, n, "next to the video")
-
-    for d in dirnames:
-        if d.strip().lower() not in SUBTITLE_DIR_NAMES:
-            continue
-        sub_dir = parent / d
-        files, nested = _list_dir(sub_dir)
-        for n in files:
-            stem, ext = _split_name(n)
-            if ext in SUB_EXT and belongs(stem, True):
-                _add(sub_dir, n, "Subs folder")
-        for nd in nested:
-            # Season packs: Subs/<video name>/ or Subs/S01E02/
-            if belongs(nd.strip(), True, folder=True):
-                for n in _list_dir(sub_dir / nd)[0]:
-                    if _split_name(n)[1] in SUB_EXT:
-                        _add(sub_dir / nd, n, "per-episode Subs folder")
-
-    log.debug(f"Total subs found for {video.name}: {len(subs)}")
-    return subs
-
-# ═══════════════════════════════════════════════════════════════════
-#  FORMATTER
-# ═══════════════════════════════════════════════════════════════════
-ILLEGAL = r'[<>:"/\\|?*\x00-\x1f]'
-
-def sanitize(name):
-    return (re.sub(ILLEGAL, "", str(name)).strip(". ") or "Unknown")
-
-def _normalize_rel(rel):
-    """Clean a template-produced relative path: drop empty '()' left by a
-    missing year, sanitize each path segment (illegal chars, trailing
-    dots/spaces Windows can't create), and drop empty segments."""
-    rel = re.sub(r"\(\s*\)", "", rel)
-    segments = []
-    for seg in re.split(r"[/\\]+", rel):
-        seg = re.sub(ILLEGAL, "", seg).strip(". ")
-        seg = re.sub(r"\s{2,}", " ", seg)
-        if seg:
-            segments.append(seg)
-    return "/".join(segments)
-
-def _to_int(value, default):
-    """int(value), or default for None / "" / junk. Keeps 0 (Season 00, episode 0)."""
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-def fmt_tv(show, season, episode, title, ext, template, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", episode_type="dvd", episode_title=None, year="", episodes=None, air_date=None):
-    """episodes: all episode numbers in the file (multi-episode files become
-    S01E01-E02, Plex's form). air_date: date-based shows become "2024-05-17"
-    inside a "Season 2024" folder, as Plex expects."""
-    if isinstance(show, list):
-        show = show[0] if show else "Unknown"
-    if isinstance(title, list):
-        title = title[0] if title else "Episode"
-    if episode_title is None:
-        episode_title = title or f"Episode {episode}"
-    elif isinstance(episode_title, list):
-        episode_title = episode_title[0] if episode_title else f"Episode {episode}"
-
-    if isinstance(year, list):
-        year = year[0] if year else ""
-
-    show_san = sanitize(show)
-    title_san = sanitize(episode_title)
-
-    if isinstance(episode, (list, tuple)):
-        episodes, episode = list(episode), (episode[0] if episode else None)
-    s = _to_int(season, 1)
-    eps = [n for n in (_to_int(x, None) for x in (episodes or [])) if n is not None]
-    if not eps:
-        eps = [_to_int(episode, 1)]
-    e = eps[0]
-
-    s00 = f"{s:02d}"
-    e00 = f"{e:02d}"
-    if len(eps) > 1:
-        s00e00 = f"S{s00}E{e00}-E{eps[-1]:02d}"
-        abs00 = f"{e00}-{eps[-1]:02d}"
-    else:
-        s00e00 = f"S{s00}E{e00}"
-        abs00 = e00
-    if air_date:
-        s00 = str(air_date.year)
-        s00e00 = abs00 = air_date.isoformat()
-
-    ctx = {
-        "show": show_san,
-        "s": str(s),
-        "s00": s00,
-        "e": str(e),
-        "e00": e00,
-        "s00e00": s00e00,
-        "abs00": abs00,
-        "title": title_san,
-        "year": year,
-        "edition": "",
-        "edition_name": "",
-        "vc": video_codec,
-        "c": audio_codec,
-        "ach": audio_channels,
-        "res": resolution,
-        "ext": ext.lstrip("."),
-    }
-
-    log.debug(f"fmt_tv input: show='{show}', season='{season}', episode='{episode}', template='{template}'")
-
-    if not template or not template.strip():
-        template = "{show} ({year})/Season {s00}/{show} {s00e00} - {title}"
-
-    if episode_type == "absolute":
-        template = template.replace("{s00e00}", "{abs00}")
-        template = template.replace("{s00}", "")
-
-    try:
-        rel = template.format(**ctx)
-    except Exception as ex:
-        log.warning(f"Template format failed: {ex}, using fallback")
-        rel = f"{show_san}/Season {s00}/{show_san} - {s00e00} - {title_san}"
-
-    rel = _normalize_rel(rel)
-
-    # Append the extension unless the template already produced it ({ext})
-    if ext and not rel.endswith(ext):
-        rel = rel + ext
-
-    return rel
-
-# Movie editions, written the Plex way: "Aliens (1986) {edition-Special Edition}.mkv".
-# Plex then shows both cuts of a movie under one title.
-_EDITION_NAMES = {
-    "special": "Special Edition", "extended": "Extended Edition", "collector": "Collector's Edition",
-    "criterion": "Criterion Collection", "deluxe": "Deluxe Edition", "theatrical": "Theatrical Cut",
-    "ultimate": "Ultimate Edition", "fan": "Fan Edit", "imax": "IMAX",
-}
-_EDITION_SKIP = {"limited", "festival"}          # release types, not cuts of the film
-_PLEX_EDITION = re.compile(r"\{edition-([^}]+)\}", re.IGNORECASE)
-_EDITION_EXTRA = [   # names guessit doesn't know; only looked for after the year
-    (re.compile(r"(?i)(?<![a-z])final[ ._-]cut(?![a-z])"), "Final Cut"),
-    (re.compile(r"(?i)(?<![a-z])redux(?![a-z])"), "Redux"),
-    (re.compile(r"(?i)(?<![a-z])(?:(\d{1,3}(?:st|nd|rd|th))[ ._-])?anniversary[ ._-]edition(?![a-z])"),
-     "Anniversary Edition"),
-]
-_YEAR_IN_NAME = re.compile(r"(?<!\d)(?:19|20)\d\d(?!\d)")
-
-def detect_edition(name, raw=None):
-    """The edition of a movie from its file name ("" if none): a Plex
-    {edition-...} tag already in the name, else what guessit found
-    ("Director's Cut", "Extended Edition", "IMAX", ...)."""
-    m = _PLEX_EDITION.search(name)
-    if m:
-        return m.group(1).strip()
-    found = []
-    ed = (raw or {}).get("edition")
-    for e in (ed if isinstance(ed, list) else [ed] if ed else []):
-        key = str(e).lower()
-        if key not in _EDITION_SKIP:
-            label = _EDITION_NAMES.get(key, str(e))
-            if label not in found:
-                found.append(label)
-    year = _YEAR_IN_NAME.search(name)
-    if year:                                       # "The.Final.Cut.2004" is a title, not an edition
-        after = name[year.end():]
-        for rx, label in _EDITION_EXTRA:
-            m = rx.search(after)
-            if m:
-                label = f"{m.group(1)} {label}" if m.lastindex and m.group(1) else label
-                if label not in found:
-                    found.append(label)
-    return " ".join(found)
-
-def fmt_movie(title, year, ext, template, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", edition=""):
-    if not template or not template.strip():
-        template = DEFAULTS["format_movie"]
-    if isinstance(year, list):
-        year = year[0] if year else None
-
-
-    # No year: leave it out ("Title" rather than "Title (Unknown)", which Plex
-    # would read as part of the title); _normalize_rel drops the empty "()".
-    y = str(year) if year else ""
-
-    ctx = {
-        "title": sanitize(title),
-        "year": y,
-        "edition": f"{{edition-{sanitize(edition)}}}" if edition else "",
-        "edition_name": sanitize(edition) if edition else "",
-        "vc": video_codec,
-        "c": audio_codec,
-        "ach": audio_channels,
-        "res": resolution,
-        "ext": ext.lstrip("."),
-    }
-
-    try:
-        rel = template.format(**ctx)
-    except Exception as e:
-        log.warning(f"Template format failed: {e}, using default")
-        rel = f"{sanitize(title)} ({y})/{sanitize(title)} ({y})"
-
-    rel = _normalize_rel(rel)
-
-    # Append the extension unless the template already produced it ({ext})
-    if not rel.endswith(ext) and ext:
-        rel = rel + ext
-
-    return rel
-
-# ═══════════════════════════════════════════════════════════════════
-#  RENAMER
-# ═══════════════════════════════════════════════════════════════════
-@dataclass
-class RenameOp:
-    src: Path; dst: Path; success: bool = False; error: str = ""
-    method: str = "move"      # how the file was placed: move | copy | hardlink | none
-    note: str = ""            # e.g. why a hard link became a copy
-
-@dataclass
-class RenameResult:
-    ops: List[RenameOp] = field(default_factory=list)
-    @property
-    def succeeded(self): return [o for o in self.ops if o.success]
-    @property
-    def failed(self): return [o for o in self.ops if not o.success]
-
-def _same_path(a: Path, b: Path) -> bool:
-    """Windows-safe path equality (case-insensitive, separator-agnostic)."""
-    return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
-
-def _is_inside(child: Path, root: Path) -> bool:
-    """True if child is a strict descendant of root."""
-    child_n = os.path.normcase(os.path.normpath(str(child)))
-    root_n = os.path.normcase(os.path.normpath(str(root)))
-    return child_n != root_n and child_n.startswith(root_n + os.sep)
-
-RENAME_ACTIONS = ("move", "copy", "hardlink")
-
-def _cross_device(e):
-    """os.link failed because the two paths are on different drives."""
-    return getattr(e, "errno", None) == errno.EXDEV or getattr(e, "winerror", None) == 17
-
-class Renamer:
-    """Puts files at their new names — moving, copying or hard-linking them —
-    and undoes that. Every batch goes into a RenameHistory; with a history
-    file, renames can still be undone after the app was closed."""
-
-    def __init__(self, history=None):
-        self.history = history if history is not None else RenameHistory(None)
-        self.last_batch_id = None
-
-    @staticmethod
-    def _place(src, dst, action="move"):
-        op = RenameOp(src=src, dst=dst, method=action)
-        try:
-            if not src.exists():
-                raise FileNotFoundError(f"Source no longer exists: {src}")
-            same = _same_path(dst, src)
-            if dst.exists() and not same:
-                raise FileExistsError(f"Exists: {dst}")
-            if same and action != "move":
-                op.method, op.success = "none", True      # already there: nothing to copy
-                return op
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if action == "copy":
-                shutil.copy2(str(src), str(dst))
-            elif action == "hardlink":
-                try:
-                    os.link(str(src), str(dst))
-                except OSError as e:
-                    # Other drive, FAT/exFAT or a share without hard links: copy instead
-                    log.info(f"Hard link not possible ({e}); copying {src.name}")
-                    shutil.copy2(str(src), str(dst))
-                    op.method = "copy"
-                    op.note = ("copied: hard links only work on the same drive"
-                               if _cross_device(e) else "copied: this drive can't hard-link")
-            else:
-                shutil.move(str(src), str(dst))
-            op.success = True
-        except Exception as e:
-            op.error = str(e)
-        return op
-
-    def execute(self, ops, dest_root=None, action="move", source="manual"):
-        """Place each (src, dst) pair on its own; one undo step for all."""
-        return self.execute_groups([(op, []) for op in ops], dest_root, action, source)
-
-    def execute_groups(self, groups, dest_root=None, action="move", source="manual"):
-        """groups: [((video src, dst), [(subtitle src, dst), ...]), ...].
-        A video's subtitles are placed only if the video was, so a failure
-        never leaves its subtitles alone in the library. One undo step for all."""
-        result, done = RenameResult(), []
-        for (src, dst), sub_ops in groups:
-            op = self._place(src, dst, action)
-            result.ops.append(op)
-            if op.success:
-                done.append(op)
-            for s, d in sub_ops:
-                if not op.success:
-                    result.ops.append(RenameOp(src=s, dst=d, error="Skipped: its video was not moved"))
-                    continue
-                sop = self._place(s, d, action)
-                result.ops.append(sop)
-                if sop.success:
-                    done.append(sop)
-        self.last_batch_id = None
-        if done:
-            try:
-                self.last_batch_id = self.history.add([(o.src, o.dst, o.method) for o in done],
-                                                      dest_root, source)["id"]
-            except OSError as e:
-                log.warning(f"Could not save the rename history: {e}")
-        return result
-
-    def can_undo(self):
-        return self.history.last_undoable() is not None
-
-    def undo_last(self):
-        batch = self.history.last_undoable()
-        return self.undo_batch(batch["id"]) if batch else RenameResult()
-
-    def undo_batch(self, batch_id):
-        """Put a batch back: moved files go back where they were; copies and
-        hard links are deleted (the originals never moved). A copy is only
-        deleted while its original still exists and it wasn't changed."""
-        batch = self.history.get(batch_id)
-        result = RenameResult()
-        if not batch or batch.get("undone"):
-            return result
-        dest_root = batch.get("dest_root") or None
-        for entry in reversed(batch["ops"]):
-            src, dst, method = Path(entry["src"]), Path(entry["dst"]), entry.get("method", "move")
-            undo = RenameOp(src=dst, dst=src, method=method)
-            try:
-                if method == "download":          # a subtitle downloaded after the rename
-                    if dst.exists():
-                        dst.unlink()
-                elif method == "none":
-                    pass
-                elif method == "move":
-                    if not dst.exists():
-                        raise FileNotFoundError(f"File not found: {dst}")
-                    if src.exists() and not _same_path(src, dst):
-                        raise FileExistsError(f"Original location occupied: {src}")
-                    src.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(dst), str(src))
-                else:
-                    if not dst.exists():
-                        raise FileNotFoundError(f"File not found: {dst}")
-                    if not src.exists():
-                        raise FileNotFoundError(f"The original is gone, so the copy was kept: {dst}")
-                    if method == "copy" and dst.stat().st_size != src.stat().st_size:
-                        raise ValueError(f"The copy was changed since, so it was kept: {dst}")
-                    dst.unlink()
-                undo.success = True
-                if dest_root:
-                    _cleanup_empty_dirs(dst.parent, stop=Path(dest_root))
-            except Exception as e:
-                undo.error = str(e)
-            result.ops.append(undo)
-        if not result.ops or any(o.success for o in result.ops):
-            self.history.mark_undone(batch_id)
-        return result
-
-def detect_conflicts(ops):
-    return [(s, d) for s, d in ops if d.exists() and not _same_path(d, s)]
-
-def _cleanup_empty_dirs(folder: Path, stop: Optional[Path] = None):
-    """Remove empty directories walking upward. Never removes `stop` itself,
-    and never climbs outside of it when given."""
-    try:
-        while folder.exists() and not any(folder.iterdir()):
-            if stop is not None and not _is_inside(folder, stop):
-                break
-            parent = folder.parent
-            folder.rmdir()
-            folder = parent
-    except Exception:
-        pass
-
-# ═══════════════════════════════════════════════════════════════════
-#  API: SHARED HELPERS
-# ═══════════════════════════════════════════════════════════════════
-def _title_score(query: str, candidate: str) -> float:
-    """Fuzzy title similarity resistant to the token-subset trap: pure
-    token_set_ratio scores 100 for any candidate that merely CONTAINS all the
-    query's words (e.g. 'Dr Strange' vs 'The Strange Case of Dr Jekyll...').
-    Blending with token_sort_ratio penalizes all those extra words."""
-    q = (query or "").lower()
-    c = (candidate or "").lower()
-    return 0.4 * fuzz.token_set_ratio(q, c) + 0.6 * fuzz.token_sort_ratio(q, c)
-
-# ═══════════════════════════════════════════════════════════════════
-#  API: TMDB
-# ═══════════════════════════════════════════════════════════════════
-class TMDBClient:
-    BASE = "https://api.themoviedb.org/3"
-    def __init__(self, key):
-        self.key = key
-        self.s = requests.Session()
-        self.s.params = {"api_key": key, "language": "en-US"}
-    def _get(self, ep, **p):
-        try:
-            r = self.s.get(f"{self.BASE}{ep}", params=p, timeout=10)
-            r.raise_for_status(); return r.json()
-        except Exception: return None
-    def _best(self, query, results, key):
-        if not results: return None
-        return max(results, key=lambda r: _title_score(query, r.get(key,"")))
-    def search_movie(self, title, year=None):
-        p = {"query": title}
-        if year: p["year"] = year
-        d = self._get("/search/movie", **p)
-        if not d or not d.get("results"): return None
-        b = self._best(title, d["results"], "title")
-        if not b: return None
-        yr = None
-        rd = b.get("release_date") or ""
-        if rd[:4].isdigit(): yr = int(rd[:4])
-        return {"title": b.get("title", title), "year": yr, "id": b.get("id")}
-    def search_movie_all(self, title, year=None):
-        p = {"query": title, "include_adult": "false"}
-        if year: p["year"] = year
-        d = self._get("/search/movie", **p)
-        if not d or not d.get("results"): return []
-        log.debug(f"TMDB movie search raw results: {d['results'][:2]}")
-        results = []
-        for r in d["results"][:10]:
-            yr = None
-            if r.get("release_date"):
-                try: yr = int(r["release_date"][:4])
-                except (ValueError, TypeError): pass
-            results.append({
-                "title": r.get("title", title),
-                "year": yr,
-                "id": r.get("id"),
-                "overview": r.get("overview", ""),
-                "poster": r.get("poster_path", ""),
-                "rating": r.get("vote_average", 0),
-            })
-        return results
-    def search_tv(self, title):
-        d = self._get("/search/tv", query=title)
-        if not d or not d.get("results"): return None
-        b = self._best(title, d["results"], "name")
-        return {"show": b.get("name", title), "id": b.get("id")} if b else None
-    def search_tv_all(self, title):
-        d = self._get("/search/tv", query=title, include_adult=False)
-        if not d or not d.get("results"): return []
-        log.debug(f"TMDB TV search raw results: {d['results'][:2]}")
-        results = []
-        for r in d["results"][:10]:
-            results.append({
-                "show": r.get("name", title),
-                "id": r.get("id"),
-                "overview": r.get("overview", ""),
-                "poster": r.get("poster_path", ""),
-                "first_air_date": r.get("first_air_date", ""),
-                "rating": r.get("vote_average", 0),
-            })
-        return results
-    def get_tv_details(self, tv_id):
-        d = self._get(f"/tv/{tv_id}")
-        if not d: return None
-        return {
-            "title": d.get("name", ""),
-            "overview": d.get("overview", ""),
-            "poster": d.get("poster_path", ""),
-            "first_air_date": d.get("first_air_date", ""),
-            "rating": d.get("vote_average", 0),
-        }
-    def get_movie_details(self, movie_id):
-        d = self._get(f"/movie/{movie_id}")
-        if not d: return None
-        return {
-            "title": d.get("title", ""),
-            "overview": d.get("overview", ""),
-            "poster": d.get("poster_path", ""),
-            "release_date": d.get("release_date", ""),
-            "rating": d.get("vote_average", 0),
-        }
-    def get_episode(self, show_id, season, episode):
-        d = self._get(f"/tv/{show_id}/season/{season}/episode/{episode}")
-        if not d: return None
-        return {"title": d.get("name", f"Episode {episode}")}
-
-# ═══════════════════════════════════════════════════════════════════
-#  API: CINEMETA
-# ═══════════════════════════════════════════════════════════════════
-class CinemetaClient:
-    """Movie title/year lookup via Cinemeta (Stremio's public catalog) — no
-    key required. Used when TMDB is not configured or returns nothing."""
-    BASE = "https://v3-cinemeta.strem.io"
-    def __init__(self):
-        self.s = requests.Session()
-    def _get(self, ep):
-        try:
-            r = self.s.get(f"{self.BASE}{ep}", timeout=10)
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            return None
-    @staticmethod
-    def _year_of(meta):
-        info = str(meta.get("releaseInfo") or "")
-        return int(info[:4]) if info[:4].isdigit() else None
-    @staticmethod
-    def _rating_of(meta):
-        try:
-            return float(meta.get("imdbRating") or 0)
-        except (TypeError, ValueError):
-            return 0
-    def _search(self, title):
-        from urllib.parse import quote
-        d = self._get(f"/catalog/movie/top/search={quote(str(title))}.json")
-        return (d or {}).get("metas") or []
-    def search_movie(self, title, year=None):
-        metas = self._search(title)
-        if not metas: return None
-        scored = []
-        for rank, m in enumerate(metas):
-            score = _title_score(str(title), m.get("name") or "")
-            if year and self._year_of(m) == year:
-                score += 10
-            scored.append((score, rank, m))
-        best_score = max(s for s, _, _ in scored)
-        if best_score < 70:
-            return None
-        # Among the plausible matches (score >= 70 and within 20 points of the
-        # best), keep Cinemeta's own ordering, which is by popularity.
-
-        viable = [t for t in scored if t[0] >= 70 and t[0] >= best_score - 20]
-        viable.sort(key=lambda t: t[1])
-        best = viable[0][2]
-        return {"title": best.get("name", title), "year": self._year_of(best), "id": best.get("id")}
-    def search_movie_all(self, title, year=None):
-        metas = self._search(title)
-        out = []
-        for m in metas[:10]:
-            out.append({
-                "title": m.get("name", title),
-                "year": self._year_of(m),
-                "id": m.get("id"),
-                "overview": m.get("description") or "",
-                "poster": m.get("poster") or "",
-                "rating": self._rating_of(m),
-            })
-        return out
-    def get_movie_details(self, imdb_id):
-        d = self._get(f"/meta/movie/{imdb_id}.json")
-        meta = (d or {}).get("meta")
-        if not meta: return None
-        yr = self._year_of(meta)
-        return {"title": meta.get("name", ""), "release_date": str(yr) if yr else ""}
-
-# ═══════════════════════════════════════════════════════════════════
-#  API: TVMAZE
-# ═══════════════════════════════════════════════════════════════════
-class TVMazeClient:
-    def __init__(self): self.s = requests.Session()
-    def _get(self, ep, **p):
-        try:
-            r = self.s.get(f"https://api.tvmaze.com{ep}", params=p, timeout=10)
-            if r.status_code == 404: return None
-            r.raise_for_status(); return r.json()
-        except Exception: return None
-    def search_show(self, title):
-        d = self._get("/search/shows", q=title)
-        if not d: return None
-        best = max(d, key=lambda x: _title_score(title, x["show"]["name"]))
-        s = best["show"]
-        premiered = s.get("premiered", "")
-        year = premiered[:4] if premiered else ""
-        return {"show": s["name"], "id": s["id"], "year": year}
-    def search_show_all(self, title):
-        d = self._get("/search/shows", q=title)
-        if not d: return []
-        log.debug(f"TVMaze raw results: {d[:2]}")
-        results = []
-        for item in d[:10]:
-            s = item.get("show", {})
-            premiered = s.get("premiered") or ""
-            year = premiered[:4] if premiered else ""
-            results.append({
-                "show": s.get("name", title),
-                "id": s.get("id"),
-                "overview": s.get("summary") or "",
-                "poster": (s.get("image") or {}).get("medium", ""),
-                "first_air_date": premiered,
-                "rating": (s.get("rating") or {}).get("average") or 0,
-                "year": year,
-            })
-        return results
-    def get_episode(self, show_id, season, episode):
-        d = self._get(f"/shows/{show_id}/episodebynumber", season=season, number=episode)
-        return {"title": d.get("name", f"Episode {episode}")} if d else None
-
-    def get_episode_by_date(self, show_id, air_date):
-        d = self._get(f"/shows/{show_id}/episodesbydate", date=str(air_date))
-        if isinstance(d, list) and d:
-            return {"title": d[0].get("name") or str(air_date)}
-        return None
-
-    def get_show_info(self, show_id: int):
-        data = self._get(f"/shows/{show_id}")
-        if not data:
-            return None
-        premiered = data.get("premiered", "")
-        year = premiered[:4] if premiered else ""
-        return {
-            "show": data.get("name", ""),
-            "id": show_id,
-            "year": year,
-        }
-
-    def get_show_by_tvdb_id(self, tvdb_id):
-        d = self._get("/lookup/shows", thetvdb=tvdb_id)
-        if not d:
-            log.debug(f"TVMaze: No show found for TVDB ID {tvdb_id}")
-            return None
-        return {
-            "show": d.get("name"),
-            "id": d.get("id"),
-            "overview": d.get("summary", ""),
-            "poster": d.get("image", {}).get("medium", "") if d.get("image") else "",
-            "first_air_date": d.get("premiered", ""),
-            "rating": d.get("rating", {}).get("average", 0) if d.get("rating") else 0,
-        }
-
-# ═══════════════════════════════════════════════════════════════════
-#  API: ANIDB
-# ═══════════════════════════════════════════════════════════════════
-CACHE_DIR = _APP_DIR / "cache"
-TITLES_CACHE = CACHE_DIR / "anidb_titles.xml.gz"
-
-class AniDBClient:
-    def __init__(self): self._titles = None
-    def _ensure(self):
-        if self._titles is not None: return
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        age = (time.time() - TITLES_CACHE.stat().st_mtime) if TITLES_CACHE.exists() else 999999
-        if age > 86400 * 7:
-            try:
-                r = requests.get("https://anidb.net/api/anime-titles.xml.gz",
-                                 headers={"User-Agent": f"Mozilla/5.0 PathRenamer/{APP_VERSION}"}, timeout=15)
-                r.raise_for_status(); TITLES_CACHE.write_bytes(r.content)
-            except Exception: pass
-        self._titles = []
-        if not TITLES_CACHE.exists(): return
-        try:
-            with gzip.open(TITLES_CACHE, "rb") as f: root = ET.parse(f).getroot()
-            for anime in root.findall("anime"):
-                try: aid = int(anime.get("aid","0"))
-                except: continue
-                for t in anime.findall("title"):
-                    lang = t.get("{http://www.w3.org/XML/1998/namespace}lang","")
-                    if (lang == "en" or t.get("type","") == "main") and t.text:
-                        self._titles.append((aid, t.text.strip()))
-        except Exception: pass
-    def search_anime(self, title):
-        self._ensure()
-        if not self._titles: return None
-        best = max(self._titles, key=lambda x: fuzz.token_set_ratio(title.lower(), x[1].lower()))
-        score = fuzz.token_set_ratio(title.lower(), best[1].lower())
-        return {"show": best[1], "id": best[0]} if score >= 60 else None
-    def search_anime_all(self, title):
-        self._ensure()
-        if not self._titles: return []
-        matches = []
-        for aid, name in self._titles:
-            score = fuzz.token_set_ratio(title.lower(), name.lower())
-            if score >= 40:
-                matches.append({"show": name, "id": aid, "score": score})
-        matches.sort(key=lambda x: x["score"], reverse=True)
-        return matches[:10]
-    def get_episode(self, anime_id, season, episode):
-        try:
-            r = requests.get("http://api.anidb.net:9001/httpapi",
-                params={"request":"anime","client":"pathrenamer","clientver":1,"protover":1,"aid":anime_id},
-                headers={"User-Agent":f"Mozilla/5.0 PathRenamer/{APP_VERSION}"}, timeout=15)
-            root = ET.fromstring(r.text)
-            eps = root.find("episodes")
-            if eps is None: return None
-            XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
-            for ep in eps.findall("episode"):
-                epno = ep.find("epno")
-                if epno is None or epno.get("type","1") != "1": continue
-                try:
-                    if int(epno.text) == episode:
-                        title = None
-                        for t in ep.findall("title"):
-                            if t.get(XML_LANG) == "en":
-                                title = t.text
-                                break
-                        if title is None:
-                            t = ep.find("title")
-                            title = t.text if t is not None else None
-                        return {"title": title or f"Episode {episode}"}
-                except (ValueError, TypeError): continue
-        except Exception: pass
-        return None
-
-# ═══════════════════════════════════════════════════════════════════
-#  MATCH ENGINE
-# ═══════════════════════════════════════════════════════════════════
-@dataclass(eq=False)
-class Candidate:
-    source: Path
-    dest_rel: str
-    media_type: str
-    confidence: float
-    conflict: bool = False
-    error: str = ""
-    subtitles: List[Tuple[Path, str]] = field(default_factory=list)
-    video_codec: str = ""
-    audio_codec: str = ""
-    audio_channels: str = ""
-    media_source: str = ""
-    resolution: str = ""
-    # What the name was built from, so one row can be fixed by hand
-    title: str = ""                       # show or movie title used
-    year: str = ""                        # its year, when known
-    season: Optional[int] = None
-    episodes: List[int] = field(default_factory=list)
-    manual: bool = False                  # new name typed by the user
-
-def derive_title_for(path: Path, media_type: str = "tv") -> str:
-    """Best-guess show/movie title for a file.
-
-    The file name wins when it carries the show/movie name itself; the folder
-    (or the show folder above a "Season N" folder) is used when the file name
-    has no title, only an episode title or a scene short name, or when both
-    agree. See parser.analyse_path."""
-    return analyse_path(path, media_type).title or "Unknown"
-
-
-class MatchEngine:
-    def __init__(self, cfg, tvmaze=None, anidb=None, tmdb=None, cinemeta=None):
-        self.cfg = cfg; self.tvmaze = tvmaze; self.anidb = anidb
-        self.tmdb = tmdb; self.cinemeta = cinemeta
-    def match(self, path, media_type):
-        return self.match_with_override(path, media_type)
-
-    def _transform_subtitle_dest(self, cand, is_subtitle, output_counts=None):
-        """For a subtitle file matched on its own (no video picked), turn the
-        video-style destination into a Plex subtitle name next to where the
-        video goes: "Show S01E01 - Title.eng.forced.srt".
-
-        output_counts: {destination folder: set of names used}, shared across
-        a scan so two subtitles never get the same name.
-        """
-        if not is_subtitle or cand.error:
-            return cand
-        src = cand.source
-        lang, flags = detect_subtitle_language(src)
-        dest_path = Path(cand.dest_rel)          # built as if the subtitle were the video
-        taken = set() if output_counts is None else output_counts.setdefault(
-            str(dest_path.parent).lower(), set())
-        name = unique_subtitle_filename(dest_path.stem, lang, src.suffix.lower(), flags, taken)
-        cand.dest_rel = str(dest_path.parent / name).replace("\\", "/")
-        return cand
-
-    def search_all_matches(self, path, media_type):
-        try:
-            guess = analyse_path(path, media_type)
-            return self.search_title(guess.title or "Unknown", media_type, guess.year)
-        except Exception as e:
-            log.exception(f"search_all_matches failed for {path.name}: {e}")
-            return []
-
-    def search_title(self, title, media_type, year=None):
-        """Shows or movies matching a title, for the match chooser."""
-        try:
-            matches = []
-            if media_type == "movie":
-                if self.tmdb:
-                    matches = self.tmdb.search_movie_all(title, year)
-                    for m in matches:
-                        m["src"] = "tmdb"
-                    log.debug(f"Using TMDB for movie search: {title}")
-                if not matches and self.cinemeta:
-                    matches = self.cinemeta.search_movie_all(title, year)
-                    for m in matches:
-                        m["src"] = "cinemeta"
-                    log.debug(f"Using Cinemeta for movie search: {title}")
-            elif media_type == "anime":
-                if self.tvmaze:
-                    matches = self.tvmaze.search_show_all(title)
-                    for m in matches:
-                        m["src"] = "tvmaze"
-                    log.debug(f"Using TVMaze for anime search: {title}")
-                if not matches and self.anidb:
-                    matches = self.anidb.search_anime_all(title)
-                    for m in matches:
-                        m["src"] = "anidb"
-                    log.debug(f"Using AniDB for anime search: {title}")
-            else:
-                if self.tvmaze:
-                    matches = self.tvmaze.search_show_all(title)
-                    for m in matches:
-                        m["src"] = "tvmaze"
-                    log.debug(f"Using TVMaze for TV show search: {title}")
-            return matches
-        except Exception as e:
-            log.exception(f"search_title failed for {title!r}: {e}")
-            return []
-
-    @staticmethod
-    def _scalar(raw, key, default=""):
-        """guessit may return a scalar or a list; always return a scalar."""
-        v = raw.get(key, default)
-        if isinstance(v, list):
-            v = v[0] if v else default
-        return v
-
-    def match_with_override(self, path, media_type, selected_title=None, selected_id=None,
-                            season=None, episodes=None):
-        """season / episodes: numbers chosen by the user for this file (Change
-        Episode, Number in Order); they replace what the name says."""
-        try:
-            ext = path.suffix.lower()
-            # Title, year, season, episode(s) / air date from the file name and
-            # its folders. The file's own SxxEyy always wins; a folder's only
-            # fills in what the file name lacks (e.g. obfuscated file names).
-            guess = analyse_path(path, media_type)
-            if episodes:
-                guess.episodes = [int(e) for e in episodes]
-                guess.date = None
-                if season is not None:
-                    guess.season = int(season)
-            raw = guess.raw
-            title = guess.title
-            tvmaze_log.debug(f"TITLE_DETECT: file='{path.name}' -> '{title}' (from {guess.title_source or 'nothing'})")
-            video_codec = self._scalar(raw, "video_codec")
-            audio_codec = self._scalar(raw, "audio_codec")
-            audio_channels = self._scalar(raw, "audio_channels")
-            media_source = self._scalar(raw, "source")
-            resolution = self._scalar(raw, "screen_size")
-            if (ext in VIDEO_EXT and self.cfg.get("read_media_info", True)
-                    and not (video_codec and audio_codec and audio_channels and resolution)):
-                # What the name doesn't say is read from the file itself
-                info = read_media_info(path)
-                if info:
-                    resolution = resolution or info.resolution
-                    video_codec = video_codec or info.video_codec
-                    if not audio_codec or audio_codec == info.audio_codec:
-                        # channels only when they belong to the codec the name gives
-                        audio_codec = audio_codec or info.audio_codec
-                        audio_channels = audio_channels or info.audio_channels
-
-            if selected_title:
-                title = selected_title
-            if not title:
-                return Candidate(path, path.name, media_type, 0.0,
-                                 error="No title found in the file or folder name")
-
-            if media_type == "movie":
-                return self._movie_with_title(path, title, guess.year, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id,
-                                              edition=detect_edition(path.stem, raw))
-
-            if not guess.episodes and not guess.date:
-                # Better to skip than to invent S01E01 (every such file would collide)
-                return Candidate(path, path.name, media_type, 0.0,
-                                 error="No season/episode number in the name")
-            season = guess.season if guess.season is not None else 1
-            episodes = guess.episodes
-            episode = episodes[0] if episodes else None
-            log.info(f"Parsed {path.name}: title='{title}' S{season} E{episodes} date={guess.date} year={guess.year}")
-            extra = dict(year=guess.year, episodes=episodes, air_date=guess.date,
-                         fallback_title=guess.episode_title if guess.date else "")
-            if media_type == "anime":
-                return self._anime_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id, **extra)
-            else:
-                return self._tv_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id, **extra)
-        except Exception as e:
-            log.exception(f"match_with_override failed for {path.name}: {e}")
-            return Candidate(path, path.name, media_type, 0.0, error=str(e))
-
-    def _episode_titles(self, client, show_id, season, episodes, air_date):
-        """Episode title(s) from TVMaze / AniDB. Multi-episode files get the
-        distinct titles joined ("Part 1 & Part 2"); date-based shows look the
-        episode up by air date."""
-        if air_date:
-            getter = getattr(client, "get_episode_by_date", None)
-            e = getter(show_id, air_date) if getter else None
-            return e.get("title") if e else None
-        titles = []
-        for n in episodes[:3]:
-            e = client.get_episode(show_id, season, n)
-            t = e.get("title") if e else None
-            if t and t not in titles:
-                titles.append(t)
-        return " & ".join(titles) if titles else None
-
-    @staticmethod
-    def _split_selected_id(selected_id):
-        """Selected ids carry their source database as ("tvmaze"|"anidb"|"tmdb", id).
-        Bare ids (older callers) are assumed to be TVMaze."""
-        if not selected_id:
-            return None, None
-        if isinstance(selected_id, (tuple, list)) and len(selected_id) == 2:
-            return selected_id[0], selected_id[1]
-        return "tvmaze", selected_id
-
-    def _tv_with_title(self, path, title, season, episode, ext, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", selected_id=None, year=None, episodes=None, air_date=None, fallback_title=""):
-        episodes = list(episodes) if episodes else ([episode] if episode is not None else [])
-        default_title = fallback_title or (air_date.isoformat() if air_date else f"Episode {episode}")
-        show, ep_title, conf = title, default_title, 0.95
-        show_year = ""
-        id_src, sid = self._split_selected_id(selected_id)
-
-        # A show picked in the match selector is used by id; otherwise search
-        # TVMaze by the detected title.
-        if sid and id_src == "tvmaze" and self.tvmaze:
-            # Real show name + premiere year for the folder name
-            show_info = self.tvmaze.get_show_info(sid)
-            if show_info:
-                show = show_info.get("show", title)
-                show_year = show_info.get("year", "")
-                log.debug(f"TVMaze show info: {show}, year: '{show_year}'")
-            t = self._episode_titles(self.tvmaze, sid, season, episodes, air_date)
-            if t:
-                ep_title = t
-                log.debug(f"TVMaze episode title: {ep_title}")
-        elif self.tvmaze:
-            # Automatic match
-            tvmaze_log.debug(f"TVMAZE_SEARCH: Searching for title='{title}'")
-            s = self.tvmaze.search_show(title)
-            if s:
-                show = s["show"]
-                show_year = s.get("year", "")
-                tvmaze_log.debug(f"TVMAZE_FOUND: show='{show}', year='{show_year}', id={s['id']}")
-                log.debug(f"TVMaze found: {show}, year: '{show_year}'")
-                t = self._episode_titles(self.tvmaze, s["id"], season, episodes, air_date)
-                if t:
-                    ep_title = t
-                    conf = 0.95
-                    log.debug(f"TVMaze episode: {ep_title}")
-            else:
-                tvmaze_log.debug(f"TVMAZE_NOT_FOUND: No results for title='{title}'")
-                log.debug(f"TVMaze search returned nothing for: {title}")
-                conf = 0.5
-        else:
-            conf = 0.5
-
-        if not show_year and year:
-            show_year = str(year)       # year from the file/folder name, e.g. "Doctor Who (2005)"
-        ep_type = self.cfg.get("episode_tv", "dvd")
-        rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_tv",""), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
-        c = Candidate(path, rel, "tv", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
-                      title=show, season=season, episodes=list(episodes), year=str(show_year or ""))
-        if ext not in SUB_EXT:
-            self._subs(path, rel, c)
-        return c
-
-    def _movie_with_title(self, path, title, year, ext, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", selected_id=None, edition=""):
-        conf = 0.9 if year else 0.6
-        id_src, sid = self._split_selected_id(selected_id)
-        matched = False
-        if sid and id_src == "tmdb" and self.tmdb:
-            d = self.tmdb.get_movie_details(sid)
-            if d:
-                title = d.get("title") or title
-                rd = d.get("release_date") or ""
-                if rd[:4].isdigit():
-                    year = int(rd[:4])
-                conf, matched = 0.95, True
-        elif sid and id_src == "cinemeta" and self.cinemeta:
-            d = self.cinemeta.get_movie_details(sid)
-            if d:
-                title = d.get("title") or title
-                rd = d.get("release_date") or ""
-                if rd[:4].isdigit():
-                    year = int(rd[:4])
-                conf, matched = 0.9, True
-        if not matched and self.tmdb:
-            m = self.tmdb.search_movie(title, year)
-            if m:
-                title = m.get("title") or title
-                year = m.get("year") or year
-                conf, matched = 0.95, True
-        if not matched and self.cinemeta:
-            m = self.cinemeta.search_movie(title, year)
-            if m:
-                title = m.get("title") or title
-                year = m.get("year") or year
-                conf, matched = 0.9, True
-        rel = fmt_movie(title, year, ext, self.cfg.get("format_movie",""), video_codec, audio_codec, audio_channels, media_source, resolution, edition)
-        c = Candidate(path, rel, "movie", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
-                      title=title, year=str(year or ""))
-        if ext not in SUB_EXT:
-            self._subs(path, rel, c)
-        return c
-
-    def _anime_with_title(self, path, title, season, episode, ext, video_codec="", audio_codec="", audio_channels="", media_source="", resolution="", selected_id=None, year=None, episodes=None, air_date=None, fallback_title=""):
-        episodes = list(episodes) if episodes else ([episode] if episode is not None else [])
-        default_title = fallback_title or (air_date.isoformat() if air_date else f"Episode {episode}")
-        show, ep_title, conf = title, default_title, 0.90
-        show_year = ""
-        id_src, sid = self._split_selected_id(selected_id)
-
-        if sid and id_src == "tvmaze" and self.tvmaze:
-            show_info = self.tvmaze.get_show_info(sid)
-            if show_info:
-                show = show_info.get("show", title)
-                show_year = show_info.get("year", "")
-                log.debug(f"TVMaze anime show info: {show}, year: '{show_year}'")
-            t = self._episode_titles(self.tvmaze, sid, season, episodes, air_date)
-            if t:
-                ep_title = t
-                conf = 0.95
-                log.debug(f"TVMaze anime episode: {ep_title}")
-        elif sid and id_src == "anidb" and self.anidb:
-            t = self._episode_titles(self.anidb, sid, season, episodes, air_date)
-            if t:
-                ep_title = t
-                conf = 0.95
-        elif not sid:
-            # Automatic match: TVMaze first, AniDB as fallback
-            conf = 0.5
-            if self.tvmaze:
-                s = self.tvmaze.search_show(title)
-                if s:
-                    show = s["show"]
-                    show_year = s.get("year", "")
-                    t = self._episode_titles(self.tvmaze, s["id"], season, episodes, air_date)
-                    if t:
-                        ep_title = t
-                        conf = 0.90
-            if conf < 0.9 and self.anidb:
-                s = self.anidb.search_anime(title)
-                if s:
-                    show, conf = s["show"], 0.90
-                    t = self._episode_titles(self.anidb, s["id"], season, episodes, air_date)
-                    if t:
-                        ep_title = t
-
-        if not show_year and year:
-            show_year = str(year)
-        ep_type = self.cfg.get("episode_anime", "dvd")
-        rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_anime", self.cfg.get("format_tv","")), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
-        c = Candidate(path, rel, "anime", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
-                      title=show, season=season, episodes=list(episodes), year=str(show_year or ""))
-        if ext not in SUB_EXT:
-            self._subs(path, rel, c)
-        return c
-
-    def _subs(self, video, video_rel, cand):
-        """Add the video's subtitles to cand, each with its Plex name next to
-        the renamed video: "Movie (2010).eng.srt", "Movie (2010).spa.forced.srt".
-        Two subtitles with the same language and flags are numbered
-        ("Movie (2010).2.eng.srt") so neither overwrites the other."""
-        if not self.cfg.get("rename_subtitles", True):
-            return
-        dest = Path(video_rel)
-        taken = set()
-        for sub in find_subtitle_siblings(video):
-            if _same_path(sub, video):
-                continue
-            lang, flags = detect_subtitle_language(sub, video.stem)
-            name = unique_subtitle_filename(dest.stem, lang, sub.suffix.lower(), flags, taken)
-            cand.subtitles.append((sub, str(dest.parent / name).replace("\\", "/")))
+import updates
+import startup
 
 # ═══════════════════════════════════════════════════════════════════
 #  THEMES  (palettes and stylesheets live in themes.py)
@@ -1422,7 +28,7 @@ from themes import (THEMES, THEME_NAMES, BASE_THEMES, ROLES, palette_for, custom
                     is_color, app_stylesheet, base_stylesheet, tab_stylesheet)
 
 # ═══════════════════════════════════════════════════════════════════
-#  BACKGROUND JOBS (downloads, Plex, license checks)
+#  BACKGROUND JOBS (downloads, media servers, license checks)
 # ═══════════════════════════════════════════════════════════════════
 class BackgroundJobs(QObject):
     """Runs slow network work in a background thread and hands the result
@@ -1460,11 +66,163 @@ class BackgroundJobs(QObject):
                 raise
 
 
+def _set_link_color(pal):
+    """Links in labels and release notes in the theme's accent colour (Qt's
+    default dark blue can't be read on the dark themes)."""
+    app = QApplication.instance()
+    if app is None or not pal.get("accent"):
+        return
+    palette = app.palette()
+    for role in (QPalette.ColorRole.Link, QPalette.ColorRole.LinkVisited):
+        palette.setColor(role, QColor(pal["accent"]))
+    app.setPalette(palette)
+
+
 def _note_label(text):
     note = QLabel(text)
     note.setWordWrap(True)
     note.setStyleSheet("color:#888;font-size:11px")
     return note
+
+
+class UpdateDialog(QDialog):
+    """A newer PathRenamer: what's new, and Update Now. One click downloads
+    it from GitHub, checks it against what GitHub published, installs it and
+    starts the new version (the portable exe is swapped in place; a copy run
+    from source opens the download page instead)."""
+    _progress = pyqtSignal(int, int)
+    _finished = pyqtSignal(object, object)
+
+    def __init__(self, release, parent=None, start=False, kind=None):
+        super().__init__(parent)
+        self.release = release
+        self.kind = kind or updates.install_kind()
+        self.asset = release.installer if self.kind == "installer" else release.portable
+        if self.kind != "source" and self.asset is None:
+            self.kind = "source"                  # no file for this kind of copy: the page has it
+        self.skipped = self.installing = False
+        self._cancel = False
+        self._busy = False
+        self.setWindowTitle("Update PathRenamer")
+        self.setMinimumWidth(520)
+        L = QVBoxLayout(self)
+        head = QLabel(f"<b>PathRenamer {release.version} is available.</b> You have {APP_VERSION}.")
+        head.setWordWrap(True)
+        L.addWidget(head)
+        notes = QTextBrowser()
+        notes.setOpenExternalLinks(True)
+        notes.setMarkdown(release.notes or "See the release page for what's new.")
+        notes.setMinimumHeight(220)
+        L.addWidget(notes, 1)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.hide()
+        L.addWidget(self.progress)
+        self.message = _note_label({
+            "installer": "Update Now downloads the new version, installs it and starts it again. "
+                         "Your settings and rename history are kept.",
+            "portable": "Update Now downloads the new PathRenamer.exe, puts it in place of this one and "
+                        "starts it. Your settings and rename history are kept.",
+            "source": "This copy runs from the source code: Update Now opens the download page.",
+        }[self.kind])
+        L.addWidget(self.message)
+        row = QHBoxLayout()
+        self.btn_skip = QPushButton("Skip This Version")
+        self.btn_skip.clicked.connect(self._skip)
+        self.btn_later = QPushButton("Later")
+        self.btn_later.clicked.connect(self._later)
+        self.btn_update = QPushButton("Update Now" if self.kind != "source" else "Open Download Page")
+        self.btn_update.setDefault(True)
+        self.btn_update.clicked.connect(self.update_now)
+        row.addWidget(self.btn_skip)
+        row.addStretch()
+        row.addWidget(self.btn_later)
+        row.addWidget(self.btn_update)
+        L.addLayout(row)
+        self._progress.connect(self._on_progress)
+        self._finished.connect(self._on_finished)
+        if start:
+            QTimer.singleShot(0, self.update_now)
+
+    def update_now(self):
+        if self._busy:
+            return
+        if self.kind == "source":
+            QDesktopServices.openUrl(QUrl(self.release.page_url))
+            self.accept()
+            return
+        self._busy, self._cancel = True, False
+        self.btn_update.setEnabled(False)
+        self.btn_skip.setEnabled(False)
+        self.btn_later.setText("Cancel")
+        self.progress.setValue(0)
+        self.progress.show()
+        self.message.setText("Downloading…")
+        threading.Thread(target=self._download, daemon=True).start()
+
+    def _download(self):
+        try:
+            path = updates.download(self.asset, progress=self._report, should_cancel=lambda: self._cancel)
+            result = (path, None)
+        except Exception as e:                    # shown in the dialog
+            result = (None, e)
+        try:
+            self._finished.emit(*result)
+        except RuntimeError:                      # the dialog was closed meanwhile
+            pass
+
+    def _report(self, done, total):
+        try:
+            self._progress.emit(done, total)
+        except RuntimeError:
+            pass
+
+    def _on_progress(self, done, total):
+        mb = 1024 * 1024
+        if total:
+            self.progress.setValue(min(100, done * 100 // total))
+            self.message.setText(f"Downloading… {done / mb:.1f} MB of {total / mb:.1f} MB")
+        else:
+            self.message.setText(f"Downloading… {done / mb:.1f} MB")
+
+    def _on_finished(self, path, error):
+        self._busy = False
+        if error is None and self._cancel:        # closed or cancelled as it finished: don't install
+            error = updates.UpdateError("The download was cancelled.")
+        if error is None:
+            self.message.setText("Installing the update: PathRenamer closes and starts again…")
+            try:
+                updates.start_update(path, self.kind)
+            except Exception as e:
+                error = e
+            else:
+                self.installing = True
+                self.accept()
+                return
+        self.progress.hide()
+        self.message.setText(f"The update didn't finish: {error}" if not self._cancel else
+                             "The download was cancelled.")
+        self.btn_update.setEnabled(True)
+        self.btn_update.setText("Try Again")
+        self.btn_skip.setEnabled(True)
+        self.btn_later.setText("Later")
+
+    def _skip(self):
+        self.skipped = True
+        self.reject()
+
+    def _later(self):
+        if self._busy:                            # Cancel: the download stops at its next chunk
+            self._cancel = True
+            self.btn_later.setEnabled(False)
+            self.message.setText("Cancelling…")
+            return
+        self.reject()
+
+    def reject(self):
+        if self._busy:
+            self._cancel = True
+        super().reject()
 
 
 class PlexSignInDialog(QDialog):
@@ -1856,6 +614,23 @@ class SettingsDialog(QDialog):
         gl2.addRow(self.auto_detect_type)
 
         L.addWidget(grp2)
+
+        grp3 = QGroupBox("Tray and Windows Start")
+        gl3 = QVBoxLayout(grp3)
+        self.tray_on_close = QCheckBox("Keep PathRenamer running in the tray when the window is closed")
+        self.tray_on_close.setChecked(bool(self.cfg.get("tray_on_close")))
+        self.tray_on_close.setToolTip("The watch folder keeps working. Open or quit PathRenamer from its "
+                                      "icon next to the clock.")
+        gl3.addWidget(self.tray_on_close)
+        self.start_with_windows = QCheckBox("Start PathRenamer in the tray when Windows starts")
+        self.start_with_windows.setChecked(bool(self.cfg.get("start_with_windows")))
+        if not startup.supported():
+            self.start_with_windows.setEnabled(False)
+            self.start_with_windows.setToolTip("Available in PathRenamer.exe (installed or portable).")
+        gl3.addWidget(self.start_with_windows)
+        gl3.addWidget(_note_label("Both keep the watch folder (Tools → Watch Folder) running in the "
+                                  "background, so new downloads are handled even with the window closed."))
+        L.addWidget(grp3)
         L.addStretch()
         return w
 
@@ -1880,7 +655,7 @@ class SettingsDialog(QDialog):
 
         grp = QGroupBox("Watch Folder")
         gl = QFormLayout(grp)
-        self.watch_enabled = QCheckBox("Watch a folder for new downloads while PathRenamer is open")
+        self.watch_enabled = QCheckBox("Watch a folder for new downloads while PathRenamer is running")
         self.watch_enabled.setChecked(bool(self.cfg.get("watch_enabled")))
         gl.addRow(self.watch_enabled)
         self.watch_folder = QLineEdit(self.cfg.get("watch_folder", ""))
@@ -1905,17 +680,62 @@ class SettingsDialog(QDialog):
             "folders. Anything PathRenamer isn't sure about is put in the preview for you to check."))
         L.addWidget(grp)
 
-        grp2 = QGroupBox("Plex")
+        grp2 = QGroupBox("Media Server")
         g2 = QFormLayout(grp2)
+        self.server_kind = QComboBox()
+        for key, label in SERVER_KINDS:
+            self.server_kind.addItem(label, key)
+        self.server_kind.setCurrentIndex(max(0, self.server_kind.findData(self.cfg.get("media_server", "plex"))))
+        g2.addRow("Server:", self.server_kind)
+        self.server_pages = QStackedWidget()
+
+        plex_page = QWidget()
+        pf = QFormLayout(plex_page)
+        pf.setContentsMargins(0, 0, 0, 0)
         self.plex_url = QLineEdit(self.cfg.get("plex_url", ""))
         self.plex_url.setPlaceholderText("e.g., http://localhost:32400")
-        g2.addRow("Server:", self.plex_url)
+        pf.addRow("Address:", self.plex_url)
         self.plex_token = QLineEdit(unprotect(self.cfg.get("plex_token", "")))
         self.plex_token.setEchoMode(QLineEdit.EchoMode.Password)
         self.plex_token.setPlaceholderText("Filled in when you sign in")
         sign_in = QPushButton("Sign in with Plex…")
         sign_in.clicked.connect(self._plex_sign_in)
-        g2.addRow("Token:", self._make_browse_row(self.plex_token, sign_in))
+        pf.addRow("Token:", self._make_browse_row(self.plex_token, sign_in))
+        self.server_pages.addWidget(plex_page)
+
+        self.server_fields = {}
+        for kind in ("jellyfin", "emby"):
+            page = QWidget()
+            f = QFormLayout(page)
+            f.setContentsMargins(0, 0, 0, 0)
+            url = QLineEdit(self.cfg.get(f"{kind}_url", ""))
+            url.setPlaceholderText("e.g., http://localhost:8096")
+            key = QLineEdit(unprotect(self.cfg.get(f"{kind}_key", "")))
+            key.setEchoMode(QLineEdit.EchoMode.Password)
+            key.setPlaceholderText("Dashboard → API Keys → +")
+            f.addRow("Address:", url)
+            f.addRow("API key:", key)
+            self.server_fields[kind] = (url, key)
+            self.server_pages.addWidget(page)
+
+        kodi_page = QWidget()
+        kf = QFormLayout(kodi_page)
+        kf.setContentsMargins(0, 0, 0, 0)
+        self.kodi_url = QLineEdit(self.cfg.get("kodi_url", ""))
+        self.kodi_url.setPlaceholderText("e.g., http://192.168.1.20:8080")
+        self.kodi_user = QLineEdit(self.cfg.get("kodi_user", ""))
+        self.kodi_pass = QLineEdit(unprotect(self.cfg.get("kodi_password", "")))
+        self.kodi_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        kf.addRow("Address:", self.kodi_url)
+        kf.addRow("Username:", self.kodi_user)
+        kf.addRow("Password:", self.kodi_pass)
+        kf.addRow("", _note_label("In Kodi, turn on Settings → Services → Control → "
+                                  "Allow remote control via HTTP."))
+        self.server_pages.addWidget(kodi_page)
+        self.server_kind.currentIndexChanged.connect(self._show_server_page)
+        self._show_server_page(self.server_kind.currentIndex())
+        g2.addRow(self.server_pages)
+
         test_row = QHBoxLayout()
         self.plex_test_btn = QPushButton("Test Connection")
         self.plex_test_btn.clicked.connect(self._plex_test)
@@ -1924,13 +744,32 @@ class SettingsDialog(QDialog):
         test_row.addWidget(self.plex_test_btn)
         test_row.addWidget(self.plex_status, 1)
         g2.addRow("", test_row)
-        self.plex_auto = self._pro_checkbox("Ask Plex to scan right after renaming", "plex_auto_scan")
-        g2.addRow(self.plex_auto)
+        self.server_auto = self._pro_checkbox("Ask the media server to scan right after renaming", "plex_auto_scan")
+        g2.addRow(self.server_auto)
         g2.addRow("", _note_label("Only the folders that changed are scanned, so new episodes show up in "
-                                  "seconds. Tools → Ask Plex to Scan Now works without Pro."))
+                                  "seconds, also in apps like Plezy. Tools → Scan Media Server Now works "
+                                  "without Pro."))
         L.addWidget(grp2)
         L.addStretch()
         return w
+
+    def _show_server_page(self, index):
+        """Only the chosen server's fields take room (no gap left by the others)."""
+        self.server_pages.setCurrentIndex(index)
+        for i in range(self.server_pages.count()):
+            policy = QSizePolicy.Policy.Preferred if i == index else QSizePolicy.Policy.Ignored
+            self.server_pages.widget(i).setSizePolicy(policy, policy)
+        self.server_pages.adjustSize()
+
+    def _server_from_fields(self):
+        """A media server client from what is typed on the page (for Test)."""
+        kind = self.server_kind.currentData()
+        if kind in self.server_fields:
+            url, key = self.server_fields[kind]
+            return JellyfinClient(url.text(), key.text(), emby=kind == "emby")
+        if kind == "kodi":
+            return KodiClient(self.kodi_url.text(), self.kodi_user.text(), self.kodi_pass.text())
+        return PlexClient(self.plex_url.text(), self.plex_token.text())
 
     def _plex_sign_in(self):
         if not self.cfg.get("plex_client_id"):
@@ -1945,12 +784,13 @@ class SettingsDialog(QDialog):
                                      "Signed in. Type your server's address above.")
 
     def _plex_test(self):
-        client = PlexClient(self.plex_url.text(), self.plex_token.text())
+        client = self._server_from_fields()
         self.plex_test_btn.setEnabled(False)
         self.plex_status.setText("Connecting…")
 
         def work():
-            return client.server_name(), [s["title"] for s in client.sections() if s["type"] in ("movie", "show")]
+            return client.server_name(), [lib["title"] for lib in client.libraries()
+                                          if lib["type"] in VIDEO_LIBRARY_TYPES]
 
         def done(result, error):
             self.plex_test_btn.setEnabled(True)
@@ -2019,7 +859,7 @@ class SettingsDialog(QDialog):
         kl = QVBoxLayout(self.pro_key_box)
         kl.setContentsMargins(0, 6, 0, 0)
         row = QHBoxLayout()
-        self.license_key = QLineEdit(self.cfg.get("license_key", ""))
+        self.license_key = QLineEdit(self.license.key)
         self.license_key.setPlaceholderText("Paste your license key")
         self.btn_activate = QPushButton("Activate")
         self.btn_activate.clicked.connect(self._activate_license)
@@ -2048,12 +888,12 @@ class SettingsDialog(QDialog):
         return w
 
     def _update_pro_buttons(self):
-        has_key = bool(self.cfg.get("license_key"))
+        has_key = bool(self.license.key)
         self.btn_check.setEnabled(has_key)
         self.btn_deactivate.setEnabled(has_key)
         self.pro_status.setText(self.license.summary())
         allowed = self.license.can_try()
-        for box in (getattr(self, "watch_auto", None), getattr(self, "plex_auto", None),
+        for box in (getattr(self, "watch_auto", None), getattr(self, "server_auto", None),
                     getattr(self, "subs_auto", None)):
             if box is not None:
                 box.setEnabled(allowed)
@@ -2189,11 +1029,26 @@ class SettingsDialog(QDialog):
         license_note.setStyleSheet("color: #888; font-size: 11px; margin-top: 8px;")
         gl.addWidget(license_note)
 
-        version = QLabel(f"Version: {APP_VERSION}")
-        version.setStyleSheet("color: #666; font-size: 11px; margin-top: 8px;")
-        gl.addWidget(version)
-
         L.addWidget(grp)
+
+        grp_up = QGroupBox("Updates")
+        ul = QVBoxLayout(grp_up)
+        row = QHBoxLayout()
+        version = QLabel(f"You have PathRenamer {APP_VERSION}.")
+        row.addWidget(version, 1)
+        check_now = getattr(self.parent(), "check_for_updates", None)
+        self.btn_check_updates = QPushButton("Check for Updates")
+        self.btn_check_updates.setVisible(check_now is not None)
+        if check_now is not None:
+            self.btn_check_updates.clicked.connect(check_now)
+        row.addWidget(self.btn_check_updates)
+        ul.addLayout(row)
+        self.check_updates_chk = QCheckBox("Check for updates automatically (once a day)")
+        self.check_updates_chk.setChecked(self.cfg.get("check_updates", True))
+        ul.addWidget(self.check_updates_chk)
+        ul.addWidget(_note_label("When a new version is out, “Update to …” appears at the bottom right of the "
+                                 "window: one click downloads it from GitHub, checks it and installs it."))
+        L.addWidget(grp_up)
         L.addStretch()
         return w
 
@@ -2235,15 +1090,26 @@ class SettingsDialog(QDialog):
             "watch_media_type": self.watch_type.currentData(),
             "watch_auto_rename": self.watch_auto.isChecked(),
             "watch_include_existing": self.watch_existing.isChecked(),
+            "media_server": self.server_kind.currentData(),
             "plex_url": self.plex_url.text().strip(),
             "plex_token": protect(self.plex_token.text().strip()),
-            "plex_auto_scan": self.plex_auto.isChecked(),
+            "jellyfin_url": self.server_fields["jellyfin"][0].text().strip(),
+            "jellyfin_key": protect(self.server_fields["jellyfin"][1].text().strip()),
+            "emby_url": self.server_fields["emby"][0].text().strip(),
+            "emby_key": protect(self.server_fields["emby"][1].text().strip()),
+            "kodi_url": self.kodi_url.text().strip(),
+            "kodi_user": self.kodi_user.text().strip(),
+            "kodi_password": protect(self.kodi_pass.text()),
+            "plex_auto_scan": self.server_auto.isChecked(),
             "subs_languages": ", ".join(self._language_names()) or "English",
             "subs_auto": self.subs_auto.isChecked(),
             "subs_hearing_impaired": self.subs_hi.isChecked(),
             "opensubtitles_api_key": self.os_key.text().strip(),
             "opensubtitles_username": self.os_user.text().strip(),
             "opensubtitles_password": protect(self.os_pass.text()),
+            "check_updates": self.check_updates_chk.isChecked(),
+            "tray_on_close": self.tray_on_close.isChecked(),
+            "start_with_windows": self.start_with_windows.isChecked(),
             "first_run": False,
         })
         turned_on = [k for k in self.PRO_SWITCHES if self.cfg.get(k) and not self._initial.get(k)]
@@ -2265,23 +1131,6 @@ class SettingsDialog(QDialog):
 #  RENAME TABLE
 # ═══════════════════════════════════════════════════════════════════
 # Row colours per status: (background, foreground)
-DUPLICATE_PREFIX = "Same new name as "
-
-def mark_duplicates(cands, dest_root):
-    """Flag every candidate whose new path an earlier one already takes
-    (e.g. a 720p and a 1080p copy of the same episode); the first keeps it."""
-    for c in cands:
-        if c.error.startswith(DUPLICATE_PREFIX):
-            c.error = ""
-    owners = {}
-    for c in cands:
-        if c.error:
-            continue
-        key = os.path.normcase(os.path.normpath(str(Path(dest_root or ".") / c.dest_rel)))
-        owner = owners.setdefault(key, c)
-        if owner is not c:
-            c.error = f"{DUPLICATE_PREFIX}{owner.source.name}"
-
 def row_colors(pal):
     """Preview row colours per status, (background, text), from a theme palette."""
     return {k: (QColor(pal[f"row_{k}_bg"]), QColor(pal[f"row_{k}_fg"]))
@@ -2565,6 +1414,7 @@ class RenameTable(QTableWidget):
 #  BACKGROUND WORKER
 # ═══════════════════════════════════════════════════════════════════
 class ScanWorker(QObject):
+    """Runs core.match_files in a thread and reports each match to the window."""
     progress       = pyqtSignal(int, int)
     candidate_ready = pyqtSignal(object)
     finished       = pyqtSignal()
@@ -2574,67 +1424,18 @@ class ScanWorker(QObject):
         super().__init__()
         self.files = files; self.engine = engine
         self.media_type = media_type; self.dest_root = dest_root
-        self.selected_overrides = selected_overrides or {}       # str(path) -> (title, id)
-        self.episode_overrides = episode_overrides or {}         # str(path) -> (season, [episodes])
-        self._sub_output_counts = {}
-        self._dest_owner = {}     # normalised destination -> first source file renamed to it
+        self.selected_overrides = selected_overrides or {}
+        self.episode_overrides = episode_overrides or {}
 
     def run(self):
-        log.info(f"Scan started: {len(self.files)} file(s), type={self.media_type}, dest={self.dest_root}")
-        # Videos first: their subtitles are renamed with them, so a subtitle
-        # file that was also added to the list on its own is not done twice.
-        files = ([f for f in self.files if f.suffix.lower() not in SUB_EXT] +
-                 [f for f in self.files if f.suffix.lower() in SUB_EXT])
-        claimed = set()      # subtitles already renamed together with a video
-        for i, f in enumerate(files):
-            try:
-                log.debug(f"Matching: {f.name}")
-                if f.suffix.lower() in SUB_EXT and os.path.normcase(str(f)) in claimed:
-                    log.debug("  -> renamed with its video")
-                    continue
-
-                if not f.exists():
-                    self.candidate_ready.emit(Candidate(
-                        f, f.name, self.media_type, 0.0,
-                        error="Source file no longer exists (already renamed or removed)"))
-                    continue
-
-                key = str(f)
-                selected_title, selected_id = None, None
-                if key in self.selected_overrides:
-                    selected_title, selected_id = self.selected_overrides[key]
-
-                season, episodes = self.episode_overrides.get(key, (None, None))
-                cand = self.engine.match_with_override(f, self.media_type, selected_title, selected_id,
-                                                       season=season, episodes=episodes)
-
-                # Subtitle files picked directly: give them Plex subtitle names
-                src_ext = f.suffix.lower()
-                if src_ext in SUB_EXT:
-                    cand = self.engine._transform_subtitle_dest(cand, True, self._sub_output_counts)
-
-                log.debug(f"  -> dest_rel={cand.dest_rel}  conf={cand.confidence:.2f}  err={cand.error!r}")
-                dest = Path(self.dest_root) / cand.dest_rel
-                if dest.exists() and not _same_path(dest, f):
-                    cand.conflict = True
-                    log.warning(f"  CONFLICT: {dest}")
-                if not cand.error:
-                    # e.g. a 720p and a 1080p copy of the same episode: only the
-                    # first one can take the name, so flag the others now
-                    key = os.path.normcase(os.path.normpath(str(dest)))
-                    owner = self._dest_owner.setdefault(key, f)
-                    if not _same_path(owner, f):
-                        cand.error = f"{DUPLICATE_PREFIX}{owner.name}"
-                        log.warning(f"  DUPLICATE: {f.name} and {owner.name} -> {dest}")
-                    else:
-                        claimed.update(os.path.normcase(str(s)) for s, _ in cand.subtitles)
-                self.candidate_ready.emit(cand)
-            except Exception as e:
-                log.exception(f"Error matching {f.name}: {e}")
-                self.candidate_ready.emit(Candidate(f, f.name, self.media_type, 0.0, error=str(e)))
-            finally:
-                self.progress.emit(i + 1, len(files))
-        log.info("Scan finished.")
+        total = len(self.files)
+        done = 0
+        for cand in match_files(self.files, self.engine, self.media_type, self.dest_root,
+                                self.selected_overrides, self.episode_overrides):
+            self.candidate_ready.emit(cand)
+            done += 1
+            self.progress.emit(min(done, total), total)
+        self.progress.emit(total, total)
         self.finished.emit()
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3541,6 +2342,7 @@ class FormatEditorDialog(QDialog):
     def _apply_theme(self):
         pal = palette_for(self.cfg)
         self.setStyleSheet(base_stylesheet(pal) + tab_stylesheet(pal))
+        _set_link_color(pal)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3689,7 +2491,7 @@ class MainWindow(QMainWindow):
         self.cfg = cfg_load()
         self.renamer = Renamer(RenameHistory(HISTORY_PATH))
         self.license = License(self.cfg)
-        self.jobs = BackgroundJobs(self)       # downloads, Plex and license checks
+        self.jobs = BackgroundJobs(self)       # downloads, media servers and license checks
         self._watch_queue = []                 # new files waiting to be matched
         self._watch_busy = False
         self._watch_anidb = None
@@ -3703,6 +2505,11 @@ class MainWindow(QMainWindow):
         self._title_overrides = {}    # str(path) -> (title, id) chosen for that file
         self._episode_overrides = {}  # str(path) -> (season, [episodes]) chosen for that file
         self._shown_once = False
+        self._quitting = False                 # closing the window really quits (not to the tray)
+        self._closed = False                   # really closed: no more background checks
+        self._tray_forced = False              # started with --tray
+        self.tray = None
+        self._instance_server = None
         self._split_main = self._split_preview = None
         self._files_stack = self._preview_stack = None
         self.setWindowTitle("PathRenamer")
@@ -3740,6 +2547,25 @@ class MainWindow(QMainWindow):
         self._apply_automation()
         QTimer.singleShot(4000, self._check_license)   # a Pro key is re-checked once a week
 
+        # Updates: a quiet check once a day; "Update to …" appears at the bottom right
+        self._update_busy = False
+        self._update_release = None
+        self.update_btn = QPushButton()
+        self.update_btn.setObjectName("updateButton")
+        self.update_btn.setFlat(True)
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setStyleSheet("font-weight:600; padding:0 8px;")
+        self.update_btn.setToolTip("A new version of PathRenamer is ready. Click to download and install it.")
+        self.update_btn.clicked.connect(self._update_clicked)
+        self.status.addPermanentWidget(self.update_btn)
+        self._show_update_button()
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self._auto_check_updates)
+        self._update_timer.start(6 * 3600 * 1000)        # (for when PathRenamer runs for days)
+        QTimer.singleShot(8000, self._auto_check_updates)
+        updates.remove_old_downloads()
+        self._apply_windows_options()
+
         if self.cfg.get("first_run", True):
             self._first_run_wizard()
 
@@ -3756,7 +2582,8 @@ class MainWindow(QMainWindow):
         a = QAction("Settings…", self); a.triggered.connect(self._settings)
         a.setShortcut(QKeySequence("Ctrl+,")); fm.addAction(a)
         fm.addSeparator()
-        q = QAction("Quit", self); q.triggered.connect(self.close); fm.addAction(q)
+        q = QAction("Quit", self); q.triggered.connect(self.quit_app); fm.addAction(q)
+        q.setShortcut(QKeySequence("Ctrl+Q"))
 
         em = mb.addMenu("Edit")
         self.act_undo = QAction("Undo Last Rename", self)
@@ -3814,8 +2641,8 @@ class MainWindow(QMainWindow):
         self.act_download_subs.setEnabled(False)
         self.act_download_subs.triggered.connect(self._download_subtitles)
         tm.addAction(self.act_download_subs)
-        act = QAction("Ask Plex to Scan Now", self)
-        act.triggered.connect(self._scan_plex_now)
+        act = QAction("Scan Media Server Now", self)
+        act.triggered.connect(self._scan_server_now)
         tm.addAction(act)
         tm.addSeparator()
         act = QAction("Automation Settings…", self)
@@ -3828,6 +2655,9 @@ class MainWindow(QMainWindow):
         hm.addAction(act)
         act = QAction("Website and Guides", self)
         act.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(WEBSITE_URL)))
+        hm.addAction(act)
+        act = QAction("Check for Updates…", self)
+        act.triggered.connect(self.check_for_updates)
         hm.addAction(act)
         act = QAction("About PathRenamer", self)
         act.triggered.connect(lambda: self._settings("About"))
@@ -4308,13 +3138,29 @@ class MainWindow(QMainWindow):
             self.resize(1180, 760)
 
     def closeEvent(self, event):
-        self.watcher.stop()
         try:
             self.cfg["window_geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
             cfg_save(self.cfg)
         except Exception as e:
             log.debug(f"Could not save window size: {e}")
+        if not self._quitting and self._tray_active():
+            event.ignore()                     # keep running in the tray
+            self.hide()
+            if not self.cfg.get("tray_hint_shown"):
+                self.tray.showMessage("PathRenamer is still running",
+                                      "It keeps watching your folder. Right-click this icon to open or quit it.")
+                self.cfg["tray_hint_shown"] = True
+                cfg_save(self.cfg)
+            return
+        self.watcher.stop()
+        self._closed = True
+        self._update_timer.stop()
+        if self.tray is not None:
+            self.tray.hide()
         super().closeEvent(event)
+        app = QApplication.instance()
+        if app is not None and not app.quitOnLastWindowClosed():
+            app.quit()                         # (the tray keeps the app alive otherwise)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -4451,6 +3297,9 @@ class MainWindow(QMainWindow):
         self._refresh_clients()
         if hasattr(self, "watcher"):         # (the first-run wizard opens Settings before it exists)
             self._apply_automation()
+        if hasattr(self, "update_btn"):
+            self._show_update_button()
+            self._apply_windows_options()
         saved_type = self.cfg.get("media_type", "tv")
         idx = {"tv": 0, "movie": 1, "anime": 2}.get(saved_type, 0)
         if self.combo.currentIndex() != idx:
@@ -4499,6 +3348,7 @@ class MainWindow(QMainWindow):
         Custom theme is being edited)."""
         pal = pal or palette_for(self.cfg)
         self.setStyleSheet(app_stylesheet(pal, self.cfg.get("density", "comfortable")))
+        _set_link_color(pal)
         self.table.set_palette(pal)
         self.details.pal = pal
         self._update_details()
@@ -4770,20 +3620,10 @@ class MainWindow(QMainWindow):
         can_rename = total > 0 and (total - errors) > 0
         self.btn_rename.setEnabled(can_rename)
 
-    ACTION_WORDS = {  # rename action -> (verb, past tense)
-        "move": ("Move", "Renamed"), "copy": ("Copy", "Copied"), "hardlink": ("Hard-link", "Hard-linked"),
-    }
+    ACTION_WORDS = ACTION_WORDS
 
     def _rename_groups(self, cands, dst):
-        """(video op, [subtitle ops]) per renameable candidate, so subtitles follow their video."""
-        groups = []
-        for cand in cands:
-            if cand.error:
-                continue
-            main_op = (cand.source, Path(dst) / cand.dest_rel)
-            sub_ops = [(s, Path(dst) / rel) for s, rel in cand.subtitles]
-            groups.append((main_op, sub_ops))
-        return groups
+        return rename_groups(cands, dst)
 
     def _rename(self):
         dst = self._get_destination()
@@ -4849,36 +3689,9 @@ class MainWindow(QMainWindow):
         """Rename (move / copy / hard-link) the groups and clean up empty
         folders under cleanup_root (default: the source folder).
         Returns (result, status message)."""
-        # A subtitle whose new name already exists stays where it is
-        sub_skipped = sum(1 for _, sub_ops in groups for s in sub_ops if detect_conflicts([s]))
-        groups = [(main_op, [s for s in sub_ops if not detect_conflicts([s])])
-                  for main_op, sub_ops in groups]
-        action = self.cfg.get("rename_action", "move")
-        if action not in RENAME_ACTIONS:
-            action = "move"
-        result = self.renamer.execute_groups(groups, dest_root=dst, action=action, source=source)
-        ok_subs = sum(1 for op in result.succeeded if op.src.suffix.lower() in SUB_EXT)
-        ok_files = len(result.succeeded) - ok_subs
-        fallbacks = sum(1 for op in result.succeeded if op.note)
-
-        # Remove folders left empty in the source tree (only moving empties them)
-        if action == "move" and self.cfg.get("cleanup_empty_folders", True):
-            root = str(cleanup_root or self.src.text().strip())
-            if root and os.path.isdir(root):
-                for op in result.succeeded:
-                    if _is_inside(op.src, Path(root)):
-                        _cleanup_empty_dirs(op.src.parent, stop=Path(root))
-
-        msg = f"{self.ACTION_WORDS.get(action, self.ACTION_WORDS['move'])[1]} {ok_files} file(s)"
-        if ok_subs:
-            msg += f" and {ok_subs} subtitle(s)"
-        if result.failed:
-            msg += f", {len(result.failed)} failed"
-        if fallbacks:
-            msg += f" · {fallbacks} copied instead (hard links only work on the same drive)"
-        if sub_skipped:
-            msg += f" · {sub_skipped} subtitle(s) left in place (new name already exists)"
-
+        result, msg = place_groups(self.renamer, groups, dst, self.cfg.get("rename_action", "move"), source,
+                                   cleanup_root or self.src.text().strip(),
+                                   self.cfg.get("cleanup_empty_folders", True))
         # Placed files are done; drop them from the list
         self._purge_files_from_list([op.src for op in result.succeeded])
         self._update_undo_buttons()
@@ -5198,6 +4011,9 @@ class MainWindow(QMainWindow):
         folder = self.watcher.folder()
         self.watch_label.setVisible(folder is not None)
         self.act_watch.setChecked(folder is not None)
+        if self.tray is not None:
+            self.tray_watch.setChecked(folder is not None)
+            self.tray.setToolTip(f"PathRenamer: watching {folder}" if folder is not None else "PathRenamer")
         if folder is not None:
             self.watch_label.setText(f"Watching {folder.name or folder}")
             self.watch_label.setToolTip(f"New videos in {folder} are matched as soon as they finish "
@@ -5229,26 +4045,14 @@ class MainWindow(QMainWindow):
         self._process_watch_queue()
 
     def _watch_media_type(self, path, cfg=None):
-        chosen = (cfg or self.cfg).get("watch_media_type", "auto")
-        if chosen in self.MEDIA_TYPES:
-            return chosen
-        guess = analyse_path(path, "tv")
-        # "Dune Part Two 2024" has a part number and a year: a movie
-        year = guess.year or (guess.raw or {}).get("year")
-        episodic = guess.season is not None or guess.date or (guess.episodes and not year)
-        return "tv" if episodic else "movie"
+        return detect_media_type(path, (cfg or self.cfg).get("watch_media_type", "auto"))
 
     def _watch_engine(self):
         """The watch folder matches next to a normal preview, so it uses its
         own connections."""
         if self.cfg.get("use_anidb", True) and self._watch_anidb is None:
             self._watch_anidb = AniDBClient()
-        key = (self.cfg.get("tmdb_api_key") or "").strip()
-        return MatchEngine(cfg=dict(self.cfg),
-                           tvmaze=TVMazeClient() if self.cfg.get("use_tvmaze", True) else None,
-                           anidb=self._watch_anidb if self.cfg.get("use_anidb", True) else None,
-                           tmdb=TMDBClient(key) if key else None,
-                           cinemeta=CinemetaClient() if self.cfg.get("use_cinemeta", True) else None)
+        return make_engine(self.cfg, self._watch_anidb)
 
     def _process_watch_queue(self):
         """Match the next batch of new files (one kind at a time) in the background."""
@@ -5305,12 +4109,15 @@ class MainWindow(QMainWindow):
             notes.append(f"Watch folder: {msg}")
             self._update_summary()
             self._after_rename(result, renamed, dst, self.renamer.last_batch_id)
+            if renamed:
+                self._notify("New downloads renamed", f"{len(renamed)} file(s) went into your library.")
         rest = [c for c in cands if id(c) not in placed]
         if rest:
             shown = self._show_watch_candidates(rest, media_type, dst)
             where = "in the preview" if shown else "in the file list"
             why = " (automatic renaming is part of PathRenamer Pro)" if wanted and not allowed else ""
             notes.append(f"{len(rest)} new file(s) to check {where}{why}")
+            self._notify("New downloads", f"{len(rest)} new file(s) to check in PathRenamer.")
         self.status.showMessage(" · ".join(notes))
 
     def _show_watch_candidates(self, cands, media_type, dst):
@@ -5331,20 +4138,21 @@ class MainWindow(QMainWindow):
         self._update_fix_actions()
         return True
 
-    # ── After renaming: subtitles and Plex ───────────────────────────
+    # ── After renaming: subtitles and the media server ───────────────
     def _subtitle_client(self):
         key = (self.cfg.get("opensubtitles_api_key") or "").strip() or OPENSUBTITLES_APP_KEY
         return OpenSubtitlesClient(key, self.cfg.get("opensubtitles_username", ""),
                                    unprotect(self.cfg.get("opensubtitles_password", "")), APP_VERSION)
 
-    def _plex_client(self):
-        return PlexClient(self.cfg.get("plex_url", ""), unprotect(self.cfg.get("plex_token", "")))
+    def _media_server(self):
+        """The Plex, Jellyfin, Emby or Kodi client the settings choose."""
+        return server_from_config(self.cfg, unprotect)
 
     def _subtitle_languages(self):
         return parse_languages(self.cfg.get("subs_languages", "")) or ["eng"]
 
     def _after_rename(self, result, cands, dst, batch_id):
-        """Pro: download missing subtitles, then ask Plex to scan, in the
+        """Pro: download missing subtitles, then ask the media server to scan, in the
         background. Downloads join the rename's undo step."""
         subs_on = bool(self.cfg.get("subs_auto")) and self.license.allows("subs_auto")
         plex_on = bool(self.cfg.get("plex_auto_scan")) and self.license.allows("plex_auto_scan")
@@ -5357,9 +4165,10 @@ class MainWindow(QMainWindow):
         if subs_on and videos:
             subtitles = {"client": self._subtitle_client(), "languages": self._subtitle_languages(),
                          "hearing_impaired": bool(self.cfg.get("subs_hearing_impaired"))}
-        plex = self._plex_client() if plex_on else None
-        if subtitles is None and plex is None:
+        server = self._media_server() if plex_on else None
+        if subtitles is None and server is None:
             return
+        label = server.label if server is not None else ""
         media_type = cands[0].media_type if cands else self._media_type()
         paths = [op.dst for op in result.succeeded]
 
@@ -5380,12 +4189,12 @@ class MainWindow(QMainWindow):
             if downloaded:
                 parts.append(f"downloaded {len(downloaded)} subtitle(s)")
             if scanned:
-                parts.append(f"Plex is scanning {', '.join(scanned)}")
+                parts.append(f"{label} is scanning {', '.join(scanned)}")
             parts += problems
             if parts:
                 log.info("After renaming: " + " · ".join(parts))
                 self.status.showMessage("After renaming: " + " · ".join(parts))
-        self.jobs.run(lambda: run_after_rename(videos, paths, media_type, subtitles, plex), done)
+        self.jobs.run(lambda: run_after_rename(videos, paths, media_type, subtitles, server), done)
 
     def _download_subtitles(self):
         """Free: download subtitles for the selected rows, next to the
@@ -5445,26 +4254,30 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Subtitles", "\n".join(problems[:5]))
         self.jobs.run(work, done)
 
-    def _scan_plex_now(self):
-        """Free: ask Plex to scan every movie and TV library."""
-        plex = self._plex_client()
-        if not plex.base_url or not plex.token:
-            QMessageBox.information(self, "Plex", "Connect PathRenamer to your Plex server first: "
-                                    "Settings → Automation → Sign in with Plex.")
+    def _scan_server_now(self):
+        """Free: ask the media server to scan every movie and TV library."""
+        server = self._media_server()
+        if not server.configured:
+            QMessageBox.information(self, "Media server", "Connect PathRenamer to your media server first "
+                                    "(Plex, Jellyfin, Emby or Kodi): Settings → Automation.")
             self._settings("Automation")
             return
-        self.status.showMessage("Asking Plex to scan…")
+        self.status.showMessage(f"Asking {server.label} to scan…")
 
         def done(titles, error):
             if error is not None:
-                self.status.showMessage(f"Plex: {error}")
+                self.status.showMessage(f"{server.label}: {error}")
             else:
-                self.status.showMessage(f"Plex is scanning {', '.join(titles)}." if titles else
-                                        "Plex has no movie or TV libraries to scan.")
-        self.jobs.run(plex.scan_all, done)
+                self.status.showMessage(f"{server.label} is scanning {', '.join(titles)}." if titles else
+                                        f"{server.label} has no movie or TV libraries to scan.")
+        self.jobs.run(server.scan_all, done)
 
     def _check_license(self):
         """Re-check a Pro key once a week, quietly in the background."""
+        if self._closed:
+            return
+        if self.license.touch():             # (setting the clock back doesn't stretch the trial)
+            cfg_save(self.cfg)
         if not self.license.needs_check():
             return
         copy = License(dict(self.cfg))
@@ -5478,6 +4291,176 @@ class MainWindow(QMainWindow):
                         self.cfg.pop(k, None)
                 cfg_save(self.cfg)
         self.jobs.run(copy.check, done)
+
+    # ── Tray and Windows start ──────────────────────────────────────
+    def _apply_windows_options(self):
+        """Settings → Options → Tray and Windows Start."""
+        try:
+            startup.sync(bool(self.cfg.get("start_with_windows")))
+        except OSError as e:
+            log.warning(f"Couldn't change the Windows start entry: {e}")
+            self.status.showMessage(f"Couldn't set PathRenamer to start with Windows: {e}")
+        self._update_tray()
+
+    def _tray_wanted(self):
+        return bool(self.cfg.get("tray_on_close") or self.cfg.get("start_with_windows") or self._tray_forced)
+
+    def _tray_active(self):
+        """Closing the window hides it only when the tray icon can bring it back."""
+        return self.tray is not None and self.tray.isVisible()
+
+    def _update_tray(self):
+        if not self._tray_wanted() or not QSystemTrayIcon.isSystemTrayAvailable():
+            if self.tray is not None:
+                self.tray.hide()
+            return
+        if self.tray is None:
+            self._build_tray()
+        self.tray.show()
+        self._update_watch_label()
+
+    def _build_tray(self):
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip("PathRenamer")
+        menu = QMenu(self)
+        act = QAction("Open PathRenamer", self)
+        act.triggered.connect(self.show_window)
+        menu.addAction(act)
+        menu.addSeparator()
+        self.tray_watch = QAction("Watch Folder", self)
+        self.tray_watch.setCheckable(True)
+        self.tray_watch.triggered.connect(self._toggle_watch)
+        menu.addAction(self.tray_watch)
+        act = QAction("Check the Watch Folder Now", self)
+        act.triggered.connect(self._check_watch_now)
+        menu.addAction(act)
+        act = QAction("Check for Updates…", self)
+        act.triggered.connect(self.check_for_updates)
+        menu.addAction(act)
+        menu.addSeparator()
+        act = QAction("Quit PathRenamer", self)
+        act.triggered.connect(self.quit_app)
+        menu.addAction(act)
+        self.tray.setContextMenu(menu)
+        self._tray_menu = menu
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.messageClicked.connect(self.show_window)
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.show_window()
+
+    def start_in_tray(self):
+        """Started by Windows with --tray: only the tray icon, no window.
+        False when there is no tray to start in."""
+        self._tray_forced = True
+        self._update_tray()
+        return self._tray_active()
+
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def listen_for_second_starts(self, name):
+        """Starting PathRenamer again (from the Start menu) shows this window
+        instead of running a second copy that watches the same folder."""
+        QLocalServer.removeServer(name)                    # left over after a crash
+        self._instance_server = QLocalServer(self)
+        if not self._instance_server.listen(name):
+            log.debug(f"Couldn't listen for second starts: {self._instance_server.errorString()}")
+            return
+        self._instance_server.newConnection.connect(self._on_second_start)
+
+    def _on_second_start(self):
+        while self._instance_server.hasPendingConnections():
+            conn = self._instance_server.nextPendingConnection()
+            conn.disconnected.connect(conn.deleteLater)
+            conn.disconnectFromServer()
+        self.show_window()
+
+    # ── Updates ─────────────────────────────────────────────────────
+    def check_for_updates(self):
+        """Help → Check for Updates: ask GitHub now and say what was found."""
+        self._run_update_check(manual=True)
+
+    def _auto_check_updates(self):
+        """Once a day, quietly in the background (Settings → About can turn it off)."""
+        if self._closed or not self.cfg.get("check_updates", True) or self._update_busy:
+            return
+        if time.time() - float(self.cfg.get("update_checked_at") or 0) < 20 * 3600:
+            return
+        self._run_update_check(manual=False)
+
+    def _update_clicked(self):
+        """The "Update to …" button: one click downloads and installs it."""
+        if self._update_release is not None and updates.is_newer(self._update_release.version, APP_VERSION):
+            self._open_update_dialog(self._update_release, start=True)
+        else:                                  # found in an earlier session: get the download details
+            self._run_update_check(manual=True, start=True)
+
+    def _run_update_check(self, manual=False, start=False):
+        if self._update_busy:
+            return
+        self._update_busy = True
+        if manual:
+            self.status.showMessage("Checking for updates…")
+
+        def done(release, error):
+            self._update_busy = False
+            if error is not None:
+                if manual:
+                    self.status.showMessage(f"Couldn't check for updates: {error}")
+                    QMessageBox.warning(self, "Check for Updates", str(error))
+                return
+            self._update_release = release
+            self.cfg["update_checked_at"] = time.time()
+            self.cfg["update_available"] = release.version if release else ""
+            cfg_save(self.cfg)
+            self._show_update_button()
+            if release is None:
+                if manual:
+                    self.status.showMessage(f"PathRenamer is up to date ({APP_VERSION}).")
+                    QMessageBox.information(self, "Check for Updates",
+                                            f"You have the latest version of PathRenamer ({APP_VERSION}).")
+                return
+            if manual:
+                self._open_update_dialog(release, start=start)
+            elif release.version != self.cfg.get("update_skip_version"):
+                self.status.showMessage(f"PathRenamer {release.version} is available: click “Update to "
+                                        f"{release.version}” at the bottom right to install it.")
+                self._notify("Update available", f"PathRenamer {release.version} is ready to install.")
+        self.jobs.run(lambda: updates.check(APP_VERSION), done)
+
+    def _show_update_button(self):
+        version = self.cfg.get("update_available") or ""
+        show = (bool(version) and updates.is_newer(version, APP_VERSION)
+                and version != self.cfg.get("update_skip_version"))
+        self.update_btn.setText(f"Update to {version}")
+        self.update_btn.setVisible(show)
+
+    def _open_update_dialog(self, release, start=False):
+        d = UpdateDialog(release, self, start=start)
+        d.exec()
+        if d.skipped:
+            self.cfg["update_skip_version"] = release.version
+            cfg_save(self.cfg)
+            self._show_update_button()
+            self.status.showMessage(f"Version {release.version} skipped. Help → Check for Updates still finds it.")
+        if d.installing:
+            self.quit_app()                    # the new version starts on its own
+
+    def _notify(self, title, text):
+        """A message from the tray when the window isn't on screen."""
+        tray = getattr(self, "tray", None)
+        if tray is not None and tray.isVisible() and not self.isVisible():
+            tray.showMessage(title, text)
+
+    def quit_app(self):
+        """Really quit (also when closing the window would keep PathRenamer in the tray)."""
+        self._quitting = True
+        self.close()
+        QApplication.instance().quit()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -5511,9 +4494,39 @@ class MainWindow(QMainWindow):
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════
 
+def _instance_name():
+    """One PathRenamer per Windows user."""
+    import getpass
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "user"
+    return "PathRenamer-" + "".join(ch for ch in user if ch.isalnum())[:40]
+
+
+def _show_running_copy(name):
+    """True when PathRenamer already runs (it is asked to show its window)."""
+    sock = QLocalSocket()
+    sock.connectToServer(name)
+    if not sock.waitForConnected(500):
+        return False
+    sock.write(b"show")
+    sock.flush()
+    sock.waitForBytesWritten(500)
+    sock.disconnectFromServer()
+    return True
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("PathRenamer")
     app.setApplicationVersion(APP_VERSION)
-    w = MainWindow(); w.show()
+    name = _instance_name()
+    if _show_running_copy(name):
+        sys.exit(0)
+    app.setQuitOnLastWindowClosed(False)       # the tray can keep PathRenamer running; closing quits otherwise
+    w = MainWindow()
+    w.listen_for_second_starts(name)
+    if not (startup.TRAY_ARG in sys.argv[1:] and w.start_in_tray()):
+        w.show()
     sys.exit(app.exec())

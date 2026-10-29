@@ -1,0 +1,41 @@
+# Builds the Docker image (PathRenamer's command line version, for servers
+# and NAS boxes) and tries it on a file, so a broken image shows up before a
+# release. Each release pushes the image to ghcr.io (see release.yml).
+name: Docker
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t pathrenamer:test .
+
+      - name: Rename a file with it, then undo
+        run: |
+          set -e
+          mkdir -p t/config t/data/downloads t/data/media/movies
+          echo video > "t/data/downloads/Heat.1995.1080p.BluRay.x264.mkv"
+          sudo chown -R 1000:1000 t
+          run() {
+            docker run --rm -v "$PWD/t/config:/config" -v "$PWD/t/data:/data" \
+              -e PATHRENAMER_MOVIES=/data/media/movies pathrenamer:test "$@"
+          }
+          run --version
+          run config set use_cinemeta false
+          run rename /data/downloads --type movie --action hardlink --yes
+          test -f "t/data/media/movies/Heat (1995)/Heat (1995) 1080p H.264.mkv"
+          test "$(stat -c %h 't/data/downloads/Heat.1995.1080p.BluRay.x264.mkv')" = 2
+          test "$(stat -c %u t/config/config.json)" = 1000
+          run history
+          run undo
+          test ! -e "t/data/media/movies/Heat (1995)"

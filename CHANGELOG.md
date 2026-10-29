@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.6.0
+
+- Jellyfin, Emby and Kodi: Settings → Automation → Media Server connects
+  any of them next to Plex. After renaming (Pro), or with Tools → Scan Media
+  Server Now (free), the server scans only the folders that changed, or the
+  whole library when it sees the files under other paths (another computer
+  or Docker). Apps playing from these servers, like Plezy, see the new files
+  right away.
+- Updates: PathRenamer checks GitHub once a day (Settings → About to turn it
+  off). "Update to …" at the bottom right downloads the new version, checks
+  its size and SHA-256 against GitHub, installs it and starts it again; the
+  portable PathRenamer.exe is swapped in place. Help → Check for Updates
+  checks by hand.
+- Tray and Windows start (Settings → Options): closing the window can keep
+  PathRenamer running in the tray with the watch folder working, and it can
+  start in the tray when Windows starts. Starting PathRenamer a second time
+  shows the running window instead of a second copy. File → Quit (Ctrl+Q)
+  really quits.
+- Docker and command line: `pathrenamer rename`, `watch`, `undo`,
+  `history`, `subtitles`, `scan`, `plex-signin`, `config`, `license` and
+  `update`, with the same settings and names as the app. The image
+  (ghcr.io/royalkiller2222/pathrenamer) runs as PUID/PGID, keeps its
+  settings in /config, and is built for Intel/AMD and ARM. See DOCKER.md.
+- Pro is harder to unlock without paying: the license and trial state are
+  sealed (encrypted for the Windows user, or signed in Docker), so editing
+  config.json unlocks nothing; activations are tied to the computer they
+  were made on; deleting the settings doesn't restart the trial, and
+  setting the clock back doesn't stretch it.
+- Log files roll over at 5 MB instead of growing forever.
+- The engine (core.py) is separate from the window (main.py), so the Docker
+  version runs without Qt.
+
 ## 1.5.0
 
 - Watch folder (Tools → Watch Folder, Settings → Automation): new videos in a

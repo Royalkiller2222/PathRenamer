@@ -27,7 +27,7 @@ NAV = (("/", "Home"), ("/download/", "Download"), ("/pricing/", "Pricing"),
 
 
 def app_version():
-    text = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+    text = (ROOT / "src" / "version.py").read_text(encoding="utf-8")
     m = re.search(r'^APP_VERSION = "(.+)"', text, re.M)
     return m.group(1) if m else ""
 
@@ -43,11 +43,14 @@ def last_changed(path):
 
 
 def markdown(text):
-    """The little Markdown RELEASE_NOTES.md uses: paragraphs, - lists, **bold**."""
+    """The little Markdown RELEASE_NOTES.md uses: paragraphs, - lists, **bold**,
+    `code` and [links](https://...)."""
     out, items = [], []
 
     def inline(s):
-        s = html.escape(s)
+        s = html.escape(s, quote=False)
+        s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+        s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s\"<>]+)\)", r'<a href="\2">\1</a>', s)
         return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
 
     def flush():
@@ -183,6 +186,10 @@ def build():
     values = dict(site, root=root, version=version, year=date.today().year,
                   release_notes=markdown((ROOT / "RELEASE_NOTES.md").read_text(encoding="utf-8")))
     values["pro_cta"] = pro_cta(site, root)
+    # One sentence about Pro that matches the pricing page: on sale, or early access
+    values["pro_now"] = (f"The automatic Pro features come with a free {site['trial_days']}-day trial."
+                         if site.get("checkout_url") else
+                         "The automatic Pro features are unlocked during early access.")
     values["faq_items"] = faq_html(faq, values)
     values["faq_top"] = faq_html(faq[:4], values)
     layout = (HERE / "templates" / "layout.html").read_text(encoding="utf-8")

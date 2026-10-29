@@ -1,6 +1,6 @@
 <!--meta
 {"title": "Privacy | PathRenamer",
- "description": "What PathRenamer sends where: title lookups, subtitle searches, Plex, license checks. No ads, no tracking, no file uploads.",
+ "description": "What PathRenamer sends where: title lookups, subtitle searches, media servers, update and license checks. No ads, no tracking, no file uploads.",
  "path": "/privacy/", "priority": 0.3,
  "crumbs": [["/", "Home"], ["/privacy/", "Privacy"]]}
 -->
@@ -20,12 +20,13 @@
       <tr><td>AniDB</td><td>Matching anime</td><td>A download of its title list; anime ids for episode names</td></tr>
       <tr><td>TMDB</td><td>Only if you add your own TMDB key</td><td>Movie and show titles, with your key</td></tr>
       <tr><td>OpenSubtitles.com</td><td>Only when subtitles are downloaded</td><td>The title, season and episode, your languages, the video's OpenSubtitles fingerprint (a number made from its size and its first and last 64 KB), and your username and password if you entered them</td></tr>
-      <tr><td>Your Plex server</td><td>Only if you connect Plex</td><td>Requests to scan the folders that changed</td></tr>
+      <tr><td>Your media server (Plex, Jellyfin, Emby or Kodi)</td><td>Only if you connect one</td><td>Requests to scan the folders that changed, with the token, API key or password you entered</td></tr>
       <tr><td>plex.tv</td><td>Only when you click <em>Sign in with Plex</em></td><td>A sign-in code; you sign in on plex.tv itself</td></tr>
-      <tr><td>Polar</td><td>Only for Pro license keys</td><td>Your license key and your computer's name (so you can tell your computers apart when moving a license)</td></tr>
+      <tr><td>Polar</td><td>Only for Pro license keys</td><td>Your license key, your computer's name (so you can tell your computers apart when moving a license), and an anonymous ID for the computer: a scrambled number that can't be traced back to it, so a license only works on the computers it was activated on</td></tr>
+      <tr><td>GitHub</td><td>Once a day to check for a new version (you can turn this off under Settings → About), and when you update</td><td>A request for the newest version number; updates are downloaded from GitHub Releases</td></tr>
     </tbody>
   </table>
-  <p>Your settings, rename history and logs stay in <code>%APPDATA%\PathRenamer</code> on your computer. The Plex token and OpenSubtitles password are stored encrypted for your Windows account.</p>
+  <p>Your settings, rename history and logs stay in <code>%APPDATA%\PathRenamer</code> on your computer (in Docker: the <code>/config</code> folder). Media server tokens and keys and the OpenSubtitles password are stored encrypted for your Windows account.</p>
 
   <h2>Buying Pro</h2>
   <p>Payments are handled by <a href="https://polar.sh">Polar</a> as the seller of record: Polar collects your name, email and payment details to sell you the license and send your key, under <a href="https://polar.sh/legal/privacy">Polar's privacy policy</a>. PathRenamer never sees your card.</p>

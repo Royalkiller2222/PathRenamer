@@ -29,6 +29,7 @@
     <li>Set <strong>When renaming</strong> to <strong>Hard-link the files (torrents keep seeding)</strong>.</li>
     <li>Preview and rename as usual. Downloads stay where they are; your library gets the new names.</li>
   </ol>
+  <p>In the <a href="{{ repo_url }}/blob/main/DOCKER.md">Docker version</a>, set <code>PATHRENAMER_ACTION: hardlink</code>, and map one folder that holds both your downloads and your media (for example <code>/srv/data:/data</code>): hard links can't cross from one mapped folder to another.</p>
   <p>Undo removes only the library name; the download is never touched.</p>
 
   <h2>The one rule: same drive</h2>

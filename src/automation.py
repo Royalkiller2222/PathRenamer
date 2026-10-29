@@ -1,5 +1,5 @@
 """Work PathRenamer does on its own after renaming: download missing
-subtitles and ask Plex to scan. Plain functions without Qt, run in a
+subtitles and ask the media server to scan. Plain functions without Qt, run in a
 background thread by the window."""
 import os
 from pathlib import Path
@@ -60,12 +60,12 @@ def fetch_subtitles(client, video, languages, title="", year=None, season=None, 
     return saved
 
 
-def after_rename(videos, paths, media_type, subtitles=None, plex=None):
+def after_rename(videos, paths, media_type, subtitles=None, server=None):
     """The after-rename job. videos: [(candidate, new video path)] for
-    subtitle downloads; paths: every placed file, for the Plex scan.
-    subtitles: dict(client, languages, hearing_impaired) or None;
-    plex: a PlexClient or None. Returns (downloaded files, scanned library
-    names, problems worded for the user)."""
+    subtitle downloads; paths: every placed file, for the library scan.
+    subtitles: dict(client, languages, hearing_impaired) or None; server: a
+    media server client (Plex, Jellyfin, Emby or Kodi) or None. Returns
+    (downloaded files, scanned library names, problems worded for the user)."""
     downloaded, scanned, problems = [], [], []
     if subtitles:
         client = subtitles["client"]
@@ -80,9 +80,9 @@ def after_rename(videos, paths, media_type, subtitles=None, plex=None):
             problems.append(f"Subtitles: {e}")
         except OSError as e:
             problems.append(f"Subtitles: couldn't save a subtitle ({e.strerror or e}).")
-    if plex is not None:
+    if server is not None:
         try:
-            scanned = plex.scan([str(p) for p in list(paths) + downloaded], media_type)
-        except Exception as e:                   # PlexError, or a server answering nonsense
-            problems.append(f"Plex: {e}")
+            scanned = server.scan([str(p) for p in list(paths) + downloaded], media_type)
+        except Exception as e:                   # a server error, or a server answering nonsense
+            problems.append(f"{getattr(server, 'label', 'Media server')}: {e}")
     return downloaded, scanned, problems

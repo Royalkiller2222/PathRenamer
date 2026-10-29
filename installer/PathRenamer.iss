@@ -44,3 +44,12 @@ Name: "{autodesktop}\PathRenamer"; Filename: "{app}\PathRenamer.exe"; Tasks: des
 
 [Run]
 Filename: "{app}\PathRenamer.exe"; Description: "{cm:LaunchProgram,PathRenamer}"; Flags: nowait postinstall skipifsilent
+; One-click updates run this setup quietly with /relaunch=1: start the new version afterwards
+; (as the user who started the update, not as administrator)
+Filename: "{app}\PathRenamer.exe"; Flags: nowait runasoriginaluser; Check: ShouldRelaunch
+
+[Code]
+function ShouldRelaunch: Boolean;
+begin
+  Result := WizardSilent and (ExpandConstant('{param:relaunch|0}') = '1');
+end;

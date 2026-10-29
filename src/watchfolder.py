@@ -1,10 +1,7 @@
-"""Watch a folder (like Downloads) and report new videos once they are
-complete: their size and modification time stayed the same for a while and
-they can be opened. A download or copy that is still running is waited for.
-
-Files already in the folder when watching starts are left alone unless asked
-for. Scanning runs in a background thread, so a slow network drive never
-freezes the window.
+"""The window's watch folder: reports new videos once they are complete
+(see watchscan.py, which decides that). Scanning runs in a background
+thread, so a slow network drive never freezes the window, and folder
+change notifications make new files show up within seconds.
 """
 import os
 import threading
@@ -13,20 +10,9 @@ from pathlib import Path
 
 from PyQt6.QtCore import QFileSystemWatcher, QObject, QTimer, pyqtSignal
 
+from watchscan import Settler, scan_tree
+
 MAX_WATCHED_DIRS = 400          # operating systems limit how many folders can be watched
-
-
-def _key(path) -> str:
-    return os.path.normcase(os.path.normpath(str(path)))
-
-
-def _can_open(path) -> bool:
-    try:
-        with open(path, "rb") as f:
-            f.read(1)
-        return True
-    except OSError:
-        return False
 
 
 class FolderWatcher(QObject):
@@ -44,10 +30,7 @@ class FolderWatcher(QObject):
         self.max_depth = max_depth
         self._folder = None
         self._generation = 0
-        self._first = False
-        self._include_existing = False
-        self._known = set()                   # normcased paths already reported or ignored
-        self._pending = {}                    # normcased path -> (path, signature, seen since)
+        self._settler = Settler(settle_seconds)
         self._scanning = False
         self._again = False
         self._missing = False
@@ -71,9 +54,8 @@ class FolderWatcher(QObject):
             return False
         self._folder = folder
         self._generation += 1
-        self._first = True
-        self._include_existing = include_existing
-        self._known, self._pending, self._missing = set(), {}, False
+        self._settler = Settler(self.settle_seconds, include_existing)
+        self._missing = False
         self._poll.start(int(self.poll_seconds * 1000))
         self.check_now()
         return True
@@ -86,7 +68,7 @@ class FolderWatcher(QObject):
         dirs = self._fs.directories()
         if dirs:
             self._fs.removePaths(dirs)
-        self._pending = {}
+        self._settler.pending = {}
 
     def is_running(self):
         return self._folder is not None
@@ -96,10 +78,7 @@ class FolderWatcher(QObject):
 
     def ignore(self, paths):
         """Never report these files (e.g. ones the user already handled)."""
-        for p in paths:
-            k = _key(p)
-            self._known.add(k)
-            self._pending.pop(k, None)
+        self._settler.ignore(paths)
 
     def check_now(self):
         if self._folder is None:
@@ -108,7 +87,8 @@ class FolderWatcher(QObject):
             self._again = True
             return
         self._scanning = True
-        known = set(self._known)
+        self._settler.settle_seconds = self.settle_seconds
+        known = set(self._settler.known)
         threading.Thread(target=self._scan, args=(self._generation, str(self._folder), known),
                          daemon=True).start()
 
@@ -119,30 +99,9 @@ class FolderWatcher(QObject):
 
     # ── scanning (background thread) ─────────────────────────────────
     def _scan(self, generation, folder, known):
-        result = None
         try:
-            if os.path.isdir(folder):
-                files, dirs = {}, [folder]
-                base = folder.rstrip("\\/").count(os.sep)
-                for root, dnames, fnames in os.walk(folder):
-                    depth = root.rstrip("\\/").count(os.sep) - base
-                    dnames[:] = ([d for d in sorted(dnames) if not d.startswith(".") and not self.skip_dir(d)]
-                                 if depth < self.max_depth else [])
-                    dirs.extend(os.path.join(root, d) for d in dnames)
-                    for name in fnames:
-                        if name.startswith("."):
-                            continue
-                        path = os.path.join(root, name)
-                        k = _key(path)
-                        if k in known or not self.accept(Path(path)):
-                            continue
-                        try:
-                            st = os.stat(path)
-                        except OSError:
-                            continue
-                        files[k] = (path, (st.st_size, st.st_mtime_ns), st.st_size > 0 and _can_open(path))
-                result = (files, dirs)
-        except Exception:                     # a folder vanished mid-walk: try again next time
+            result = scan_tree(folder, self.accept, self.skip_dir, self.max_depth, known)
+        except Exception:                     # never let a scan error stop watching
             result = ({}, [])
         try:
             self._scanned.emit(generation, result)
@@ -163,36 +122,16 @@ class FolderWatcher(QObject):
                 self.error.emit(f"The watch folder is missing: {self._folder}. "
                                 "Watching resumes when it is back.")
             return
-        if self._missing:
-            self._missing = False
+        self._missing = False
         files, dirs = result
-        if self._first:
-            self._first = False
-            if not self._include_existing:
-                self._known.update(files)
-                files = {}
         now = time.monotonic()
-        ready = []
-        for k, (path, signature, readable) in files.items():
-            if k in self._known:
-                continue
-            seen = self._pending.get(k)
-            if seen is None or seen[1] != signature:
-                self._pending[k] = (path, signature, now)
-            elif readable and now - seen[2] >= self.settle_seconds:
-                ready.append(path)
-        for k in list(self._pending):
-            if k not in files:
-                del self._pending[k]          # gone (or renamed by its download client)
+        ready = self._settler.update(files, now)
         self._watch_dirs(dirs)
         if ready:
-            self.ignore(ready)
-            self.files_ready.emit([Path(p) for p in sorted(ready)])
-        if self._pending:
-            # look again when the next file could be ready; a file that is
-            # done but still locked (being copied) is retried every few seconds
-            wait = min(seen + self.settle_seconds - now for _, _, seen in self._pending.values())
-            self._check_in(wait + 0.2 if wait > 0 else 5.0)
+            self.files_ready.emit([Path(p) for p in ready])
+        wait = self._settler.next_check(now)
+        if wait is not None:
+            self._check_in(wait)
         if self._again:
             self._again = False
             self.check_now()

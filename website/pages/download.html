@@ -1,6 +1,6 @@
 <!--meta
 {"title": "Download PathRenamer for Windows",
- "description": "Download PathRenamer {{ version }} for Windows 10 and 11. Install in a minute, pick your Plex library folders, and rename your first downloads.",
+ "description": "Download PathRenamer {{ version }} for Windows 10 and 11, or run it with Docker on a server or NAS. Pick your library folders and rename your first downloads.",
  "path": "/download/", "priority": 0.9, "schema": ["software"],
  "crumbs": [["/", "Home"], ["/download/", "Download"]]}
 -->
@@ -8,7 +8,7 @@
   <div class="page-head">
     <span class="eyebrow">Download</span>
     <h1>Get PathRenamer {{ version }}</h1>
-    <p class="lead">For Windows 10 and 11. Renaming is free; the automatic Pro features are unlocked during early access.</p>
+    <p class="lead">For Windows 10 and 11, and for servers and NAS boxes <a href="#docker">with Docker</a>. Renaming is free. {{ pro_now }}</p>
     <div class="actions">
       <a class="button primary" href="{{ download_url }}">Download from GitHub</a>
       <span class="small">Pick <strong>PathRenamer-Setup-{{ version }}.exe</strong> under <em>Assets</em>.</span>
@@ -22,7 +22,7 @@
     <li>Start PathRenamer and choose your library folders (TV Shows, Movies, Anime) when it asks.</li>
     <li>Drop a downloads folder on the window, click <strong>Preview</strong>, then <strong>Rename Files</strong>.</li>
   </ol>
-  <p>Updating? Run the new installer: it keeps your settings and rename history. Prefer no installer? <strong>PathRenamer.exe</strong> on the same page runs on its own.</p>
+  <p>Updating is one click: when a new version is out, <strong>Update to …</strong> appears at the bottom right of PathRenamer. Click it and the new version is downloaded, checked and installed, with your settings and rename history kept. Prefer no installer? <strong>PathRenamer.exe</strong> on the same page runs on its own, and updates itself the same way.</p>
 
   <img class="shot" src="{{ root }}img/app-light.webp" width="1280" height="800" loading="lazy"
        alt="PathRenamer in the Light theme, previewing new names for five movies">
@@ -30,6 +30,24 @@
   <div class="callout">
     <p>New to Plex naming? Read <a href="{{ root }}guides/plex-naming/">how to name movies and TV shows for Plex</a>. PathRenamer does all of it for you, but it helps to know what good names look like.</p>
   </div>
+
+  <h2 id="docker">On a server, NAS, Linux or Mac: Docker</h2>
+  <p>The Docker version names files exactly like the Windows app and has every free feature. With Pro it renames new downloads on its own. Save this as <code>docker-compose.yml</code>, change the folders on the left of each <code>:</code>, and run <code>docker compose up -d</code>:</p>
+  <pre><code>services:
+  pathrenamer:
+    image: ghcr.io/royalkiller2222/pathrenamer:latest
+    restart: unless-stopped
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      PATHRENAMER_WATCH: /data/downloads
+      PATHRENAMER_MOVIES: /data/media/movies
+      PATHRENAMER_TV: /data/media/tv
+      PATHRENAMER_ACTION: hardlink
+    volumes:
+      - ./pathrenamer-config:/config
+      - /srv/data:/data</code></pre>
+  <p>Rename by hand with <code>docker compose exec pathrenamer pathrenamer rename /data/downloads</code>. Everything else, from media servers to Pro, is in the <a href="{{ repo_url }}/blob/main/DOCKER.md">Docker guide</a>.</p>
 
   <h2>What's new in {{ version }}</h2>
   <div class="notes">
@@ -41,6 +59,7 @@
   <ul>
     <li>Windows 10 or 11, 64-bit</li>
     <li>An internet connection to look up titles, episode names and subtitles</li>
-    <li>Plex Media Server is optional: the names work for Jellyfin and Emby too</li>
+    <li>A media server is optional: the names work for Plex, Jellyfin, Emby and Kodi, and PathRenamer can ask any of them to scan</li>
+    <li>Docker version: any 64-bit Intel, AMD or ARM computer with Docker</li>
   </ul>
 </div>
