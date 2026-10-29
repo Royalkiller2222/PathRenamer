@@ -1,0 +1,4 @@
+# Only the Python files go into the image
+*
+!src/*.py
+!src/requirements-cli.txt

@@ -8,18 +8,26 @@ The Python source is in [`src/`](src/):
 
 | File | Purpose |
 | --- | --- |
-| `src/main.py` | The app: window layouts, metadata lookups, renaming, subtitles |
+| `src/main.py` | The Windows app: window, dialogs, tray |
+| `src/core.py` | The engine without a window: settings, scanning, matching, naming, renaming |
+| `src/version.py` | The version number (`APP_VERSION`) |
 | `src/parser.py` | Reads title, year, season and episode from release names and folders |
 | `src/scanner.py` | Subtitle language/flag detection and Plex subtitle names |
 | `src/themes.py` | Colour themes (palettes) and the stylesheets built from them |
 | `src/history.py` | Rename history kept on disk, for undo |
 | `src/mediainfo.py` | Resolution and codecs read from MKV / MP4 / AVI headers |
-| `src/watchfolder.py` | Watch folder: reports new videos once they finished arriving |
+| `src/watchscan.py` | Watch folder logic without Qt: which new videos finished arriving |
+| `src/watchfolder.py` | The window's watch folder (runs watchscan in a thread) |
+| `src/mediaservers.py` | Jellyfin, Emby and Kodi scans; matching files to library folders |
 | `src/plex.py` | Plex scans and Sign in with Plex |
 | `src/opensubs.py` | OpenSubtitles.com search and download |
-| `src/automation.py` | After-rename jobs: subtitles, then the Plex scan |
-| `src/licensing.py` | Free / Pro: trial and Polar license keys |
-| `src/secret.py` | Encrypts the Plex token and passwords in config.json (Windows DPAPI) |
+| `src/automation.py` | After-rename jobs: subtitles, then the media server scan |
+| `src/licensing.py` | Free / Pro: trial, Polar license keys, the sealed license state |
+| `src/secret.py` | Encrypts tokens and passwords in config.json (Windows DPAPI) |
+| `src/updates.py` | Update check on GitHub, verified download, installing it |
+| `src/startup.py` | Start with Windows (the Run key in the registry) |
+| `src/cli.py` | The command line and Docker version (`pathrenamer rename`, `watch`, …) |
+| `src/docker_start.py` | Docker entry point: runs the CLI as PUID/PGID |
 | `src/newicon.ico` | App and window icon |
 | `src/build_exe.bat` | Builds `dist\PathRenamer.exe` with PyInstaller |
 
@@ -35,6 +43,36 @@ cd src
 pip install -r requirements.txt
 python main.py
 ```
+
+The command line version needs no PyQt6:
+
+```
+pip install -r src/requirements-cli.txt
+python src/cli.py --help
+```
+
+### Docker
+
+`Dockerfile` builds the command line version on `python:3.13-slim`
+(`docker build -t pathrenamer .`). The image's entry point is
+`docker_start.py`, which runs `cli.py` as `PUID`/`PGID`; settings live in
+`/config` (`PATHRENAMER_CONFIG_DIR`). `.github/workflows/docker.yml` builds
+and tries the image on every pull request; publishing a release pushes it to
+`ghcr.io/royalkiller2222/pathrenamer` for amd64 and arm64 (the `docker` job in
+`release.yml`). One-time setup after the first release: on GitHub open your
+profile → **Packages** → **pathrenamer** → **Package settings** → **Change
+visibility** → **Public**, so people can pull it without signing in.
+
+### Updates
+
+`updates.py` asks `api.github.com/repos/Royalkiller2222/PathRenamer/releases/latest`
+for the newest release, picks `PathRenamer-Setup-*.exe` (installed copies) or
+`PathRenamer.exe` (portable copies), and checks the download's size and the
+SHA-256 GitHub publishes for each release file. The installer then runs with
+`/SILENT /CLOSEAPPLICATIONS /relaunch=1`; `installer/PathRenamer.iss` starts
+the new version afterwards as the user. A portable exe is swapped in by a
+small script once PathRenamer has closed. Copies run from source open the
+release page.
 
 ### How this source was recovered
 
@@ -66,12 +104,14 @@ Releases are built by GitHub Actions (`.github/workflows/release.yml`) on Window
 with Python 3.13 and the versions in `src/requirements-lock.txt`. Everything is
 done on the GitHub website:
 
-1. Make sure `APP_VERSION` in `src/main.py` is the new version and
+1. Make sure `APP_VERSION` in `src/version.py` is the new version and
    `RELEASE_NOTES.md` describes it (the release page shows that text).
 2. Open the **Actions** tab, click **Release** on the left, then
    **Run workflow** → **Run workflow** (branch `main`).
 3. After about five minutes the run turns green and **Releases** has
    "Version X.Y.Z" with `PathRenamer-Setup-X.Y.Z.exe` and `PathRenamer.exe`.
+   The Docker image is pushed to ghcr.io in the same run. Everyone with
+   1.6.0 or newer sees "Update to X.Y.Z" in the app within a day.
 
 The workflow runs the tests, builds `PathRenamer.exe` with PyInstaller and
 `PathRenamer-Setup-<version>.exe` with Inno Setup (`installer/PathRenamer.iss`),
@@ -84,8 +124,20 @@ attached a few minutes later.
 ## Pro, licensing and the app's API keys
 
 Renaming by hand is free. The automatic parts (watch-folder auto-rename,
-subtitles after renaming, Plex scan after renaming) are Pro. Turning one on
-starts a 14-day trial (`trial_started` in config.json).
+subtitles after renaming, media server scan after renaming) are Pro. Turning
+one on starts a 14-day trial; in Docker, `pathrenamer watch` starts it.
+
+The license and trial live sealed in config.json under `license_state`:
+encrypted with DPAPI for the Windows user, or signed with HMAC-SHA256 and a
+random key in `seal.key` next to the settings (Docker, Linux). Plain
+`license_*` or `trial_started` values are ignored and removed. Activations
+send Polar `conditions: {"machine": <hash>}` (a SHA-256 of the Windows
+MachineGuid, or of the install's key), so Polar only validates them on that
+computer. On Windows the trial's start is also kept in
+`HKCU\Software\PathRenamer` (value `State`), and the latest time seen is kept
+so setting the clock back doesn't help. See `src/licensing.py`. The code is
+GPL, so anyone can build a copy without the checks; the official builds are
+what Pro pays for.
 
 Licensing is **off** until an organization ID is set: then every feature is
 unlocked ("early access"). The release build writes `src/build_info.py` (not in
@@ -104,6 +156,8 @@ To start selling Pro:
    merchant of record: it takes the payment and handles sales tax and VAT.
 2. Add a product "PathRenamer Pro" with a **License Keys** benefit. Set an
    activation limit (for example 3 computers) so keys can't be shared widely.
+   Fill in a support email in your Polar settings: buyers use it for refunds
+   (14 days, no questions asked).
 3. Copy the organization ID into the `POLAR_ORGANIZATION_ID` variable, and the
    product's checkout link into `website/site.json` (`checkout_url`).
 4. Release a new version. Keys are checked with Polar's public customer-portal

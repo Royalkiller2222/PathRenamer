@@ -5,33 +5,24 @@ Also signs in with a Plex account the way other Plex apps do (a code shown on
 plex.tv), which finds the server address and token for the user.
 """
 import xml.etree.ElementTree as ET
-from pathlib import PureWindowsPath, PurePosixPath
 from urllib.parse import urlencode
 
 import requests
+
+from mediaservers import MediaServerError, map_folders
 
 PRODUCT = "PathRenamer"
 PLEX_TV = "https://plex.tv/api/v2"
 SIGN_IN_PAGE = "https://app.plex.tv/auth#?"
 
 
-class PlexError(Exception):
+class PlexError(MediaServerError):
     """Something the user can act on, worded for them."""
 
 
-def _norm(path) -> str:
-    """'D:\\Plex\\Movies\\' and 'd:/plex/movies' compare equal."""
-    return str(path).replace("\\", "/").rstrip("/").lower()
-
-
-def _parent(path) -> str:
-    text = str(path)
-    if "\\" in text or (len(text) > 1 and text[1] == ":"):
-        return str(PureWindowsPath(text).parent)
-    return str(PurePosixPath(text).parent)
-
-
 class PlexClient:
+    label = "Plex"
+
     def __init__(self, base_url, token, session=None, timeout=10.0):
         url = (base_url or "").strip().rstrip("/")
         if url and "://" not in url:
@@ -41,8 +32,12 @@ class PlexClient:
         self.s = session or requests.Session()
         self.timeout = timeout
 
+    @property
+    def configured(self):
+        return bool(self.base_url and self.token)
+
     def _get(self, path, params=None):
-        if not self.base_url or not self.token:
+        if not self.configured:
             raise PlexError("Plex isn't set up yet: add your server and sign in under Settings → Automation.")
         try:
             r = self.s.get(self.base_url + path, params=params, timeout=self.timeout,
@@ -73,44 +68,28 @@ class PlexClient:
                         "locations": [loc.get("path") for loc in d.findall("Location") if loc.get("path")]})
         return out
 
+    libraries = sections
+
     def scan(self, paths, media_type=None):
         """Scan the folders holding these files (new names). Files outside every
         library folder (e.g. Plex sees the drive by another path) get their
         whole library of that kind scanned instead. Returns the names of the
         libraries asked to scan."""
         sections = self.sections()
-        jobs = {}                          # key -> [title, set of folders or None for all]
-        unmatched = False
-        for p in paths:
-            folder = _parent(p)
-            n_folder = _norm(folder)
-            found = False
-            for sec in sections:
-                for loc in sec["locations"]:
-                    n_loc = _norm(loc)
-                    if n_folder != n_loc and not n_folder.startswith(n_loc + "/"):
-                        continue
-                    rest = folder.replace("\\", "/").rstrip("/")[len(n_loc):].strip("/")
-                    sep = "\\" if "\\" in loc or (len(loc) > 1 and loc[1] == ":") else "/"
-                    server_folder = loc.rstrip("\\/") + (sep + rest.replace("/", sep) if rest else "")
-                    job = jobs.setdefault(sec["key"], [sec["title"], set()])
-                    if job[1] is not None:
-                        job[1].add(server_folder)
-                    found = True
-            unmatched = unmatched or not found
+        jobs, unmatched = map_folders(paths, sections)
+        whole = []
         if unmatched:
             kind = {"movie": "movie", "tv": "show", "anime": "show"}.get(media_type)
-            for sec in sections:
-                if sec["type"] == kind or (kind is None and sec["type"] in ("movie", "show")):
-                    jobs[sec["key"]] = [sec["title"], None]
-        for key, (title, folders) in jobs.items():
-            if folders is None:
-                self._get(f"/library/sections/{key}/refresh")
-            else:
-                for folder in sorted(folders):
-                    self._get(f"/library/sections/{key}/refresh", {"path": folder})
-        return sorted(title for title, _ in jobs.values())
-
+            whole = [sec for sec in sections
+                     if sec["type"] == kind or (kind is None and sec["type"] in ("movie", "show"))]
+        for sec in whole:
+            self._get(f"/library/sections/{sec['key']}/refresh")
+        for key, (sec, folders) in jobs.items():
+            if any(w["key"] == key for w in whole):
+                continue
+            for folder in sorted(folders):
+                self._get(f"/library/sections/{key}/refresh", {"path": folder})
+        return sorted({sec["title"] for sec in whole} | {sec["title"] for sec, _ in jobs.values()})
 
     def scan_all(self):
         """Scan every movie and TV library. Returns their names."""

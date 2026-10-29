@@ -99,5 +99,6 @@ def test_old_default_movie_format_is_upgraded(main, tmp_path, monkeypatch, old):
     import json
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps({"format_movie": old}))
-    monkeypatch.setattr(main, "CONFIG_PATH", cfg_path)
+    import core
+    monkeypatch.setattr(core, "CONFIG_PATH", cfg_path)
     assert main.cfg_load()["format_movie"] == main.DEFAULTS["format_movie"]

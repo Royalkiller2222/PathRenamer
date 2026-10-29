@@ -1,4 +1,4 @@
-"""After a rename: missing subtitles are downloaded with Plex names and Plex
+"""After a rename: missing subtitles are downloaded with Plex names and the media server
 is asked to scan."""
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,6 +72,8 @@ def test_never_overwrites(tmp_path):
 
 
 class FakePlex:
+    label = "Plex"
+
     def __init__(self, error=None):
         self.scans, self.error = [], error
 
@@ -88,7 +90,7 @@ def test_after_rename_downloads_then_scans(tmp_path):
     client = FakeSubs([SubtitleResult(9, "eng")])
     plex = FakePlex()
     downloaded, scanned, problems = after_rename(
-        [(cand, v)], [v], "movie", subtitles={"client": client, "languages": ["eng"]}, plex=plex)
+        [(cand, v)], [v], "movie", subtitles={"client": client, "languages": ["eng"]}, server=plex)
     assert [p.name for p in downloaded] == ["Heat (1995).eng.srt"]
     assert client.logins == 1 and client.searches[0]["year"] == "1995"
     assert scanned == ["Movies"] and plex.scans == [(["Heat (1995).eng.srt", "Heat (1995).mkv"], "movie")]
@@ -101,7 +103,7 @@ def test_after_rename_reports_problems_and_still_scans(tmp_path):
     client = FakeSubs([SubtitleResult(9, "eng")], fail_on_download=OpenSubtitlesError("limit reached"))
     plex = FakePlex()
     downloaded, scanned, problems = after_rename(
-        [(cand, v)], [v], "movie", subtitles={"client": client, "languages": ["eng"]}, plex=plex)
+        [(cand, v)], [v], "movie", subtitles={"client": client, "languages": ["eng"]}, server=plex)
     assert downloaded == [] and scanned == ["Movies"] and problems == ["Subtitles: limit reached"]
-    _, scanned, problems = after_rename([], [v], "movie", plex=FakePlex(error=RuntimeError("Plex is off")))
+    _, scanned, problems = after_rename([], [v], "movie", server=FakePlex(error=RuntimeError("Plex is off")))
     assert scanned == [] and problems == ["Plex: Plex is off"]

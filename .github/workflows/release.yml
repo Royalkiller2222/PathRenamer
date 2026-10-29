@@ -2,7 +2,7 @@
 # GitHub Release.
 #
 # The easy way: on GitHub open Actions > Release > "Run workflow" > Run.
-# It reads the version from APP_VERSION in src/main.py, builds, and publishes
+# It reads the version from APP_VERSION in src/version.py, builds, and publishes
 # release "V<version>" with RELEASE_NOTES.md as its text. A tag left behind by
 # a deleted release is moved to the new build.
 #
@@ -12,6 +12,9 @@
 #
 # On pull requests it only builds (the exe and installer are downloadable from
 # the run's artifacts), so a broken build shows up before release.
+#
+# A published release also pushes the Docker image (the command line version)
+# to ghcr.io/royalkiller2222/pathrenamer, tagged latest and with the version.
 name: Release
 
 on:
@@ -47,11 +50,11 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          $v = (Select-String -Path src/main.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          $v = (Select-String -Path src/version.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
           "version=$v" >> $env:GITHUB_OUTPUT
           # Tags may be v1.3.0 or V1.3.0 (PowerShell compares case-insensitively)
           if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$v") {
-            throw "Tag ${{ github.ref_name }} does not match APP_VERSION $v in src/main.py"
+            throw "Tag ${{ github.ref_name }} does not match APP_VERSION $v in src/version.py"
           }
 
       - name: Run tests
@@ -121,7 +124,7 @@ jobs:
             gh release upload $tag @files --repo $repo --clobber
           } elseif ($exists) {
             throw ("Release $tag already exists. To publish a new version, raise APP_VERSION in " +
-                   "src/main.py first, or delete release $tag on GitHub and run this again.")
+                   "src/version.py first, or delete release $tag on GitHub and run this again.")
           } else {
             if (-not $fromTag) {
               # A tag left behind by a deleted release: point it at this build
@@ -137,3 +140,51 @@ jobs:
           }
           if ($LASTEXITCODE -ne 0) { throw "Publishing release $tag failed" }
           Write-Host "Published: https://github.com/$repo/releases/tag/$tag"
+
+  docker:
+    needs: build
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read app version
+        id: ver
+        run: echo "version=$(sed -n 's/^APP_VERSION = "\(.*\)"$/\1/p' src/version.py)" >> "$GITHUB_OUTPUT"
+
+      - name: Add the app's API keys
+        env:
+          OPENSUBTITLES_API_KEY: ${{ secrets.OPENSUBTITLES_API_KEY }}
+          POLAR_ORGANIZATION_ID: ${{ vars.POLAR_ORGANIZATION_ID }}
+          POLAR_PORTAL_URL: ${{ vars.POLAR_PORTAL_URL }}
+        run: |
+          python3 - <<'PY'
+          import os
+          with open("src/build_info.py", "w", encoding="utf-8") as f:
+              f.write("# Written by the release build. Not in git.\n")
+              for name in ("OPENSUBTITLES_API_KEY", "POLAR_ORGANIZATION_ID", "POLAR_PORTAL_URL"):
+                  value = (os.environ.get(name) or "").replace("\\", "").replace("'", "")
+                  f.write(f"{name} = '{value}'\n")
+          PY
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Intel/AMD servers and ARM boxes (Raspberry Pi, many NAS models)
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/royalkiller2222/pathrenamer:latest
+            ghcr.io/royalkiller2222/pathrenamer:${{ steps.ver.outputs.version }}
