@@ -1,0 +1,52 @@
+# Builds the website (website/) and publishes it with GitHub Pages.
+#
+# One-time setup on GitHub: Settings > Pages > Build and deployment >
+# Source: "GitHub Actions". The site is then at
+# https://royalkiller2222.github.io/PathRenamer/ after every push to main
+# that changes it. Pull requests only build it (broken links fail the check).
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths: ["website/**", "src/main.py", "RELEASE_NOTES.md", ".github/workflows/pages.yml"]
+  pull_request:
+    paths: ["website/**", "src/main.py", "RELEASE_NOTES.md", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # page dates come from git history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build the site
+        run: python website/build.py
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: website/_site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

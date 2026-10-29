@@ -1,0 +1,90 @@
+<!--meta
+{"title": "PathRenamer: Rename Movies and TV Shows for Plex (Free for Windows)",
+ "description": "Free Windows app that renames movies, TV shows and anime for Plex, takes subtitles along, and can rename new downloads automatically.",
+ "path": "/", "class": "home", "priority": 1.0, "schema": ["software", "website"]}
+-->
+<section class="hero">
+  <div class="wrap">
+    <span class="eyebrow">For Plex on Windows</span>
+    <h1>Messy downloads in.<br>Clean Plex library out.</h1>
+    <p class="lead">PathRenamer renames your movies, TV shows and anime the way Plex expects, takes their subtitles along, and can do it on its own the moment a download finishes.</p>
+    <div class="actions">
+      <a class="button primary" href="{{ root }}download/">Download for Windows</a>
+      <a class="button" href="#how-it-works">See how it works</a>
+    </div>
+    <p class="small">Version {{ version }} · Windows 10 and 11 · Renaming is free</p>
+    <img class="shot" src="{{ root }}img/app-dark.webp" width="1280" height="800" fetchpriority="high"
+         alt="PathRenamer showing a preview of movie downloads with their new Plex names, subtitles found and a conflict marked in red">
+  </div>
+</section>
+
+<section class="alt" id="how-it-works">
+  <div class="wrap">
+    <span class="eyebrow">What it does</span>
+    <h2>From release names to names Plex understands</h2>
+    <p class="lead">Release names are full of tags Plex can't use. PathRenamer finds the real title, year and episode, looks up episode titles, and builds the folders for you.</p>
+    <div class="rename">
+      <div class="row">
+        <div class="from">Downloads/The.Office.US.S02E01.720p.WEB-DL.x264-GRP.mkv</div>
+        <div class="arrow" aria-hidden="true">→</div>
+        <div class="to">TV Shows/The Office (2005)/Season 02/The Office S02E01 - The Dundies.mkv</div>
+      </div>
+      <div class="row">
+        <div class="from">Downloads/Dune.2021.1080p.WEBRip.x264-RARBG/Dune.2021.1080p.WEBRip.x264-RARBG.mp4<br>…/Subs/2_English.srt<br>…/Subs/4_Spanish (Latin America).srt</div>
+        <div class="arrow" aria-hidden="true">→</div>
+        <div class="to">Movies/Dune (2021)/Dune (2021) 1080p H.264.mp4<br>Dune (2021) 1080p H.264.eng.srt<br>Dune (2021) 1080p H.264.spa.srt</div>
+      </div>
+      <div class="row">
+        <div class="from">Downloads/[Group] Some Anime - 12 (1080p) [ABCD1234].mkv</div>
+        <div class="arrow" aria-hidden="true">→</div>
+        <div class="to">Anime/Some Anime (2023)/Season 01/Some Anime S01E12 - Episode Title.mkv</div>
+      </div>
+    </div>
+    <div class="steps">
+      <div class="card"><h3>Pick your downloads</h3><p>Drop a folder or files on the window, and choose TV Shows, Movies or Anime.</p></div>
+      <div class="card"><h3>Check the preview</h3><p>Every new name is shown before anything moves. Anything unsure is marked, and one right-click fixes a row.</p></div>
+      <div class="card"><h3>Rename</h3><p>Files move (or copy, or hard-link) into your library with their subtitles. Changed your mind? Undo.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="eyebrow">Features</span>
+    <h2>Everything a tidy Plex library needs</h2>
+    <div class="grid three">
+      <div class="card"><h3>Plex-ready names</h3><p>Movies, TV shows, anime, multi-episode files, daily shows, specials and movie editions, named the way Plex matches them.</p></div>
+      <div class="card"><h3>Subtitles come along</h3><p>Subtitles next to the video or in a Subs folder get the right language code: <code>.eng.srt</code>, <code>.spa.forced.srt</code>, <code>.eng.sdh.srt</code>.</p></div>
+      <div class="card"><h3>Download missing subtitles</h3><p>Get subtitles from OpenSubtitles.com in your languages. The ones made for your exact file come first.</p></div>
+      <div class="card"><h3>Watch folder <span class="badge">PRO</span></h3><p>Point it at Downloads. New movies and episodes are renamed into your library as soon as they finish downloading.</p></div>
+      <div class="card"><h3>Plex scans right away <span class="badge">PRO</span></h3><p>Sign in with Plex once. After each rename, Plex scans just the folders that changed, so new episodes appear in seconds.</p></div>
+      <div class="card"><h3>Keep seeding</h3><p>Hard links put files in your library without moving the download or using extra space, so torrents keep seeding.</p></div>
+      <div class="card"><h3>Undo anything</h3><p>Undo the last rename, or any earlier one from the rename history, even after a restart.</p></div>
+      <div class="card"><h3>Quality from the file</h3><p>No tags in the name? Resolution and codecs are read from the video itself: <em>Home Video (2019) 1080p H.264</em>.</p></div>
+      <div class="card"><h3>Make it yours</h3><p>Naming formats, presets, a Modern or Classic layout, and dark, light or custom themes.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap split">
+    <div>
+      <span class="eyebrow">Automation</span>
+      <h2>Downloads that file themselves</h2>
+      <p>Turn on the watch folder and PathRenamer waits until each download is complete, matches it, and renames it into the right library folder. Files it isn't sure about wait in the preview for you.</p>
+      <p>Then it fetches missing subtitles and tells Plex to scan. You just press play.</p>
+      <p><a href="{{ root }}pricing/">Free and Pro, explained →</a></p>
+    </div>
+    <img src="{{ root }}img/app-automation.webp" width="760" height="560" loading="lazy"
+         alt="PathRenamer settings page with the watch folder set to D:/Downloads, automatic renaming turned on, and the Plex connection">
+  </div>
+</section>
+
+<section>
+  <div class="wrap narrow">
+    <span class="eyebrow">Questions</span>
+    <h2>Before you download</h2>
+    {{ faq_top }}
+    <div class="actions"><a class="button primary" href="{{ root }}download/">Download PathRenamer</a><a href="{{ root }}faq/">All questions</a></div>
+  </div>
+</section>
