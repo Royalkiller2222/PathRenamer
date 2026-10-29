@@ -124,3 +124,7 @@ Prices, links and the address live in `website/site.json`.
 
 One-time setup: **Settings → Pages → Build and deployment → Source: GitHub
 Actions**. The site is then at https://royalkiller2222.github.io/PathRenamer/.
+
+## License
+
+GPL-3.0 (see `LICENSE`). PyQt6 is itself GPL-3.0 (or a paid Riverbank license), so any build that ships PyQt6 must stay GPL-compatible. guessit (LGPL-3.0), rapidfuzz (MIT) and requests (Apache-2.0) are compatible. Moving to a closed license would mean buying a PyQt6 commercial license or switching to PySide6 (LGPL).

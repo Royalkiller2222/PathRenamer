@@ -2181,6 +2181,14 @@ class SettingsDialog(QDialog):
         credits.setStyleSheet("color: #888; font-size: 11px; margin-top: 8px;")
         gl.addWidget(credits)
 
+        license_note = QLabel('PathRenamer is free software under the GNU General Public License v3.0 '
+                              '(<a href="https://github.com/Royalkiller2222/PathRenamer/blob/main/LICENSE">license</a>, '
+                              '<a href="https://github.com/Royalkiller2222/PathRenamer">source code</a>).')
+        license_note.setWordWrap(True)
+        license_note.setOpenExternalLinks(True)
+        license_note.setStyleSheet("color: #888; font-size: 11px; margin-top: 8px;")
+        gl.addWidget(license_note)
+
         version = QLabel(f"Version: {APP_VERSION}")
         version.setStyleSheet("color: #666; font-size: 11px; margin-top: 8px;")
         gl.addWidget(version)

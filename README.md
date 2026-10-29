@@ -43,3 +43,6 @@ Everything you do by hand is free, forever. **PathRenamer Pro** adds the parts t
 
 Turning on a Pro feature starts a free 14-day trial. During early access every feature is unlocked.
 
+## License
+
+PathRenamer is free software under the [GNU General Public License v3.0](LICENSE): you may use, study, share and change it, and anything you share that is built from it must stay under the same license. PathRenamer Pro is a paid license key for the automatic features; buying it supports development.
