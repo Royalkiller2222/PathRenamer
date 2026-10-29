@@ -10,6 +10,7 @@ build. The build fails on a link to a page or file that doesn't exist.
 """
 import html
 import json
+import random
 import re
 import shutil
 import subprocess
@@ -177,6 +178,18 @@ def nav_links(root, current):
     return "".join(links)
 
 
+def stars_css(seed=1729):
+    """The star background's positions: random but the same on every build
+    (like the Sass function in the CodePen it comes from)."""
+    rnd = random.Random(seed)
+
+    def field(n):
+        return ", ".join(f"{rnd.randint(0, 2560)}px {rnd.randint(0, 2000)}px #fff" for _ in range(n))
+    return ("/* Star positions for the background (see style.css). Made by build.py. */\n"
+            + "".join(f".starfield .s{i} {{ box-shadow: {field(n)}; }}\n"
+                      for i, n in ((1, 700), (2, 200), (3, 100))))
+
+
 def build():
     site = json.loads((HERE / "site.json").read_text(encoding="utf-8"))
     faq = json.loads((HERE / "faq.json").read_text(encoding="utf-8"))
@@ -226,6 +239,7 @@ def build():
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
         "".join(f"  <url><loc>{html.escape(u)}</loc><lastmod>{d}</lastmod><priority>{p}</priority></url>\n"
                 for u, d, p in sitemap) + "</urlset>\n", encoding="utf-8")
+    (OUT / "stars.css").write_text(stars_css(), encoding="utf-8")
     (OUT / "robots.txt").write_text(f"User-agent: *\nAllow: /\n\nSitemap: {base}sitemap.xml\n", encoding="utf-8")
     (OUT / ".nojekyll").write_text("", encoding="utf-8")
     if site.get("custom_domain"):
