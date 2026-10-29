@@ -1,0 +1,46 @@
+<!--meta
+{"title": "Download PathRenamer for Windows",
+ "description": "Download PathRenamer {{ version }} for Windows 10 and 11. Install in a minute, pick your Plex library folders, and rename your first downloads.",
+ "path": "/download/", "priority": 0.9, "schema": ["software"],
+ "crumbs": [["/", "Home"], ["/download/", "Download"]]}
+-->
+<div class="wrap narrow">
+  <div class="page-head">
+    <span class="eyebrow">Download</span>
+    <h1>Get PathRenamer {{ version }}</h1>
+    <p class="lead">For Windows 10 and 11. Renaming is free; the automatic Pro features are unlocked during early access.</p>
+    <div class="actions">
+      <a class="button primary" href="{{ download_url }}">Download from GitHub</a>
+      <span class="small">Pick <strong>PathRenamer-Setup-{{ version }}.exe</strong> under <em>Assets</em>.</span>
+    </div>
+  </div>
+
+  <h2>Install in four steps</h2>
+  <ol>
+    <li>Open the <a href="{{ download_url }}">latest release</a> and download <strong>PathRenamer-Setup-{{ version }}.exe</strong>.</li>
+    <li>Run it. If Windows shows <em>Windows protected your PC</em>, click <strong>More info</strong>, then <strong>Run anyway</strong>. That warning appears for apps from new publishers without a paid code-signing certificate; the installer is built by GitHub from the <a href="{{ repo_url }}">public source code</a>.</li>
+    <li>Start PathRenamer and choose your library folders (TV Shows, Movies, Anime) when it asks.</li>
+    <li>Drop a downloads folder on the window, click <strong>Preview</strong>, then <strong>Rename Files</strong>.</li>
+  </ol>
+  <p>Updating? Run the new installer: it keeps your settings and rename history. Prefer no installer? <strong>PathRenamer.exe</strong> on the same page runs on its own.</p>
+
+  <img class="shot" src="{{ root }}img/app-light.webp" width="1280" height="800" loading="lazy"
+       alt="PathRenamer in the Light theme, previewing new names for five movies">
+
+  <div class="callout">
+    <p>New to Plex naming? Read <a href="{{ root }}guides/plex-naming/">how to name movies and TV shows for Plex</a>. PathRenamer does all of it for you, but it helps to know what good names look like.</p>
+  </div>
+
+  <h2>What's new in {{ version }}</h2>
+  <div class="notes">
+    {{ release_notes }}
+  </div>
+  <p class="small">Every version and its changes: <a href="{{ repo_url }}/releases">release history</a>.</p>
+
+  <h2>Requirements</h2>
+  <ul>
+    <li>Windows 10 or 11, 64-bit</li>
+    <li>An internet connection to look up titles, episode names and subtitles</li>
+    <li>Plex Media Server is optional: the names work for Jellyfin and Emby too</li>
+  </ul>
+</div>

@@ -7,3 +7,4 @@ dist/
 .venv/
 venv/
 src/build_info.py
+website/_site/

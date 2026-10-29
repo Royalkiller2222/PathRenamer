@@ -1,0 +1,60 @@
+<!--meta
+{"title": "FileBot Alternative for Plex on Windows: PathRenamer",
+ "h1": "A FileBot alternative for Plex on Windows",
+ "description": "Looking for a FileBot alternative? PathRenamer renames movies, TV shows and anime for Plex on Windows, and renaming is free. An honest comparison.",
+ "path": "/filebot-alternative/", "nav": "/guides/", "priority": 0.8, "schema": ["article"],
+ "crumbs": [["/", "Home"], ["/guides/", "Guides"], ["/filebot-alternative/", "FileBot alternative"]]}
+-->
+<article class="wrap narrow article">
+  <div class="page-head">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="{{ root }}">Home</a> › <a href="{{ root }}guides/">Guides</a> › FileBot alternative</nav>
+    <h1>A FileBot alternative for Plex on Windows</h1>
+    <p class="lead">FileBot is a powerful, long-running media renamer. If you're on Windows, use Plex, and want something you can use in a minute without learning a naming language, PathRenamer may suit you better. Here is an honest comparison.</p>
+  </div>
+
+  <h2>At a glance</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th></th><th>PathRenamer</th><th>FileBot</th></tr></thead>
+    <tbody>
+      <tr><td>Price</td><td>Renaming is free; optional Pro for automation</td><td>Paid license (see <a href="https://www.filebot.net/">filebot.net</a>)</td></tr>
+      <tr><td>Systems</td><td>Windows 10 and 11</td><td>Windows, macOS, Linux and more</td></tr>
+      <tr><td>Plex names</td><td>Built in, with Plex editions and subtitle language codes</td><td>Through format expressions you choose or write</td></tr>
+      <tr><td>Automation</td><td>Built-in watch folder, subtitles and Plex scan (Pro)</td><td>Command line and scripts, such as its automated media center script</td></tr>
+      <tr><td>Subtitle downloads</td><td>OpenSubtitles.com</td><td>OpenSubtitles.com</td></tr>
+      <tr><td>Command line</td><td>No</td><td>Yes</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="small">FileBot details are from its website; check <a href="https://www.filebot.net/">filebot.net</a> for current features and prices.</p>
+
+  <h2>Where PathRenamer is different</h2>
+  <ul>
+    <li><strong>Made for Plex out of the box.</strong> No format expression to write: movies, TV shows, anime, multi-episode files, daily shows, specials and editions get Plex's names by default.</li>
+    <li><strong>See everything first.</strong> Every new name is in the preview before a file moves. Unsure matches are marked, and one right-click fixes a row: new name, episode, or a different match.</li>
+    <li><strong>Subtitles from release folders.</strong> <code>Subs\2_English.srt</code> and <code>Spanish (Latin America).srt</code> become <code>Movie (2021).eng.srt</code> and <code>Movie (2021).spa.srt</code>, numbered when there are several in one language.</li>
+    <li><strong>Undo at any time.</strong> The rename history can put back any earlier rename, even after a restart.</li>
+    <li><strong>Automation without scripts.</strong> Point the watch folder at Downloads, tick a box, and new files are renamed, given subtitles, and scanned into Plex.</li>
+    <li><strong>Free for renaming.</strong> Pro is only for the automatic parts.</li>
+  </ul>
+
+  <h2>When FileBot is the better choice</h2>
+  <ul>
+    <li>You're on macOS or Linux, or want to run on a server without a screen.</li>
+    <li>You want command-line automation or your own scripts.</li>
+    <li>You need very custom naming rules, or databases and media types PathRenamer doesn't cover, such as music.</li>
+  </ul>
+
+  <h2>Switching from FileBot</h2>
+  <ol>
+    <li><a href="{{ root }}download/">Install PathRenamer</a> and pick your library folders.</li>
+    <li>If your FileBot format added extra details, set the same in <strong>Settings → Formats</strong>; the defaults already follow Plex's naming.</li>
+    <li>Choose <strong>Hard-link</strong> in <strong>Settings → Options</strong> if your torrents should keep seeding.</li>
+    <li>Turn on the watch folder in <strong>Tools → Watch Folder</strong> to replace a post-processing script.</li>
+  </ol>
+
+  <div class="callout">
+    <p><a class="button primary" href="{{ root }}download/">Try PathRenamer free</a></p>
+  </div>
+  <p class="small">FileBot is a trademark of its owner. PathRenamer is an independent project and isn't affiliated with FileBot.</p>
+</article>

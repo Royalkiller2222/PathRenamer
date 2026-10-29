@@ -1,0 +1,49 @@
+<!--meta
+{"title": "Rename Files for Plex and Keep Seeding: Hard Links Explained",
+ "h1": "Rename for Plex and keep seeding",
+ "description": "How hard links give Plex clean names while your torrent client keeps seeding, without using extra disk space. Setup on Windows, limits and checks.",
+ "path": "/guides/hard-links-seeding/", "nav": "/guides/", "priority": 0.7, "schema": ["article"],
+ "crumbs": [["/", "Home"], ["/guides/", "Guides"], ["/guides/hard-links-seeding/", "Hard links and seeding"]]}
+-->
+<article class="wrap narrow article">
+  <div class="page-head">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="{{ root }}">Home</a> › <a href="{{ root }}guides/">Guides</a> › Hard links and seeding</nav>
+    <h1>Rename for Plex and keep seeding</h1>
+    <p class="lead">Renaming or moving a download breaks the torrent: your client can't find its files and stops seeding. Copying works but doubles the space. Hard links solve both.</p>
+    <p class="small">Updated {{ modified }}</p>
+  </div>
+
+  <h2>What a hard link is</h2>
+  <p>On an NTFS drive, one file can have several names in different folders. Each name is a <em>hard link</em> to the same data on disk. Your torrent client keeps its name:</p>
+<pre><code>D:\Downloads\Dune.2021.1080p.WEBRip.x264-RARBG\Dune.2021.1080p.WEBRip.x264-RARBG.mp4</code></pre>
+  <p>and Plex gets a clean one, without a second copy:</p>
+<pre><code>D:\Plex\Movies\Dune (2021)\Dune (2021) 1080p H.264.mp4</code></pre>
+  <ul>
+    <li><strong>No extra space.</strong> Windows Explorer shows the size twice, but the data is stored once.</li>
+    <li><strong>Delete either name, the other stays.</strong> Removing the torrent and its files later leaves your library untouched.</li>
+  </ul>
+
+  <h2>Set it up in PathRenamer</h2>
+  <ol>
+    <li>Open <strong>Settings → Options</strong>.</li>
+    <li>Set <strong>When renaming</strong> to <strong>Hard-link the files (torrents keep seeding)</strong>.</li>
+    <li>Preview and rename as usual. Downloads stay where they are; your library gets the new names.</li>
+  </ol>
+  <p>Undo removes only the library name; the download is never touched.</p>
+
+  <h2>The one rule: same drive</h2>
+  <p>Hard links only work within one NTFS drive. Keep downloads and library on the same drive, for example <code>D:\Downloads</code> and <code>D:\Plex</code>. When they're on different drives, on FAT32 or exFAT, or on a network share that can't hard-link, PathRenamer copies the file instead and tells you so.</p>
+
+  <div class="callout">
+    <p><strong>Careful with tools that edit files in place.</strong> Both names share the same data, so a tool that changes the video file itself (for example one that edits MKV titles or tracks) changes the seeding copy too, and the torrent will fail its check. Renaming and moving are always safe.</p>
+  </div>
+
+  <h2>Check that it worked</h2>
+  <p>In Command Prompt, list every name of a file:</p>
+<pre><code>fsutil hardlink list "D:\Plex\Movies\Dune (2021)\Dune (2021) 1080p H.264.mp4"</code></pre>
+  <p>Two lines, one in Downloads and one in your library, mean it's a hard link.</p>
+
+  <div class="callout">
+    <p><a class="button primary" href="{{ root }}download/">Download PathRenamer</a></p>
+  </div>
+</article>

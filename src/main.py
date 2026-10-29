@@ -110,7 +110,8 @@ DEFAULTS = {
     "root_anime": "",
     "media_type": "tv",
     "format_tv": "{show} ({year})/Season {s00}/{show} {s00e00} - {title}",
-    "format_movie": "{title} ({year})/{title} ({year}) {edition} {res} {vc} {ach} {c}",
+    # Each edition gets its own folder, as Plex wants when movies have folders
+    "format_movie": "{title} ({year}) {edition}/{title} ({year}) {edition} {res} {vc} {ach} {c}",
     "format_anime": "{show} ({year})/Season {s00}/{show} {s00e00} - {title}",
     "episode_tv": "dvd",
     "episode_anime": "dvd",
@@ -164,6 +165,7 @@ _OLD_MOVIE_DEFAULTS = {
     "{title} ({year})/{title} ({year})",
     "{title} ({year})/{title} ({year}).{ext}",
     "{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}",     # 1.3.0, before editions
+    "{title} ({year})/{title} ({year}) {edition} {res} {vc} {ach} {c}",   # 1.4: editions shared a folder
 }
 
 def cfg_load():

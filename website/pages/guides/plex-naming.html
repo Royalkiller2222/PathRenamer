@@ -1,0 +1,131 @@
+<!--meta
+{"title": "How to Name Movies and TV Shows for Plex (with Examples)",
+ "h1": "How to name movies and TV shows for Plex",
+ "description": "Plex naming conventions with examples: movie and TV folders, years, episodes, multi-episode files, specials, daily shows, editions, extras and subtitle names.",
+ "path": "/guides/plex-naming/", "nav": "/guides/", "priority": 0.9, "schema": ["article"],
+ "crumbs": [["/", "Home"], ["/guides/", "Guides"], ["/guides/plex-naming/", "Plex naming"]]}
+-->
+<article class="wrap narrow article">
+  <div class="page-head">
+    <nav class="crumbs" aria-label="Breadcrumb"><a href="{{ root }}">Home</a> › <a href="{{ root }}guides/">Guides</a> › Plex naming</nav>
+    <h1>How to name movies and TV shows for Plex</h1>
+    <p class="lead">Plex matches your files to movies and episodes by their folder and file names. Get the names right and every poster, summary and episode title appears on its own. Here is what Plex expects, with examples.</p>
+    <p class="small">Updated {{ modified }}</p>
+  </div>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#libraries">One library per kind of media</a></li>
+      <li><a href="#movies">Movies</a></li>
+      <li><a href="#tv">TV shows</a></li>
+      <li><a href="#anime">Anime</a></li>
+      <li><a href="#subtitles">Subtitles</a></li>
+      <li><a href="#extras">Extras and trailers</a></li>
+      <li><a href="#mistakes">Common mistakes</a></li>
+    </ol>
+  </div>
+
+  <h2 id="libraries">1. One library per kind of media</h2>
+  <p>Keep movies and TV shows in separate top folders, and add each as its own Plex library (type <em>Movies</em> or <em>TV Shows</em>). Plex uses different rules for each, so a movie inside a TV library won't match.</p>
+<pre><code>D:\Plex\Movies\
+D:\Plex\TV Shows\
+D:\Plex\Anime\        (a TV Shows library of its own, if you like)</code></pre>
+
+  <h2 id="movies">2. Movies</h2>
+  <p>Give every movie its own folder, and name both the folder and the file with the title and the release year in parentheses:</p>
+<pre><code>Movies\
+  Dune (2021)\
+    Dune (2021).mkv
+  The Matrix (1999)\
+    The Matrix (1999).mkv</code></pre>
+  <ul>
+    <li><strong>The year matters.</strong> It tells remakes apart, like <code>Dune (1984)</code> and <code>Dune (2021)</code>.</li>
+    <li><strong>Quality tags can follow the year</strong>, for example <code>Dune (2021) 1080p H.264.mkv</code>.</li>
+    <li><strong>Still matched wrongly?</strong> Add the movie's IMDb or TMDB id in curly braces: <code>Dune (2021) {imdb-tt1160419}</code>.</li>
+    <li><strong>Loose files</strong> directly in the Movies folder work too, but a folder per movie is what Plex recommends, and it's needed for extras.</li>
+  </ul>
+
+  <h3>Editions (Director's Cut, Extended…)</h3>
+  <p>Mark a cut of a movie with <code>{edition-Name}</code>. When each movie has its own folder, give each edition its own folder too, with the tag in both names:</p>
+<pre><code>Movies\
+  Blade Runner (1982) {edition-Final Cut}\
+    Blade Runner (1982) {edition-Final Cut}.mkv
+  Blade Runner (1982) {edition-Director's Cut}\
+    Blade Runner (1982) {edition-Director's Cut}.mkv</code></pre>
+  <p>Editions need the current Plex Movie agent, and the server owner needs Plex Pass. Without them the tag is simply ignored.</p>
+
+  <h3>Several versions of one movie</h3>
+  <p>A 1080p and a 4K copy of the same movie can share its folder; Plex shows them as one movie with a choice of versions:</p>
+<pre><code>Dune (2021)\
+  Dune (2021) - 1080p.mkv
+  Dune (2021) - 2160p.mkv</code></pre>
+
+  <h2 id="tv">3. TV shows</h2>
+  <p>Use a folder per show, a folder per season, and season and episode numbers in every file name:</p>
+<pre><code>TV Shows\
+  Band of Brothers (2001)\
+    Season 01\
+      Band of Brothers (2001) - S01E01 - Currahee.mkv
+      Band of Brothers (2001) - S01E02 - Day of Days.mkv</code></pre>
+  <ul>
+    <li><strong>S01E01</strong> is the part that counts. The episode title is optional, and upper or lower case doesn't matter.</li>
+    <li><strong>Add the year</strong> to the show's folder, especially when shows share a name: <code>Doctor Who (2005)</code> and <code>Doctor Who (1963)</code>.</li>
+    <li><strong>IDs help with stubborn matches</strong>: <code>Doctor Who (2005) {tvdb-78804}</code> also works with <code>{tmdb-…}</code> and <code>{imdb-…}</code>.</li>
+  </ul>
+
+  <h3>Multi-episode files</h3>
+  <p>One file holding two episodes gets both numbers: <code>Show (2005) - S02E18-E19.mkv</code>. Plex lists both episodes; playing either plays the whole file.</p>
+
+  <h3>Specials</h3>
+  <p>Specials are season 0: put them in a <code>Season 00</code> (or <code>Specials</code>) folder and number them <code>S00E01</code>, <code>S00E02</code>, as listed on the show's database page.</p>
+
+  <h3>Daily and talk shows</h3>
+  <p>Shows listed by air date use the date instead of an episode number:</p>
+<pre><code>The Daily Show\
+  Season 2024\
+    The Daily Show - 2024-05-17.mkv</code></pre>
+
+  <h2 id="anime">4. Anime</h2>
+  <p>Anime goes in a TV Shows library and follows the same rules. The catch is numbering: fansub releases often count episodes straight through (<code>Show - 1071</code>), while the TV databases Plex uses split them into seasons. Either rename to the season numbering the database uses, or set the show's episode ordering to absolute in Plex.</p>
+  <p>PathRenamer reads names like <code>[Group] Show - 12 (1080p) [ABCD1234].mkv</code>, looks the show up on TVmaze and AniDB, and writes season numbers (<code>S01E12</code>) or absolute numbers, whichever you choose.</p>
+
+  <h2 id="subtitles">5. Subtitles</h2>
+  <p>A subtitle file sits next to its video and has the same name, plus a language code before the extension:</p>
+<pre><code>Avatar (2009)\
+  Avatar (2009).mkv
+  Avatar (2009).en.srt
+  Avatar (2009).es.srt
+  Avatar (2009).en.forced.srt
+  Avatar (2009).en.sdh.srt</code></pre>
+  <ul>
+    <li><strong>Language codes</strong> can be two letters (<code>en</code>) or three (<code>eng</code>). Without one, Plex shows the track as <em>Unknown</em>.</li>
+    <li><strong>forced</strong> marks subtitles for the foreign-language parts only.</li>
+    <li><strong>sdh</strong> (or <strong>cc</strong>) marks subtitles for the deaf and hard of hearing.</li>
+    <li>Subtitles named only by their language, like the <code>Subs\2_English.srt</code> many releases ship with, aren't tied to the video. The reliable way: name them after the video and keep them next to it.</li>
+  </ul>
+
+  <h2 id="extras">6. Extras and trailers</h2>
+  <p>Bonus material goes in sub-folders of the movie's folder, named after the kind of extra: <code>Trailers</code>, <code>Featurettes</code>, <code>Behind The Scenes</code>, <code>Deleted Scenes</code>, <code>Interviews</code>, <code>Scenes</code>, <code>Shorts</code> or <code>Other</code>.</p>
+<pre><code>Dune (2021)\
+  Dune (2021).mkv
+  Trailers\
+    Official Trailer.mkv</code></pre>
+
+  <h2 id="mistakes">7. Common mistakes</h2>
+  <ul>
+    <li><strong>Keeping the release name</strong>: <code>Dune.2021.1080p.WEBRip.x264-RARBG.mp4</code> often matches, but releases with odd names, foreign titles or missing years don't.</li>
+    <li><strong>Sample files</strong> next to the movie (<code>sample.mkv</code>) can be picked up as the movie. Delete them.</li>
+    <li><strong>Episodes without season numbers</strong>, like <code>Show - 05.mkv</code>, are guesswork for Plex.</li>
+    <li><strong>Two shows with the same name</strong> without a year in the folder.</li>
+    <li><strong>Subtitles without a language code</strong>, which show up as <em>Unknown</em>.</li>
+  </ul>
+
+  <div class="callout">
+    <p><strong>Let PathRenamer do it.</strong> PathRenamer turns release names into exactly these names: it finds the title, year and episode, looks up episode titles, builds the folders, gives each edition its own folder, and renames subtitles from <code>Subs</code> folders with the right language code. You see every new name before anything moves.</p>
+    <p><a class="button primary" href="{{ root }}download/">Download PathRenamer for Windows</a></p>
+  </div>
+
+  <h2>Sources</h2>
+  <p class="small">Plex's own articles: <a href="https://support.plex.tv/articles/naming-and-organizing-your-movie-media-files/">Naming and organizing your Movie files</a>, <a href="https://support.plex.tv/articles/naming-and-organizing-your-tv-show-files/">Naming and Organizing Your TV Show Files</a>, <a href="https://support.plex.tv/articles/multiple-editions/">Multiple Editions</a>, <a href="https://support.plex.tv/articles/200381043-multi-version-movies/">Multi-Version Movies</a>, <a href="https://support.plex.tv/articles/local-files-for-trailers-and-extras/">Local Files for Movie Trailers and Extras</a> and <a href="https://support.plex.tv/articles/200471133-adding-local-subtitles-to-your-media/">Adding Local Subtitles to Your Media</a>.</p>
+</article>

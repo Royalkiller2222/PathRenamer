@@ -1,0 +1,38 @@
+<!--meta
+{"title": "Privacy | PathRenamer",
+ "description": "What PathRenamer sends where: title lookups, subtitle searches, Plex, license checks. No ads, no tracking, no file uploads.",
+ "path": "/privacy/", "priority": 0.3,
+ "crumbs": [["/", "Home"], ["/privacy/", "Privacy"]]}
+-->
+<article class="wrap narrow article">
+  <div class="page-head">
+    <h1>Privacy</h1>
+    <p class="lead">PathRenamer works on your computer. It has no ads, no analytics and no tracking, and it never uploads your videos. Here is everything it sends, and where.</p>
+    <p class="small">Updated {{ modified }}</p>
+  </div>
+
+  <h2>The app</h2>
+  <table>
+    <thead><tr><th>Service</th><th>When</th><th>What it gets</th></tr></thead>
+    <tbody>
+      <tr><td>TVmaze</td><td>Matching TV shows and anime</td><td>The show name; season and episode numbers</td></tr>
+      <tr><td>Cinemeta (Stremio)</td><td>Matching movies</td><td>The movie title</td></tr>
+      <tr><td>AniDB</td><td>Matching anime</td><td>A download of its title list; anime ids for episode names</td></tr>
+      <tr><td>TMDB</td><td>Only if you add your own TMDB key</td><td>Movie and show titles, with your key</td></tr>
+      <tr><td>OpenSubtitles.com</td><td>Only when subtitles are downloaded</td><td>The title, season and episode, your languages, the video's OpenSubtitles fingerprint (a number made from its size and its first and last 64 KB), and your username and password if you entered them</td></tr>
+      <tr><td>Your Plex server</td><td>Only if you connect Plex</td><td>Requests to scan the folders that changed</td></tr>
+      <tr><td>plex.tv</td><td>Only when you click <em>Sign in with Plex</em></td><td>A sign-in code; you sign in on plex.tv itself</td></tr>
+      <tr><td>Polar</td><td>Only for Pro license keys</td><td>Your license key and your computer's name (so you can tell your computers apart when moving a license)</td></tr>
+    </tbody>
+  </table>
+  <p>Your settings, rename history and logs stay in <code>%APPDATA%\PathRenamer</code> on your computer. The Plex token and OpenSubtitles password are stored encrypted for your Windows account.</p>
+
+  <h2>Buying Pro</h2>
+  <p>Payments are handled by <a href="https://polar.sh">Polar</a> as the seller of record: Polar collects your name, email and payment details to sell you the license and send your key, under <a href="https://polar.sh/legal/privacy">Polar's privacy policy</a>. PathRenamer never sees your card.</p>
+
+  <h2>This website</h2>
+  <p>This site uses no cookies and no analytics. It is hosted by GitHub Pages, which may log visitors' IP addresses for security; see the <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub privacy statement</a>. Downloads come from GitHub Releases.</p>
+
+  <h2>Questions</h2>
+  <p>Ask on <a href="{{ repo_url }}/issues">GitHub</a>.</p>
+</article>

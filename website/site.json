@@ -1,0 +1,15 @@
+{
+  "base_url": "https://royalkiller2222.github.io/PathRenamer/",
+  "custom_domain": "",
+  "description": "PathRenamer renames movies, TV shows and anime into clean Plex names on Windows, moves their subtitles along, and can do it automatically as downloads finish.",
+  "repo_url": "https://github.com/Royalkiller2222/PathRenamer",
+  "download_url": "https://github.com/Royalkiller2222/PathRenamer/releases/latest",
+  "kofi_url": "https://ko-fi.com/pathrenamer",
+  "contact_url": "https://github.com/Royalkiller2222/PathRenamer/issues/new/choose",
+  "enterprise_url": "https://github.com/Royalkiller2222/PathRenamer/issues/new?template=enterprise.yml",
+  "checkout_url": "",
+  "pro_price": "$5 a year",
+  "pro_price_note": "or $19 once, for good",
+  "pro_seats": 3,
+  "trial_days": 14
+}

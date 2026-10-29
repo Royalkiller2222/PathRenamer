@@ -57,7 +57,7 @@ def test_movie_without_year_has_no_unknown_placeholder(main):
 def test_movie_edition_uses_the_plex_tag(main):
     rel = main.fmt_movie("Aliens", 1986, ".mkv", main.DEFAULTS["format_movie"], resolution="1080p",
                          edition="Special Edition")
-    assert rel == "Aliens (1986)/Aliens (1986) {edition-Special Edition} 1080p.mkv"
+    assert rel == "Aliens (1986) {edition-Special Edition}/Aliens (1986) {edition-Special Edition} 1080p.mkv"
     assert main.fmt_movie("Aliens", 1986, ".mkv", main.DEFAULTS["format_movie"]) == "Aliens (1986)/Aliens (1986).mkv"
 
 
@@ -88,12 +88,16 @@ def test_two_cuts_of_a_movie_get_different_names(main, tmp_path):
     plain, special = make_files(tmp_path, "Aliens.1986.1080p.mkv", "Aliens.1986.1080p.Special.Edition.mkv")
     engine = main.MatchEngine(cfg=dict(main.DEFAULTS))
     assert engine.match(plain, "movie").dest_rel == "Aliens (1986)/Aliens (1986) 1080p.mkv"
-    assert engine.match(special, "movie").dest_rel == "Aliens (1986)/Aliens (1986) {edition-Special Edition} 1080p.mkv"
+    # each cut in its own folder, so Plex shows both (and their extras)
+    assert engine.match(special, "movie").dest_rel == \
+        "Aliens (1986) {edition-Special Edition}/Aliens (1986) {edition-Special Edition} 1080p.mkv"
 
 
-def test_old_default_movie_format_is_upgraded(main, tmp_path, monkeypatch):
+@pytest.mark.parametrize("old", ["{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}",               # 1.3
+                                 "{title} ({year})/{title} ({year}) {edition} {res} {vc} {ach} {c}"])    # 1.4
+def test_old_default_movie_format_is_upgraded(main, tmp_path, monkeypatch, old):
     import json
     cfg_path = tmp_path / "config.json"
-    cfg_path.write_text(json.dumps({"format_movie": "{title} ({year})/{title} ({year}) {res} {vc} {ach} {c}"}))
+    cfg_path.write_text(json.dumps({"format_movie": old}))
     monkeypatch.setattr(main, "CONFIG_PATH", cfg_path)
     assert main.cfg_load()["format_movie"] == main.DEFAULTS["format_movie"]

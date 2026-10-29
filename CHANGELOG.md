@@ -20,6 +20,9 @@
 - PathRenamer Pro: everything done by hand stays free; the automatic parts
   are Pro, with a 14-day trial. Until licensing is switched on, everything is
   unlocked.
+- Movie editions get their own folder, with the tag in the folder and file
+  name (`Aliens (1986) {edition-Special Edition}/...`), as Plex wants when
+  each movie has a folder. Configs with the 1.4 default are upgraded.
 - The Plex token and OpenSubtitles password are stored encrypted for the
   Windows user.
 - New Tools and Help menus.
