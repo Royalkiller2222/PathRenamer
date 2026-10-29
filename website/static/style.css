@@ -1,43 +1,29 @@
-/* PathRenamer website. Light or dark follows the visitor's system setting. */
+/* PathRenamer website: dark, on a field of slowly drifting stars. */
 :root {
-  --bg: #f6f8f6;
-  --bg-alt: #edf1ee;
-  --surface: #ffffff;
-  --text: #121614;
-  --muted: #56615b;
-  --border: #d8dfda;
-  --accent: #237a2e;
-  --accent-bg: #46b04f;
-  --accent-hover: #3c9c44;
-  --on-accent: #051108;
-  --code-bg: #eef3ef;
-  --shadow: 0 18px 48px rgba(14, 22, 18, .16);
+  /* Dark, over the star background (stars.css, made by build.py) */
+  --bg: #090a0f;
+  --bg-alt: rgba(27, 39, 53, .55);
+  --surface: rgba(22, 31, 42, .92);
+  --text: #e8eef2;
+  --muted: #a3afba;
+  --border: rgba(160, 185, 210, .18);
+  --accent: #6fd977;
+  --accent-bg: #4cbb55;
+  --accent-hover: #5ccc65;
+  --on-accent: #03100a;
+  --code-bg: rgba(10, 14, 20, .75);
+  --shadow: 0 24px 64px rgba(0, 0, 0, .55);
   --radius: 14px;
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0e1110;
-    --bg-alt: #141917;
-    --surface: #19201c;
-    --text: #e8eeea;
-    --muted: #9ba7a1;
-    --border: #28312c;
-    --accent: #6fd977;
-    --accent-bg: #4cbb55;
-    --accent-hover: #5ccc65;
-    --on-accent: #03100a;
-    --code-bg: #111714;
-    --shadow: 0 24px 64px rgba(0, 0, 0, .55);
-  }
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
+html { -webkit-text-size-adjust: 100%; min-height: 100%; background: radial-gradient(ellipse at bottom, #1b2735 0%, #090a0f 100%) fixed #090a0f; }
 body {
   margin: 0;
-  background: var(--bg);
+  background: transparent;
   color: var(--text);
   font: 17px/1.62 var(--font);
 }
@@ -69,7 +55,7 @@ th { color: var(--muted); font-weight: 600; }
 /* Header */
 .site-header {
   position: sticky; top: 0; z-index: 5;
-  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  background: rgba(9, 10, 15, .72);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--border);
 }
@@ -190,3 +176,15 @@ section.alt { background: var(--bg-alt); border-block: 1px solid var(--border); 
   .button { transition: none; }
   .button:hover { transform: none; }
 }
+
+/* Star background: three layers of stars drifting up at different speeds
+   (after "Parallax Star background in CSS" by sarazond on CodePen). The
+   star positions are in stars.css, written by build.py. */
+.starfield { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+.starfield div { position: absolute; top: 0; left: 0; background: transparent; }
+.starfield div::after { content: " "; position: absolute; top: 2000px; left: 0; width: inherit; height: inherit; background: transparent; box-shadow: inherit; }
+.starfield .s1 { width: 1px; height: 1px; animation: star-drift 50s linear infinite; }
+.starfield .s2 { width: 2px; height: 2px; animation: star-drift 100s linear infinite; }
+.starfield .s3 { width: 3px; height: 3px; animation: star-drift 150s linear infinite; }
+@keyframes star-drift { from { transform: translateY(0); } to { transform: translateY(-2000px); } }
+@media (prefers-reduced-motion: reduce) { .starfield div { animation: none; } }
