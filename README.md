@@ -5,12 +5,14 @@ PathRenamer renames your TV shows, movies and anime so Plex, Jellyfin, Emby and 
 **[Download the latest version](https://github.com/Royalkiller2222/PathRenamer/releases/latest)** for Windows: run `PathRenamer-Setup-x.x.x.exe`. On a server, NAS, Linux or Mac: **[use Docker](DOCKER.md)**. Guides and FAQ: **[royalkiller2222.github.io/PathRenamer](https://royalkiller2222.github.io/PathRenamer/)**
 
 
-Preview of the app <img width="1053" height="719" alt="app" src="https://github.com/user-attachments/assets/d2b339cd-df6c-441a-9205-b548fbb862cf" />
+Preview of the app <img width="1384" height="889" alt="image" src="https://github.com/user-attachments/assets/5d9ce955-59cc-47cd-9619-9706c7972dda" />
+
 
 
 
 Shows similar results! Max 10.
-<img widthh="898" height="681" alt="filematching" src="https://github.com/user-attachments/assets/577cc13e-a7fe-43ee-9bfa-44ac95eda3b0" />
+<img width="899" height="677" alt="image" src="https://github.com/user-attachments/assets/e1a88523-efdc-4a16-aed9-c1483d67e398" />
+
 
 Feel free to leave suggestions/comments but please keep in mind this is a passion project. It's going to have bugs, I'll try my best to fix what I can in future releases!
 
