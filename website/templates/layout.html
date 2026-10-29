@@ -27,6 +27,16 @@
 </head>
 <body class="{{ page_class }}">
 <div class="starfield" aria-hidden="true"><div class="s1"></div><div class="s2"></div><div class="s3"></div></div>
+<script>
+/* Keep the stars moving across pages: each layer starts where the clock says
+   it is (50, 100 and 150 second loops), not from the top on every page. */
+(function () {
+  var t = Date.now() / 1000, layers = document.querySelectorAll(".starfield div");
+  [50, 100, 150].forEach(function (seconds, i) {
+    if (layers[i]) layers[i].style.animationDelay = -(t % seconds) + "s";
+  });
+})();
+</script>
 <a class="skip" href="#main">Skip to content</a>
 <header class="site-header">
   <div class="wrap header-row">
