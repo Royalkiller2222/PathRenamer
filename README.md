@@ -60,4 +60,4 @@ Turning on a Pro feature starts a free 14-day trial. Pro costs $5 a year or $19 
 
 ## License
 
-PathRenamer is free software under the [GNU General Public License v3.0](LICENSE): you may use, study, share and change it, and anything you share that is built from it must stay under the same license. PathRenamer Pro is a paid license key for the automatic features; buying it supports development.
+PathRenamer is free software under the [GNU General Public License v3.0](LICENSE): you may use, study, share and change it, and anything you share that is built from it must stay under the same license. PathRenamer Pro is a paid license key for the automatic features; buying it supports development because api keys aren't free.
