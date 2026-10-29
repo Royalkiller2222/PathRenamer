@@ -2173,6 +2173,14 @@ class SettingsDialog(QDialog):
         site.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(WEBSITE_URL)))
         gl.addWidget(site)
 
+        credits = QLabel(
+            "Show and episode data from TVmaze (CC BY-SA 4.0), movie data from Cinemeta, anime data "
+            "from AniDB, subtitles from OpenSubtitles.com. With your own key, movie data from TMDB: "
+            "this product uses the TMDB API but is not endorsed or certified by TMDB.")
+        credits.setWordWrap(True)
+        credits.setStyleSheet("color: #888; font-size: 11px; margin-top: 8px;")
+        gl.addWidget(credits)
+
         version = QLabel(f"Version: {APP_VERSION}")
         version.setStyleSheet("color: #666; font-size: 11px; margin-top: 8px;")
         gl.addWidget(version)
