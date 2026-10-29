@@ -194,8 +194,10 @@ def test_a_state_from_another_install_is_rejected(tmp_path, monkeypatch):
 @pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows only")
 def test_windows_encrypts_the_state_for_this_user():
     import secret
-    text = seal({"key": "K"})
-    assert text.startswith("dpapi1:") and "K" not in text and unseal(text) == {"key": "K"}
+    text = seal({"key": "PR-TEST-KEY-7F3A"})
+    assert text.startswith("dpapi1:") and unseal(text) == {"key": "PR-TEST-KEY-7F3A"}
+    raw = base64.b64decode(text[len("dpapi1:"):])
+    assert b"PR-TEST-KEY" not in raw and b'"key"' not in raw                # encrypted, not just encoded
     with pytest.raises(OSError):
         secret.unseal(secret.seal(b"data", b"one"), b"two")
     blob = bytearray(base64.b64decode(text[len("dpapi1:"):]))
