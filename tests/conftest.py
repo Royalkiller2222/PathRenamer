@@ -103,3 +103,44 @@ def wait_until(qapp, condition, timeout=5.0):
             return True
         time.sleep(0.01)
     return condition()
+
+
+class FakeResponse:
+    def __init__(self, status=200, json=None, content=b"", text=None):
+        import json as _json
+        self.status_code = status
+        self._json = json
+        if json is not None and not content:
+            content = _json.dumps(json).encode()
+        self.content = content if text is None else text.encode()
+
+    def json(self):
+        if self._json is None:
+            raise ValueError("no JSON")
+        return self._json
+
+
+class FakeSession:
+    """Answers requests from a table instead of the network.
+    routes: {(METHOD, url): response or callable(**kwargs) -> response};
+    calls: [(METHOD, url, kwargs)] in order."""
+
+    def __init__(self, routes=None, error=None):
+        self.routes = dict(routes or {})
+        self.calls = []
+        self.error = error           # raise this for every request (no network)
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        if self.error is not None:
+            raise self.error
+        answer = self.routes.get((method, url))
+        if answer is None:
+            return FakeResponse(404, json={"detail": "not found"})
+        return answer(**kwargs) if callable(answer) else answer
+
+    def get(self, url, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self.request("POST", url, **kwargs)

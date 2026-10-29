@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.5.0
+
+- Watch folder (Tools → Watch Folder, Settings → Automation): new videos in a
+  folder such as Downloads are matched as soon as they finish downloading.
+  Matches PathRenamer is sure about can be renamed on their own (Pro); the
+  rest go into the preview to check. Renames from the watch folder are undone
+  like any other.
+- Plex: Sign in with Plex finds the server and token. Plex can scan the
+  changed folders right after each rename (Pro), or every library on request
+  (Tools → Ask Plex to Scan Now).
+- Subtitles from OpenSubtitles.com: Tools → Download Subtitles for the
+  selected files, or missing languages after every rename (Pro). Subtitles
+  made for the exact file are picked first; downloads get Plex names and are
+  removed again when the rename is undone.
+- Resolution, video codec, audio codec and channels are read from the file
+  itself (MKV, WebM, MP4, M4V, MOV, AVI) when the name doesn't say, for
+  `{res}` `{vc}` `{c}` `{ach}` (Settings → Options to turn off).
+- PathRenamer Pro: everything done by hand stays free; the automatic parts
+  are Pro, with a 14-day trial. Until licensing is switched on, everything is
+  unlocked.
+- The Plex token and OpenSubtitles password are stored encrypted for the
+  Windows user.
+- New Tools and Help menus.
+
 ## 1.4.1
 
 - Preview table: every column is resizable in both layouts; long text wraps

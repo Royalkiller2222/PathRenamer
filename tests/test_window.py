@@ -89,7 +89,7 @@ def test_animations_finish(main, make_window, qapp):
 def test_settings_dialog_saves_layout_options(main, qapp, monkeypatch):
     monkeypatch.setattr(main, "cfg_save", lambda c: None)
     d = main.SettingsDialog(dict(main.DEFAULTS))
-    assert d.nav is not None and d.nav.count() == 6          # Modern: sidebar
+    assert d.nav is not None and d.nav.count() == 9          # Modern: sidebar
     d.layout_combo.setCurrentIndex(1)
     assert not d.panel_combo.isEnabled()                     # Modern-only options
     d.panel_combo.setCurrentIndex(2)

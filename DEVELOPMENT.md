@@ -13,6 +13,13 @@ The Python source is in [`src/`](src/):
 | `src/scanner.py` | Subtitle language/flag detection and Plex subtitle names |
 | `src/themes.py` | Colour themes (palettes) and the stylesheets built from them |
 | `src/history.py` | Rename history kept on disk, for undo |
+| `src/mediainfo.py` | Resolution and codecs read from MKV / MP4 / AVI headers |
+| `src/watchfolder.py` | Watch folder: reports new videos once they finished arriving |
+| `src/plex.py` | Plex scans and Sign in with Plex |
+| `src/opensubs.py` | OpenSubtitles.com search and download |
+| `src/automation.py` | After-rename jobs: subtitles, then the Plex scan |
+| `src/licensing.py` | Free / Pro: trial and Polar license keys |
+| `src/secret.py` | Encrypts the Plex token and passwords in config.json (Windows DPAPI) |
 | `src/newicon.ico` | App and window icon |
 | `src/build_exe.bat` | Builds `dist\PathRenamer.exe` with PyInstaller |
 
@@ -73,3 +80,47 @@ it stops and says so; a tag left behind by a deleted release is moved to the
 new build. Publishing a release on the website with a new tag, or pushing a
 tag (`git tag V1.3.0 && git push origin V1.3.0`), also works: the installer is
 attached a few minutes later.
+
+## Pro, licensing and the app's API keys
+
+Renaming by hand is free. The automatic parts (watch-folder auto-rename,
+subtitles after renaming, Plex scan after renaming) are Pro. Turning one on
+starts a 14-day trial (`trial_started` in config.json).
+
+Licensing is **off** until an organization ID is set: then every feature is
+unlocked ("early access"). The release build writes `src/build_info.py` (not in
+git) from the repository's settings, under **Settings → Secrets and variables →
+Actions**:
+
+| Name | Kind | What it is |
+| --- | --- | --- |
+| `POLAR_ORGANIZATION_ID` | Variable | Your Polar organization ID. Setting it switches licensing on. |
+| `POLAR_PORTAL_URL` | Variable | Your Polar customer portal link (Manage My License). |
+| `OPENSUBTITLES_API_KEY` | Secret | The app's OpenSubtitles API key. Without it, users enter their own. |
+
+To start selling Pro:
+
+1. Create an organization on [polar.sh](https://polar.sh). Polar is the
+   merchant of record: it takes the payment and handles sales tax and VAT.
+2. Add a product "PathRenamer Pro" with a **License Keys** benefit. Set an
+   activation limit (for example 3 computers) so keys can't be shared widely.
+3. Copy the organization ID into the `POLAR_ORGANIZATION_ID` variable, and the
+   product's checkout link into `website/site.json` (`checkout_url`).
+4. Release a new version. Keys are checked with Polar's public customer-portal
+   API (`/v1/customer-portal/license-keys/activate|validate|deactivate`), which
+   needs no secret in the app. The app re-checks once a week and keeps Pro for
+   30 days offline.
+
+For subtitles, register the app at
+[opensubtitles.com/consumers](https://www.opensubtitles.com/consumers) and add
+the key as the `OPENSUBTITLES_API_KEY` secret.
+
+## Website
+
+The website is plain HTML in [`website/`](website/), built by
+`website/build.py` (no dependencies) and published to GitHub Pages by
+`.github/workflows/pages.yml` on every push to `main` that changes it.
+Prices, links and the address live in `website/site.json`.
+
+One-time setup: **Settings → Pages → Build and deployment → Source: GitHub
+Actions**. The site is then at https://royalkiller2222.github.io/PathRenamer/.

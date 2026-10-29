@@ -57,6 +57,25 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+      # The app's own keys come from repository settings, never from the code:
+      # Settings > Secrets and variables > Actions. Both are optional: without
+      # OPENSUBTITLES_API_KEY users enter their own key; without
+      # POLAR_ORGANIZATION_ID every Pro feature stays unlocked (early access).
+      - name: Add the app's API keys
+        shell: pwsh
+        env:
+          OPENSUBTITLES_API_KEY: ${{ secrets.OPENSUBTITLES_API_KEY }}
+          POLAR_ORGANIZATION_ID: ${{ vars.POLAR_ORGANIZATION_ID }}
+          POLAR_PORTAL_URL: ${{ vars.POLAR_PORTAL_URL }}
+        run: |
+          $lines = @(
+            "# Written by the release build. Not in git.",
+            "OPENSUBTITLES_API_KEY = '$($env:OPENSUBTITLES_API_KEY -replace "'", '')'",
+            "POLAR_ORGANIZATION_ID = '$($env:POLAR_ORGANIZATION_ID -replace "'", '')'",
+            "POLAR_PORTAL_URL = '$($env:POLAR_PORTAL_URL -replace "'", '')'"
+          )
+          Set-Content -Path src/build_info.py -Value $lines -Encoding utf8
+
       - name: Build PathRenamer.exe
         working-directory: src
         run: >

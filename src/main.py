@@ -4,7 +4,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 
 # ── Logging / crash handler ───────────────────────────────────────────────────
 _APPDATA_BASE = Path(os.getenv("APPDATA", Path.home()))
@@ -59,10 +59,25 @@ sys.excepthook = _global_except_hook
 
 
 import errno
+import threading
+import uuid
 import requests
 import re
 from parser import analyse_path
 from history import RenameHistory, describe as describe_batch
+from mediainfo import read_media_info
+from automation import after_rename as run_after_rename, fetch_subtitles
+from licensing import (License, PRO_FEATURES, STATE_KEYS as LICENSE_KEYS,
+                       BUY_URL, MANAGE_URL)
+from opensubs import OpenSubtitlesClient, OpenSubtitlesError, parse_languages
+from plex import PlexClient, PlexSignIn
+from secret import protect, unprotect
+try:
+    import build_info                    # written by the release build: the app's own API keys
+except ImportError:
+    build_info = None
+OPENSUBTITLES_APP_KEY = getattr(build_info, "OPENSUBTITLES_API_KEY", "") or ""
+WEBSITE_URL = "https://royalkiller2222.github.io/PathRenamer/"
 from scanner import (SUBTITLE_EXTENSIONS, detect_subtitle_language, is_language_only_name,
                      unique_subtitle_filename)
 from rapidfuzz import fuzz
@@ -80,6 +95,7 @@ from PyQt6.QtGui import (QColor, QAction, QActionGroup, QDesktopServices, QDragE
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QObject, QUrl, QTimer, QVariantAnimation,
                           QEasingCurve, QByteArray, QEvent)
+from watchfolder import FolderWatcher
 
 # ═══════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -113,7 +129,24 @@ DEFAULTS = {
     "animations": True,            # modern: smooth panel animations
     "files_ratio": 0.3,            # modern: share of the window for the file list
     "rename_action": "move",       # "move" | "copy" | "hardlink" (keeps torrents seeding)
+    "read_media_info": True,       # fill {res} {vc} {c} {ach} from the video when the name lacks them
     "presets": {},                 # name -> saved settings (PRESET_KEYS)
+    # Automation (Settings → Automation and Subtitles). The automatic parts are Pro.
+    "watch_enabled": False,
+    "watch_folder": "",
+    "watch_media_type": "auto",    # "auto" (TV or movie by name) | "tv" | "movie" | "anime"
+    "watch_auto_rename": False,    # Pro: rename sure matches without asking
+    "watch_include_existing": False,
+    "plex_url": "",
+    "plex_token": "",              # encrypted (secret.protect)
+    "plex_client_id": "",
+    "plex_auto_scan": False,       # Pro: ask Plex to scan after renaming
+    "subs_languages": "English",
+    "subs_auto": False,            # Pro: download missing subtitles after renaming
+    "subs_hearing_impaired": False,
+    "opensubtitles_api_key": "",   # the user's own key (releases have one built in)
+    "opensubtitles_username": "",
+    "opensubtitles_password": "",  # encrypted
 }
 
 # What a preset remembers
@@ -179,6 +212,13 @@ def scan_folder(folder, include_subtitles=False):
             elif include_subtitles and p.suffix.lower() in SUB_EXT:
                 result.append(p)
     return result
+
+def _watchable(path):
+    """A video the watch folder should report (not a sample)."""
+    return path.suffix.lower() in VIDEO_EXT and not _SAMPLE_FILE.search(path.stem)
+
+def _skip_watch_dir(name):
+    return name.strip().lower() in _SKIP_SCAN_DIRS
 
 def _sub_matches_video(sub_stem, video_stem):
     """True if the subtitle is named after the video: "Movie" -> "Movie.en",
@@ -1031,6 +1071,7 @@ class Candidate:
     resolution: str = ""
     # What the name was built from, so one row can be fixed by hand
     title: str = ""                       # show or movie title used
+    year: str = ""                        # its year, when known
     season: Optional[int] = None
     episodes: List[int] = field(default_factory=list)
     manual: bool = False                  # new name typed by the user
@@ -1147,6 +1188,17 @@ class MatchEngine:
             audio_channels = self._scalar(raw, "audio_channels")
             media_source = self._scalar(raw, "source")
             resolution = self._scalar(raw, "screen_size")
+            if (ext in VIDEO_EXT and self.cfg.get("read_media_info", True)
+                    and not (video_codec and audio_codec and audio_channels and resolution)):
+                # What the name doesn't say is read from the file itself
+                info = read_media_info(path)
+                if info:
+                    resolution = resolution or info.resolution
+                    video_codec = video_codec or info.video_codec
+                    if not audio_codec or audio_codec == info.audio_codec:
+                        # channels only when they belong to the codec the name gives
+                        audio_codec = audio_codec or info.audio_codec
+                        audio_channels = audio_channels or info.audio_channels
 
             if selected_title:
                 title = selected_title
@@ -1248,7 +1300,7 @@ class MatchEngine:
         ep_type = self.cfg.get("episode_tv", "dvd")
         rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_tv",""), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
         c = Candidate(path, rel, "tv", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
-                      title=show, season=season, episodes=list(episodes))
+                      title=show, season=season, episodes=list(episodes), year=str(show_year or ""))
         if ext not in SUB_EXT:
             self._subs(path, rel, c)
         return c
@@ -1287,7 +1339,7 @@ class MatchEngine:
                 conf, matched = 0.9, True
         rel = fmt_movie(title, year, ext, self.cfg.get("format_movie",""), video_codec, audio_codec, audio_channels, media_source, resolution, edition)
         c = Candidate(path, rel, "movie", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
-                      title=title)
+                      title=title, year=str(year or ""))
         if ext not in SUB_EXT:
             self._subs(path, rel, c)
         return c
@@ -1340,7 +1392,7 @@ class MatchEngine:
         ep_type = self.cfg.get("episode_anime", "dvd")
         rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_anime", self.cfg.get("format_tv","")), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
         c = Candidate(path, rel, "anime", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
-                      title=show, season=season, episodes=list(episodes))
+                      title=show, season=season, episodes=list(episodes), year=str(show_year or ""))
         if ext not in SUB_EXT:
             self._subs(path, rel, c)
         return c
@@ -1368,12 +1420,143 @@ from themes import (THEMES, THEME_NAMES, BASE_THEMES, ROLES, palette_for, custom
                     is_color, app_stylesheet, base_stylesheet, tab_stylesheet)
 
 # ═══════════════════════════════════════════════════════════════════
+#  BACKGROUND JOBS (downloads, Plex, license checks)
+# ═══════════════════════════════════════════════════════════════════
+class BackgroundJobs(QObject):
+    """Runs slow network work in a background thread and hands the result
+    back on the UI thread as on_done(result, error)."""
+    _done = pyqtSignal(object, object, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.running = 0
+        self._done.connect(self._deliver)
+
+    def run(self, work, on_done=None):
+        self.running += 1
+
+        def target():
+            try:
+                result, error = work(), None
+            except Exception as e:
+                log.warning(f"Background job failed: {e!r}")
+                result, error = None, e
+            try:
+                self._done.emit(on_done, result, error)
+            except RuntimeError:              # closed meanwhile
+                pass
+        threading.Thread(target=target, daemon=True).start()
+
+    def _deliver(self, on_done, result, error):
+        self.running -= 1
+        if on_done is None:
+            return
+        try:
+            on_done(result, error)
+        except RuntimeError as e:             # its window was closed meanwhile
+            if "has been deleted" not in str(e):
+                raise
+
+
+def _note_label(text):
+    note = QLabel(text)
+    note.setWordWrap(True)
+    note.setStyleSheet("color:#888;font-size:11px")
+    return note
+
+
+class PlexSignInDialog(QDialog):
+    """Sign in with Plex: plex.tv opens in the browser, the user approves
+    PathRenamer there, and their server's address and token come back."""
+    POLL_MS = 2000
+    TIMEOUT_S = 300
+
+    def __init__(self, client_id, parent=None, sign_in=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sign in with Plex")
+        self.setMinimumWidth(440)
+        self.server = None                    # {name, url, token} once signed in
+        self._sign_in = sign_in or PlexSignIn(client_id)
+        self._pin = None
+        self._page = ""
+        self._closed = False
+        self._started = time.monotonic()
+        self.jobs = BackgroundJobs(self)
+        L = QVBoxLayout(self)
+        self.msg = QLabel("Opening plex.tv in your browser…")
+        self.msg.setWordWrap(True)
+        L.addWidget(self.msg)
+        row = QHBoxLayout()
+        self.btn_open = QPushButton("Open the Page Again")
+        self.btn_open.setEnabled(False)
+        self.btn_open.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self._page)))
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(self.btn_open); row.addStretch(); row.addWidget(cancel)
+        L.addLayout(row)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._poll)
+        self.jobs.run(self._sign_in.start, self._pin_ready)
+
+    def done(self, result):
+        self._closed = True
+        self._timer.stop()
+        super().done(result)
+
+    def _pin_ready(self, result, error):
+        if self._closed:
+            return
+        if error is not None:
+            self.msg.setText(f"Couldn't start signing in: {error}")
+            return
+        pin_id, code, self._page = result
+        self._pin = (pin_id, code)
+        self.btn_open.setEnabled(True)
+        QDesktopServices.openUrl(QUrl(self._page))
+        self.msg.setText("Approve PathRenamer on the plex.tv page that just opened in your browser. "
+                         "This window closes by itself when you're done.")
+        self._timer.start(self.POLL_MS)
+
+    def _poll(self):
+        if self._closed:
+            return
+        if time.monotonic() - self._started > self.TIMEOUT_S:
+            self.msg.setText("Signing in took too long. Close this window and try again.")
+            return
+        pin = self._pin
+        self.jobs.run(lambda: self._sign_in.token(*pin), self._token_ready)
+
+    def _token_ready(self, token, error):
+        if self._closed:
+            return
+        if error is not None or not token:    # not approved yet (or a hiccup): keep waiting
+            self._timer.start(self.POLL_MS)
+            return
+        self.msg.setText("Signed in. Looking for your Plex server…")
+        self.jobs.run(lambda: self._sign_in.servers(token),
+                      lambda servers, err: self._servers_ready(servers, err, token))
+
+    def _servers_ready(self, servers, error, token):
+        if self._closed:
+            return
+        # No server found: the token still works with an address typed by hand
+        self.server = servers[0] if servers and error is None else {"name": "", "url": "", "token": token}
+        self.accept()
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  SETTINGS DIALOG
 # ═══════════════════════════════════════════════════════════════════
 class SettingsDialog(QDialog):
-    def __init__(self, cfg, parent=None):
+    PRO_SWITCHES = ("watch_auto_rename", "plex_auto_scan", "subs_auto")
+
+    def __init__(self, cfg, parent=None, page=None):
         super().__init__(parent)
         self.cfg = dict(cfg)
+        self._initial = dict(cfg)
+        self.license = License(self.cfg)
+        self.jobs = BackgroundJobs(self)
         self.setWindowTitle("Settings"); self.setMinimumWidth(600)
         self.setMinimumHeight(500)
         L = QVBoxLayout(self)
@@ -1384,9 +1567,14 @@ class SettingsDialog(QDialog):
             ("Formats", self._build_formats_tab(theme)),
             ("Appearance", self._build_appearance_tab(theme)),
             ("Options", self._build_options_tab(theme)),
+            ("Automation", self._build_automation_tab(theme)),
+            ("Subtitles", self._build_subtitles_tab(theme)),
             ("API Keys", self._build_api_tab(theme)),
+            ("Pro", self._build_pro_tab(theme)),
             ("About", self._build_about_tab(theme)),
         ]
+        names = [name for name, _ in pages]
+        start = names.index(page) if page in names else 0
         self.nav = None
         if self.cfg.get("layout", "modern") == "modern":
             # Sidebar navigation (styled by the #settingsModern rules)
@@ -1403,7 +1591,7 @@ class SettingsDialog(QDialog):
                 page.layout().setContentsMargins(18, 14, 18, 8)
                 stack.addWidget(page)
             self.nav.currentRowChanged.connect(stack.setCurrentIndex)
-            self.nav.setCurrentRow(0)
+            self.nav.setCurrentRow(start)
             body.addWidget(self.nav); body.addWidget(stack, 1)
             L.addLayout(body, 1)
         else:
@@ -1411,6 +1599,7 @@ class SettingsDialog(QDialog):
             tabs.setStyleSheet(tab_stylesheet(palette_for(self.cfg)))
             for name, page in pages:
                 tabs.addTab(page, name)
+            tabs.setCurrentIndex(start)
             L.addWidget(tabs)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -1633,6 +1822,12 @@ class SettingsDialog(QDialog):
         self.rename_subs.setChecked(self.cfg.get("rename_subtitles", True))
         gl.addRow(self.rename_subs)
 
+        self.read_media_info = QCheckBox("Read resolution and codecs from the video when the name doesn't say")
+        self.read_media_info.setChecked(self.cfg.get("read_media_info", True))
+        self.read_media_info.setToolTip("Fills {res}, {vc}, {c} and {ach} in your formats from the file itself\n"
+                                        "(MKV, MP4 and AVI), e.g. for home videos or renamed files.")
+        gl.addRow(self.read_media_info)
+
         self.cleanup_folders = QCheckBox("Delete empty folders after rename")
         self.cleanup_folders.setChecked(self.cfg.get("cleanup_empty_folders", True))
         gl.addRow(self.cleanup_folders)
@@ -1661,6 +1856,244 @@ class SettingsDialog(QDialog):
         L.addWidget(grp2)
         L.addStretch()
         return w
+
+    # ── Automation, Subtitles, Pro ──────────────────────────────────
+    def _pro_checkbox(self, text, key):
+        """A switch for a Pro feature. Turning one on starts the free trial;
+        after the trial they are locked until Pro is activated."""
+        box = QCheckBox(f"{text}  (Pro)")
+        allowed = self.license.can_try()
+        box.setChecked(bool(self.cfg.get(key)) and allowed)
+        if not allowed:
+            box.setEnabled(False)
+            box.setToolTip("Part of PathRenamer Pro. Your trial has ended: see Settings → Pro.")
+        elif self.license.enabled and not self.license.is_pro():
+            box.setToolTip("Part of PathRenamer Pro. Turning it on starts a free 14-day trial.")
+        return box
+
+    def _build_automation_tab(self, theme):
+        w = QWidget()
+        L = QVBoxLayout(w)
+        L.setContentsMargins(10, 10, 10, 10)
+
+        grp = QGroupBox("Watch Folder")
+        gl = QFormLayout(grp)
+        self.watch_enabled = QCheckBox("Watch a folder for new downloads while PathRenamer is open")
+        self.watch_enabled.setChecked(bool(self.cfg.get("watch_enabled")))
+        gl.addRow(self.watch_enabled)
+        self.watch_folder = QLineEdit(self.cfg.get("watch_folder", ""))
+        self.watch_folder.setPlaceholderText("e.g., D:/Downloads")
+        btn = QPushButton("Browse")
+        btn.clicked.connect(lambda: self._browse_folder(self.watch_folder))
+        gl.addRow("Folder:", self._make_browse_row(self.watch_folder, btn))
+        self.watch_type = QComboBox()
+        for key, label in (("auto", "TV or movie, detected from the name"), ("tv", "TV Shows"),
+                           ("movie", "Movies"), ("anime", "Anime")):
+            self.watch_type.addItem(label, key)
+        self.watch_type.setCurrentIndex(max(0, self.watch_type.findData(self.cfg.get("watch_media_type", "auto"))))
+        gl.addRow("New files are:", self.watch_type)
+        self.watch_auto = self._pro_checkbox("Rename the files PathRenamer is sure about automatically",
+                                             "watch_auto_rename")
+        gl.addRow(self.watch_auto)
+        self.watch_existing = QCheckBox("Also handle the files already in the folder when watching starts")
+        self.watch_existing.setChecked(bool(self.cfg.get("watch_include_existing")))
+        gl.addRow(self.watch_existing)
+        gl.addRow("", _note_label(
+            "New files are matched once they finish downloading, with your formats and library "
+            "folders. Anything PathRenamer isn't sure about is put in the preview for you to check."))
+        L.addWidget(grp)
+
+        grp2 = QGroupBox("Plex")
+        g2 = QFormLayout(grp2)
+        self.plex_url = QLineEdit(self.cfg.get("plex_url", ""))
+        self.plex_url.setPlaceholderText("e.g., http://localhost:32400")
+        g2.addRow("Server:", self.plex_url)
+        self.plex_token = QLineEdit(unprotect(self.cfg.get("plex_token", "")))
+        self.plex_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.plex_token.setPlaceholderText("Filled in when you sign in")
+        sign_in = QPushButton("Sign in with Plex…")
+        sign_in.clicked.connect(self._plex_sign_in)
+        g2.addRow("Token:", self._make_browse_row(self.plex_token, sign_in))
+        test_row = QHBoxLayout()
+        self.plex_test_btn = QPushButton("Test Connection")
+        self.plex_test_btn.clicked.connect(self._plex_test)
+        self.plex_status = QLabel("")
+        self.plex_status.setWordWrap(True)
+        test_row.addWidget(self.plex_test_btn)
+        test_row.addWidget(self.plex_status, 1)
+        g2.addRow("", test_row)
+        self.plex_auto = self._pro_checkbox("Ask Plex to scan right after renaming", "plex_auto_scan")
+        g2.addRow(self.plex_auto)
+        g2.addRow("", _note_label("Only the folders that changed are scanned, so new episodes show up in "
+                                  "seconds. Tools → Ask Plex to Scan Now works without Pro."))
+        L.addWidget(grp2)
+        L.addStretch()
+        return w
+
+    def _plex_sign_in(self):
+        if not self.cfg.get("plex_client_id"):
+            self.cfg["plex_client_id"] = uuid.uuid4().hex
+        dlg = PlexSignInDialog(self.cfg["plex_client_id"], self)
+        if dlg.exec() and dlg.server:
+            if dlg.server.get("url"):
+                self.plex_url.setText(dlg.server["url"])
+            self.plex_token.setText(dlg.server["token"])
+            name = dlg.server.get("name")
+            self.plex_status.setText(f"Signed in to {name}." if name else
+                                     "Signed in. Type your server's address above.")
+
+    def _plex_test(self):
+        client = PlexClient(self.plex_url.text(), self.plex_token.text())
+        self.plex_test_btn.setEnabled(False)
+        self.plex_status.setText("Connecting…")
+
+        def work():
+            return client.server_name(), [s["title"] for s in client.sections() if s["type"] in ("movie", "show")]
+
+        def done(result, error):
+            self.plex_test_btn.setEnabled(True)
+            if error is not None:
+                self.plex_status.setText(str(error))
+                return
+            name, libraries = result
+            self.plex_status.setText(f"Connected to {name}: " + (", ".join(libraries) or
+                                                                  "no movie or TV libraries yet") + ".")
+        self.jobs.run(work, done)
+
+    def _build_subtitles_tab(self, theme):
+        w = QWidget()
+        L = QVBoxLayout(w)
+        L.setContentsMargins(10, 10, 10, 10)
+
+        grp = QGroupBox("Subtitles from OpenSubtitles.com")
+        gl = QFormLayout(grp)
+        self.subs_languages = QLineEdit(self.cfg.get("subs_languages", "English"))
+        self.subs_languages.setPlaceholderText("e.g., English, Spanish")
+        gl.addRow("Languages:", self.subs_languages)
+        self.subs_auto = self._pro_checkbox("Download missing subtitles after renaming", "subs_auto")
+        gl.addRow(self.subs_auto)
+        self.subs_hi = QCheckBox("Prefer subtitles for the deaf and hard of hearing (SDH)")
+        self.subs_hi.setChecked(bool(self.cfg.get("subs_hearing_impaired")))
+        gl.addRow(self.subs_hi)
+        gl.addRow("", _note_label("Subtitles made for your exact file are picked first. Without Pro: select "
+                                  "files in the preview and choose Tools → Download Subtitles."))
+        L.addWidget(grp)
+
+        grp2 = QGroupBox("OpenSubtitles Account (optional)")
+        g2 = QFormLayout(grp2)
+        self.os_user = QLineEdit(self.cfg.get("opensubtitles_username", ""))
+        g2.addRow("Username:", self.os_user)
+        self.os_pass = QLineEdit(unprotect(self.cfg.get("opensubtitles_password", "")))
+        self.os_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        signup = QPushButton("Create a Free Account")
+        signup.clicked.connect(lambda: QDesktopServices.openUrl(
+            QUrl("https://www.opensubtitles.com/en/users/sign_up")))
+        g2.addRow("Password:", self._make_browse_row(self.os_pass, signup))
+        self.os_key = QLineEdit(self.cfg.get("opensubtitles_api_key", ""))
+        self.os_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.os_key.setPlaceholderText("Built in" if OPENSUBTITLES_APP_KEY else
+                                       "Needed: get one free at opensubtitles.com/consumers")
+        g2.addRow("API key:", self.os_key)
+        g2.addRow("", _note_label("Signing in raises your daily download limit. The password is stored "
+                                  "encrypted for your Windows account."))
+        L.addWidget(grp2)
+        L.addStretch()
+        return w
+
+    def _build_pro_tab(self, theme):
+        w = QWidget()
+        L = QVBoxLayout(w)
+        L.setContentsMargins(10, 10, 10, 10)
+        grp = QGroupBox("PathRenamer Pro")
+        gl = QVBoxLayout(grp)
+        self.pro_status = QLabel(self.license.summary())
+        self.pro_status.setWordWrap(True)
+        self.pro_status.setStyleSheet("font-weight:600")
+        gl.addWidget(self.pro_status)
+        gl.addWidget(_note_label("Renaming by hand stays free, forever. Pro adds what PathRenamer does on "
+                                 "its own:\n• " + "\n• ".join(PRO_FEATURES.values())))
+
+        self.pro_key_box = QWidget()
+        kl = QVBoxLayout(self.pro_key_box)
+        kl.setContentsMargins(0, 6, 0, 0)
+        row = QHBoxLayout()
+        self.license_key = QLineEdit(self.cfg.get("license_key", ""))
+        self.license_key.setPlaceholderText("Paste your license key")
+        self.btn_activate = QPushButton("Activate")
+        self.btn_activate.clicked.connect(self._activate_license)
+        row.addWidget(self.license_key, 1)
+        row.addWidget(self.btn_activate)
+        kl.addLayout(row)
+        row2 = QHBoxLayout()
+        buy = QPushButton("Get Pro")
+        buy.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(BUY_URL)))
+        manage = QPushButton("Manage My License")
+        manage.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(MANAGE_URL)))
+        self.btn_check = QPushButton("Check Now")
+        self.btn_check.clicked.connect(self._check_license_now)
+        self.btn_deactivate = QPushButton("Remove From This PC")
+        self.btn_deactivate.setToolTip("Frees this computer's seat, to use your key on another computer.")
+        self.btn_deactivate.clicked.connect(self._deactivate_license)
+        for b in (buy, manage, self.btn_check, self.btn_deactivate):
+            row2.addWidget(b)
+        row2.addStretch()
+        kl.addLayout(row2)
+        gl.addWidget(self.pro_key_box)
+        self.pro_key_box.setVisible(self.license.enabled)
+        L.addWidget(grp)
+        L.addStretch()
+        self._update_pro_buttons()
+        return w
+
+    def _update_pro_buttons(self):
+        has_key = bool(self.cfg.get("license_key"))
+        self.btn_check.setEnabled(has_key)
+        self.btn_deactivate.setEnabled(has_key)
+        self.pro_status.setText(self.license.summary())
+        allowed = self.license.can_try()
+        for box in (getattr(self, "watch_auto", None), getattr(self, "plex_auto", None),
+                    getattr(self, "subs_auto", None)):
+            if box is not None:
+                box.setEnabled(allowed)
+
+    def _license_job(self, work, busy_text):
+        """Run a License call on a copy of the settings in the background;
+        on success its results are kept and saved right away (a seat on the
+        license server was used or freed)."""
+        lic = License(dict(self.cfg))
+        for b in (self.btn_activate, self.btn_check, self.btn_deactivate):
+            b.setEnabled(False)
+        self.pro_status.setText(busy_text)
+
+        def done(result, error):
+            self.btn_activate.setEnabled(True)
+            if error is None:
+                for k in LICENSE_KEYS:
+                    if k in lic.cfg:
+                        self.cfg[k] = lic.cfg[k]
+                    else:
+                        self.cfg.pop(k, None)
+                disk = cfg_load()
+                disk.update({k: self.cfg[k] for k in LICENSE_KEYS if k in self.cfg})
+                for k in LICENSE_KEYS:
+                    if k not in self.cfg:
+                        disk.pop(k, None)
+                cfg_save(disk)
+            self._update_pro_buttons()
+            if error is not None:
+                self.pro_status.setText(str(error))
+        self.jobs.run(lambda: work(lic), done)
+
+    def _activate_license(self):
+        key = self.license_key.text()
+        self._license_job(lambda lic: lic.activate(key), "Checking your key…")
+
+    def _check_license_now(self):
+        self._license_job(lambda lic: lic.check(), "Checking your license…")
+
+    def _deactivate_license(self):
+        self.license_key.clear()
+        self._license_job(lambda lic: lic.deactivate(), "Removing the license from this PC…")
 
     def _build_api_tab(self, theme):
         w = QWidget()
@@ -1727,12 +2160,16 @@ class SettingsDialog(QDialog):
         gl.addWidget(kofi_btn)
 
         desc = QLabel(
-            "PathRenamer is free. "
-            "A lot of time went into this - if you find it useful, consider supporting development!"
+            "Renaming with PathRenamer is free. "
+            "A lot of time went into this - if you find it useful, consider PathRenamer Pro or a coffee!"
         )
         desc.setStyleSheet("color: #888; font-size: 11px; margin-top: 8px;")
         desc.setWordWrap(True)
         gl.addWidget(desc)
+
+        site = QPushButton("PathRenamer Website and Guides")
+        site.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(WEBSITE_URL)))
+        gl.addWidget(site)
 
         version = QLabel(f"Version: {APP_VERSION}")
         version.setStyleSheet("color: #666; font-size: 11px; margin-top: 8px;")
@@ -1764,6 +2201,7 @@ class SettingsDialog(QDialog):
             "show_full_path": self.show_new_path.isChecked(),
             "show_detected": self.show_detected.isChecked(),
             "rename_subtitles": self.rename_subs.isChecked(),
+            "read_media_info": self.read_media_info.isChecked(),
             "rename_action": self.action_combo.currentData(),
             "cleanup_empty_folders": self.cleanup_folders.isChecked(),
             "confirm_rename": self.confirm_rename.isChecked(),
@@ -1774,10 +2212,36 @@ class SettingsDialog(QDialog):
             "use_anidb": self.use_anidb.isChecked(),
             "use_cinemeta": self.use_cinemeta.isChecked(),
             "tmdb_api_key": self.tmdb_key.text().strip(),
+            "watch_enabled": self.watch_enabled.isChecked(),
+            "watch_folder": self.watch_folder.text().strip(),
+            "watch_media_type": self.watch_type.currentData(),
+            "watch_auto_rename": self.watch_auto.isChecked(),
+            "watch_include_existing": self.watch_existing.isChecked(),
+            "plex_url": self.plex_url.text().strip(),
+            "plex_token": protect(self.plex_token.text().strip()),
+            "plex_auto_scan": self.plex_auto.isChecked(),
+            "subs_languages": ", ".join(self._language_names()) or "English",
+            "subs_auto": self.subs_auto.isChecked(),
+            "subs_hearing_impaired": self.subs_hi.isChecked(),
+            "opensubtitles_api_key": self.os_key.text().strip(),
+            "opensubtitles_username": self.os_user.text().strip(),
+            "opensubtitles_password": protect(self.os_pass.text()),
             "first_run": False,
         })
+        turned_on = [k for k in self.PRO_SWITCHES if self.cfg.get(k) and not self._initial.get(k)]
+        trial = bool(turned_on) and self.license.start_trial()
         cfg_save(self.cfg)
+        if trial:
+            QMessageBox.information(self, "PathRenamer Pro",
+                                    "Your free 14-day Pro trial has started. Enjoy the automation!\n\n"
+                                    "Renaming by hand stays free after the trial.")
         self.accept()
+
+    def _language_names(self):
+        """The typed subtitle languages, cleaned up ("en, Spanish" -> English, Spanish)."""
+        names = {"eng": "English", "spa": "Spanish", "fre": "French", "ger": "German", "ita": "Italian",
+                 "por": "Portuguese", "dut": "Dutch", "jpn": "Japanese", "kor": "Korean", "chi": "Chinese"}
+        return [names.get(code, code) for code in parse_languages(self.subs_languages.text())]
 
 # ═══════════════════════════════════════════════════════════════════
 #  RENAME TABLE
@@ -3206,6 +3670,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cfg = cfg_load()
         self.renamer = Renamer(RenameHistory(HISTORY_PATH))
+        self.license = License(self.cfg)
+        self.jobs = BackgroundJobs(self)       # downloads, Plex and license checks
+        self._watch_queue = []                 # new files waiting to be matched
+        self._watch_busy = False
+        self._watch_anidb = None
+        self._scan_note = ""                   # shown with the next preview's result
         self._cands = []
         self._thread = self._worker = None
         self._scanning = False
@@ -3242,6 +3712,15 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Ready — select a source folder and click Preview Renames.")
         self._refresh_clients()
         self._update_undo_buttons()        # renames saved from earlier sessions can be undone
+
+        self.watcher = FolderWatcher(accept=_watchable, skip_dir=_skip_watch_dir, parent=self)
+        self.watcher.files_ready.connect(self._on_watch_files)
+        self.watcher.error.connect(self._on_watch_error)
+        self.watch_label = QLabel()
+        self.watch_label.setObjectName("watchLabel")
+        self.status.addPermanentWidget(self.watch_label)
+        self._apply_automation()
+        QTimer.singleShot(4000, self._check_license)   # a Pro key is re-checked once a week
 
         if self.cfg.get("first_run", True):
             self._first_run_wizard()
@@ -3302,6 +3781,39 @@ class MainWindow(QMainWindow):
         self.act_details.setChecked(self.cfg.get("show_details", True))
         self.act_details.triggered.connect(self._toggle_details)
         vm.addAction(self.act_details)
+
+        tm = mb.addMenu("Tools")
+        self.act_watch = QAction("Watch Folder", self)
+        self.act_watch.setCheckable(True)
+        self.act_watch.triggered.connect(self._toggle_watch)
+        tm.addAction(self.act_watch)
+        act = QAction("Check the Watch Folder Now", self)
+        act.triggered.connect(self._check_watch_now)
+        tm.addAction(act)
+        tm.addSeparator()
+        self.act_download_subs = QAction("Download Subtitles for Selected Files", self)
+        self.act_download_subs.setShortcut(QKeySequence("Ctrl+D"))
+        self.act_download_subs.setEnabled(False)
+        self.act_download_subs.triggered.connect(self._download_subtitles)
+        tm.addAction(self.act_download_subs)
+        act = QAction("Ask Plex to Scan Now", self)
+        act.triggered.connect(self._scan_plex_now)
+        tm.addAction(act)
+        tm.addSeparator()
+        act = QAction("Automation Settings…", self)
+        act.triggered.connect(lambda: self._settings("Automation"))
+        tm.addAction(act)
+
+        hm = mb.addMenu("Help")
+        act = QAction("PathRenamer Pro…", self)
+        act.triggered.connect(lambda: self._settings("Pro"))
+        hm.addAction(act)
+        act = QAction("Website and Guides", self)
+        act.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(WEBSITE_URL)))
+        hm.addAction(act)
+        act = QAction("About PathRenamer", self)
+        act.triggered.connect(lambda: self._settings("About"))
+        hm.addAction(act)
 
     # ── Widgets (made once; each layout arranges them) ───────────────
     def _create_widgets(self):
@@ -3395,6 +3907,8 @@ class MainWindow(QMainWindow):
             fix_menu.addAction(act)
         fix_menu.addSeparator()
         fix_menu.addAction(self.act_move_up); fix_menu.addAction(self.act_move_down)
+        fix_menu.addSeparator()
+        fix_menu.addAction(self.act_download_subs)
         self.btn_fix.setMenu(fix_menu)
 
         self.btn_rename = QPushButton("✔  Rename Files")
@@ -3776,6 +4290,7 @@ class MainWindow(QMainWindow):
             self.resize(1180, 760)
 
     def closeEvent(self, event):
+        self.watcher.stop()
         try:
             self.cfg["window_geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
             cfg_save(self.cfg)
@@ -3904,8 +4419,8 @@ class MainWindow(QMainWindow):
                 files = scan_folder(text, include_subtitles=True)
             if files:
                 self._add_files_to_list(files)
-    def _settings(self):
-        d = SettingsDialog(self.cfg, self)
+    def _settings(self, page=None):
+        d = SettingsDialog(self.cfg, self, page=page if isinstance(page, str) else None)
         accepted = d.exec()
         if accepted:
             self.cfg = d.cfg
@@ -3914,7 +4429,10 @@ class MainWindow(QMainWindow):
             # Settings dialog) may already have saved template changes, so the
             # in-memory copy can't simply be kept.
             self.cfg = cfg_load()
+        self.license.cfg = self.cfg
         self._refresh_clients()
+        if hasattr(self, "watcher"):         # (the first-run wizard opens Settings before it exists)
+            self._apply_automation()
         saved_type = self.cfg.get("media_type", "tv")
         idx = {"tv": 0, "movie": 1, "anime": 2}.get(saved_type, 0)
         if self.combo.currentIndex() != idx:
@@ -4222,6 +4740,9 @@ class MainWindow(QMainWindow):
         errors = self.table.error_count()
 
         parts = [f"{total} file(s) matched"]
+        if self._scan_note:
+            parts.insert(0, self._scan_note)
+            self._scan_note = ""
         if conflicts:
             parts.append(f"{conflicts} conflict(s) shown in red")
         if errors:
@@ -4292,8 +4813,10 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+        renamed = list(self._cands)
         result, msg = self._place_groups(groups, dst, source="manual")
         self.status.showMessage(msg)
+        self._after_rename(result, renamed, dst, self.renamer.last_batch_id)
         if result.failed:
             details = "\n".join(f"{o.src.name}: {o.error}" for o in result.failed[:10])
             QMessageBox.warning(self, "Some Renames Failed", details)
@@ -4304,8 +4827,9 @@ class MainWindow(QMainWindow):
         self._update_summary()
         self._update_details()
 
-    def _place_groups(self, groups, dst, source="manual"):
-        """Rename (move / copy / hard-link) the groups and clean up.
+    def _place_groups(self, groups, dst, source="manual", cleanup_root=None):
+        """Rename (move / copy / hard-link) the groups and clean up empty
+        folders under cleanup_root (default: the source folder).
         Returns (result, status message)."""
         # A subtitle whose new name already exists stays where it is
         sub_skipped = sum(1 for _, sub_ops in groups for s in sub_ops if detect_conflicts([s]))
@@ -4321,7 +4845,7 @@ class MainWindow(QMainWindow):
 
         # Remove folders left empty in the source tree (only moving empties them)
         if action == "move" and self.cfg.get("cleanup_empty_folders", True):
-            root = self.src.text().strip()
+            root = str(cleanup_root or self.src.text().strip())
             if root and os.path.isdir(root):
                 for op in result.succeeded:
                     if _is_inside(op.src, Path(root)):
@@ -4498,7 +5022,9 @@ class MainWindow(QMainWindow):
                         (self.act_choose_match, has),
                         (self.act_number, episodic),
                         (self.act_move_up, has and rows[0] > 0),
-                        (self.act_move_down, has and rows[-1] < len(cands) - 1)):
+                        (self.act_move_down, has and rows[-1] < len(cands) - 1),
+                        (self.act_download_subs, has and any(
+                            cands[r].source.suffix.lower() not in SUB_EXT for r in rows if r < len(cands)))):
             act.setEnabled(bool(ok))
         self.btn_fix.setEnabled(has)
 
@@ -4509,6 +5035,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(self.act_move_up); menu.addAction(self.act_move_down)
         menu.addSeparator()
+        menu.addAction(self.act_download_subs)
         rm = QAction("Remove From List", menu); rm.triggered.connect(self._remove_selected_rows)
         rm.setEnabled(bool(self.table.selectedItems()) and not self._scanning)
         menu.addAction(rm)
@@ -4635,6 +5162,305 @@ class MainWindow(QMainWindow):
         self._update_fix_actions()
 
     # ── Drag & drop ─────────────────────────────────────────────────
+    # ── Watch folder ─────────────────────────────────────────────────
+    WATCH_SURE = 0.85                 # matches at least this sure are renamed on their own (Pro)
+
+    def _apply_automation(self):
+        """Start, move or stop the watch folder to match the settings."""
+        folder = (self.cfg.get("watch_folder") or "").strip()
+        if self.cfg.get("watch_enabled") and folder:
+            current = self.watcher.folder()
+            if current is None or not _same_path(current, folder):
+                self.watcher.start(folder, include_existing=bool(self.cfg.get("watch_include_existing")))
+        elif self.watcher.is_running():
+            self.watcher.stop()
+        self._update_watch_label()
+
+    def _update_watch_label(self):
+        folder = self.watcher.folder()
+        self.watch_label.setVisible(folder is not None)
+        self.act_watch.setChecked(folder is not None)
+        if folder is not None:
+            self.watch_label.setText(f"Watching {folder.name or folder}")
+            self.watch_label.setToolTip(f"New videos in {folder} are matched as soon as they finish "
+                                        "downloading (Tools → Watch Folder).")
+
+    def _toggle_watch(self, checked):
+        if checked and not (self.cfg.get("watch_folder") or "").strip():
+            self.act_watch.setChecked(False)
+            self._settings("Automation")
+            return
+        self.cfg["watch_enabled"] = bool(checked)
+        cfg_save(self.cfg)
+        self._apply_automation()
+
+    def _check_watch_now(self):
+        if self.watcher.is_running():
+            self.watcher.check_now()
+            self.status.showMessage(f"Checking {self.watcher.folder()} for new files…")
+        else:
+            self.status.showMessage("The watch folder is off: turn it on under Tools → Watch Folder.")
+
+    def _on_watch_error(self, message):
+        log.warning(message)
+        self.status.showMessage(message)
+
+    def _on_watch_files(self, paths):
+        log.info(f"Watch folder: {len(paths)} new file(s): {[p.name for p in paths]}")
+        self._watch_queue.extend(paths)
+        self._process_watch_queue()
+
+    def _watch_media_type(self, path, cfg=None):
+        chosen = (cfg or self.cfg).get("watch_media_type", "auto")
+        if chosen in self.MEDIA_TYPES:
+            return chosen
+        guess = analyse_path(path, "tv")
+        # "Dune Part Two 2024" has a part number and a year: a movie
+        year = guess.year or (guess.raw or {}).get("year")
+        episodic = guess.season is not None or guess.date or (guess.episodes and not year)
+        return "tv" if episodic else "movie"
+
+    def _watch_engine(self):
+        """The watch folder matches next to a normal preview, so it uses its
+        own connections."""
+        if self.cfg.get("use_anidb", True) and self._watch_anidb is None:
+            self._watch_anidb = AniDBClient()
+        key = (self.cfg.get("tmdb_api_key") or "").strip()
+        return MatchEngine(cfg=dict(self.cfg),
+                           tvmaze=TVMazeClient() if self.cfg.get("use_tvmaze", True) else None,
+                           anidb=self._watch_anidb if self.cfg.get("use_anidb", True) else None,
+                           tmdb=TMDBClient(key) if key else None,
+                           cinemeta=CinemetaClient() if self.cfg.get("use_cinemeta", True) else None)
+
+    def _process_watch_queue(self):
+        """Match the next batch of new files (one kind at a time) in the background."""
+        if self._watch_busy or not self._watch_queue:
+            return
+        queue, self._watch_queue = self._watch_queue, []
+        cfg, engine = dict(self.cfg), self._watch_engine()
+        self._watch_busy = True
+
+        def work():
+            batch, media_type, later = [], None, []
+            for path in queue:
+                if not path.exists():
+                    continue
+                kind = self._watch_media_type(path, cfg)
+                media_type = media_type or kind
+                (batch if kind == media_type else later).append(path)
+            dst = (cfg.get(f"root_{media_type}") or "").strip() if media_type else ""
+            cands = []
+            if batch:
+                worker = ScanWorker(batch, engine, media_type, dst)
+                worker.candidate_ready.connect(cands.append, Qt.ConnectionType.DirectConnection)
+                worker.run()
+            return media_type, dst, cands, later
+        self.jobs.run(work, self._on_watch_matched)
+
+    def _on_watch_matched(self, result, error):
+        self._watch_busy = False
+        try:
+            if error is not None:
+                self.status.showMessage(f"Watch folder: {error}")
+                return
+            media_type, dst, cands, later = result
+            self._watch_queue = later + self._watch_queue
+            self._handle_watch_matches(media_type, dst, cands)
+        finally:
+            self._process_watch_queue()
+
+    def _handle_watch_matches(self, media_type, dst, cands):
+        if not cands:
+            return
+        mark_duplicates(cands, dst)
+        wanted = bool(self.cfg.get("watch_auto_rename"))
+        allowed = wanted and self.license.allows("watch_auto_rename")
+        sure = [c for c in cands if allowed and dst and not c.error and not c.conflict
+                and c.confidence >= self.WATCH_SURE and c.source.suffix.lower() not in SUB_EXT]
+        notes, placed = [], set()
+        if sure:
+            result, msg = self._place_groups(self._rename_groups(sure, dst), dst, source="watch",
+                                             cleanup_root=self.watcher.folder())
+            failed = {os.path.normcase(str(op.src)) for op in result.failed}
+            renamed = [c for c in sure if os.path.normcase(str(c.source)) not in failed]
+            placed = {id(c) for c in renamed}
+            notes.append(f"Watch folder: {msg}")
+            self._update_summary()
+            self._after_rename(result, renamed, dst, self.renamer.last_batch_id)
+        rest = [c for c in cands if id(c) not in placed]
+        if rest:
+            shown = self._show_watch_candidates(rest, media_type, dst)
+            where = "in the preview" if shown else "in the file list"
+            why = " (automatic renaming is part of PathRenamer Pro)" if wanted and not allowed else ""
+            notes.append(f"{len(rest)} new file(s) to check {where}{why}")
+        self.status.showMessage(" · ".join(notes))
+
+    def _show_watch_candidates(self, cands, media_type, dst):
+        """New files that need a look go straight into the preview when it is
+        empty; otherwise into the file list, for the next preview."""
+        self._add_files_to_list([c.source for c in cands])
+        if self._scanning or self.table.rowCount():
+            return False
+        if self._media_type() != media_type:
+            self.combo.setCurrentIndex(self.MEDIA_TYPES.index(media_type))
+        self._title_overrides, self._episode_overrides = {}, {}
+        self.table.set_display_options(self.cfg.get("show_detected", True), self.cfg.get("show_full_path", True))
+        self.table.populate(cands, dst)
+        self._cands = self.table.get_cands()
+        self.btn_rename.setEnabled(any(not c.error for c in self._cands))
+        self._update_summary()
+        self._update_details()
+        self._update_fix_actions()
+        return True
+
+    # ── After renaming: subtitles and Plex ───────────────────────────
+    def _subtitle_client(self):
+        key = (self.cfg.get("opensubtitles_api_key") or "").strip() or OPENSUBTITLES_APP_KEY
+        return OpenSubtitlesClient(key, self.cfg.get("opensubtitles_username", ""),
+                                   unprotect(self.cfg.get("opensubtitles_password", "")), APP_VERSION)
+
+    def _plex_client(self):
+        return PlexClient(self.cfg.get("plex_url", ""), unprotect(self.cfg.get("plex_token", "")))
+
+    def _subtitle_languages(self):
+        return parse_languages(self.cfg.get("subs_languages", "")) or ["eng"]
+
+    def _after_rename(self, result, cands, dst, batch_id):
+        """Pro: download missing subtitles, then ask Plex to scan, in the
+        background. Downloads join the rename's undo step."""
+        subs_on = bool(self.cfg.get("subs_auto")) and self.license.allows("subs_auto")
+        plex_on = bool(self.cfg.get("plex_auto_scan")) and self.license.allows("plex_auto_scan")
+        if not result.succeeded or not (subs_on or plex_on):
+            return
+        placed = {os.path.normcase(str(op.src)): op.dst for op in result.succeeded}
+        videos = [(c, placed[os.path.normcase(str(c.source))]) for c in cands
+                  if c.source.suffix.lower() not in SUB_EXT and os.path.normcase(str(c.source)) in placed]
+        subtitles = None
+        if subs_on and videos:
+            subtitles = {"client": self._subtitle_client(), "languages": self._subtitle_languages(),
+                         "hearing_impaired": bool(self.cfg.get("subs_hearing_impaired"))}
+        plex = self._plex_client() if plex_on else None
+        if subtitles is None and plex is None:
+            return
+        media_type = cands[0].media_type if cands else self._media_type()
+        paths = [op.dst for op in result.succeeded]
+
+        def done(res, error):
+            if error is not None:
+                self.status.showMessage(f"After renaming: {error}")
+                return
+            downloaded, scanned, problems = res
+            batch = self.renamer.history.get(batch_id) if batch_id else None
+            if downloaded and batch is not None:
+                if batch.get("undone"):              # the rename was undone meanwhile
+                    for f in downloaded:
+                        Path(f).unlink(missing_ok=True)
+                    downloaded = []
+                else:
+                    self.renamer.history.add_ops(batch_id, [("OpenSubtitles", f, "download") for f in downloaded])
+            parts = []
+            if downloaded:
+                parts.append(f"downloaded {len(downloaded)} subtitle(s)")
+            if scanned:
+                parts.append(f"Plex is scanning {', '.join(scanned)}")
+            parts += problems
+            if parts:
+                log.info("After renaming: " + " · ".join(parts))
+                self.status.showMessage("After renaming: " + " · ".join(parts))
+        self.jobs.run(lambda: run_after_rename(videos, paths, media_type, subtitles, plex), done)
+
+    def _download_subtitles(self):
+        """Free: download subtitles for the selected rows, next to the
+        videos, so they are renamed with them."""
+        rows = self._rows_for_action()
+        cands = self.table.get_cands()
+        videos = [cands[r] for r in rows if r < len(cands) and cands[r].source.suffix.lower() not in SUB_EXT
+                  and cands[r].source.exists()]
+        if not videos:
+            self.status.showMessage("Select videos in the preview first.")
+            return
+        client = self._subtitle_client()
+        if not getattr(client, "api_key", True):
+            QMessageBox.information(self, "Subtitles", "Downloading subtitles needs an OpenSubtitles API "
+                                    "key. Add one under Settings → Subtitles: it's free.")
+            self._settings("Subtitles")
+            return
+        languages = self._subtitle_languages()
+        hearing_impaired = bool(self.cfg.get("subs_hearing_impaired"))
+        self.act_download_subs.setEnabled(False)
+        self.status.showMessage(f"Looking for subtitles for {len(videos)} file(s)…")
+
+        def work():
+            client.login()
+            saved, problems = [], []
+            for c in videos:
+                try:
+                    saved += fetch_subtitles(client, c.source, languages, title=c.title, year=c.year or None,
+                                             season=c.season, episodes=c.episodes, media_type=c.media_type,
+                                             hearing_impaired=hearing_impaired)
+                except OpenSubtitlesError as e:      # quota or sign-in: the rest would fail too
+                    problems.append(str(e))
+                    break
+                except OSError as e:
+                    problems.append(f"{c.source.name}: {e.strerror or e}")
+            return saved, problems
+
+        def done(res, error):
+            self._update_fix_actions()
+            if error is not None:
+                self.status.showMessage("No subtitles downloaded.")
+                QMessageBox.warning(self, "Subtitles", str(error))
+                return
+            saved, problems = res
+            message = (f"Downloaded {len(saved)} subtitle(s)" if saved else
+                       "No new subtitles found in your languages")
+            self.status.showMessage(message)
+            if saved and not self._scanning:
+                # look those rows up again, so the new subtitles go with their videos
+                again = [i for i, c in enumerate(self.table.get_cands())
+                         if any(os.path.normcase(str(f)).startswith(os.path.normcase(str(c.source.with_suffix("")) + "."))
+                                for f in saved)]
+                if again:
+                    self._scan_note = message
+                    self._rematch(again)
+            if problems:
+                QMessageBox.warning(self, "Subtitles", "\n".join(problems[:5]))
+        self.jobs.run(work, done)
+
+    def _scan_plex_now(self):
+        """Free: ask Plex to scan every movie and TV library."""
+        plex = self._plex_client()
+        if not plex.base_url or not plex.token:
+            QMessageBox.information(self, "Plex", "Connect PathRenamer to your Plex server first: "
+                                    "Settings → Automation → Sign in with Plex.")
+            self._settings("Automation")
+            return
+        self.status.showMessage("Asking Plex to scan…")
+
+        def done(titles, error):
+            if error is not None:
+                self.status.showMessage(f"Plex: {error}")
+            else:
+                self.status.showMessage(f"Plex is scanning {', '.join(titles)}." if titles else
+                                        "Plex has no movie or TV libraries to scan.")
+        self.jobs.run(plex.scan_all, done)
+
+    def _check_license(self):
+        """Re-check a Pro key once a week, quietly in the background."""
+        if not self.license.needs_check():
+            return
+        copy = License(dict(self.cfg))
+
+        def done(changed, error):
+            if error is None and changed:
+                for k in LICENSE_KEYS:
+                    if k in copy.cfg:
+                        self.cfg[k] = copy.cfg[k]
+                    else:
+                        self.cfg.pop(k, None)
+                cfg_save(self.cfg)
+        self.jobs.run(copy.check, done)
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
