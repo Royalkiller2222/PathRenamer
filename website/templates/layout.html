@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-root="{{ root }}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,7 +7,8 @@
 <meta name="description" content="{{ description }}">
 <link rel="canonical" href="{{ canonical }}">
 {{ robots }}
-<meta name="color-scheme" content="dark light">
+<meta name="color-scheme" content="dark">
+<style>html{background:#090a0f}</style>
 <meta name="theme-color" content="#090a0f">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="PathRenamer">
@@ -23,6 +24,7 @@
 <link rel="apple-touch-icon" href="{{ root }}img/apple-touch-icon.png">
 <link rel="stylesheet" href="{{ root }}style.css">
 <link rel="stylesheet" href="{{ root }}stars.css">
+<script src="{{ root }}nav.js" defer></script>
 {{ structured_data }}
 </head>
 <body class="{{ page_class }}">

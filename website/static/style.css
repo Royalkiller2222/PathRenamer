@@ -188,5 +188,4 @@ section.alt { background: var(--bg-alt); border-block: 1px solid var(--border); 
 .starfield .s3 { width: 3px; height: 3px; animation: star-drift 150s linear infinite; }
 @keyframes star-drift { from { transform: translateY(0); } to { transform: translateY(-2000px); } }
 @media (prefers-reduced-motion: reduce) { .starfield div { animation: none; } }
-/* Moving between pages: browsers that can, fade between them instead of flashing */
-@view-transition { navigation: auto; }
+main:focus { outline: none; }
