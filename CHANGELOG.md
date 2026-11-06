@@ -23,8 +23,8 @@
   regular episode across seasons, without a season folder. The old "DVD"
   setting gave the aired order, so existing settings become "aired" and names
   don't change. Command line: `pathrenamer rename --order dvd`.
-- Four presets come with PathRenamer (Presets menu): DVD order, Streaming
-  order, Absolute order, and Strip episode numbers (episodes found by their
+- Five presets come with PathRenamer (Presets menu): Aired order, DVD order,
+  Streaming order, Absolute order, and Strip episode numbers (episodes found by their
   title, named in the order you pick).
 - Free: the watch folder that renames on its own, and media server scans after
   renaming. Pro is only for what costs money to run: subtitles downloaded

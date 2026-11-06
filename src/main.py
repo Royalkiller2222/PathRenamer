@@ -3783,7 +3783,8 @@ class MainWindow(QMainWindow):
     def _fill_presets_menu(self):
         menu = self.presets_menu
         menu.clear()
-        tips = {"DVD order": "Name episodes in their DVD order",
+        tips = {"Aired order": "Name episodes in the order they were first broadcast (the usual order)",
+                "DVD order": "Name episodes in their DVD order",
                 "Streaming order": "Name episodes in their streaming order",
                 "Absolute order": "Number episodes 1, 2, 3, … across all seasons",
                 "Strip episode numbers": "Ignore the numbers in the names, find each episode by its title, "

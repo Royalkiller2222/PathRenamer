@@ -182,6 +182,7 @@ EPISODE_ORDERS = (("aired", "Aired order (as broadcast)"), ("dvd", "DVD order"),
 # Presets that come with PathRenamer (Presets menu). "Strip episode numbers"
 # matches episodes by title and asks which order to name them in.
 BUILTIN_PRESETS = {
+    "Aired order": {"episode_tv": "aired", "episode_anime": "aired", "episode_match": "number"},
     "DVD order": {"episode_tv": "dvd", "episode_anime": "dvd", "episode_match": "number"},
     "Streaming order": {"episode_tv": "streaming", "episode_anime": "streaming", "episode_match": "number"},
     "Absolute order": {"episode_tv": "absolute", "episode_anime": "absolute", "episode_match": "number"},

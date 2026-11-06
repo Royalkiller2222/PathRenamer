@@ -104,11 +104,12 @@ def test_old_dvd_setting_keeps_the_aired_names(tmp_path, monkeypatch):
 
 def test_builtin_presets(main, make_window, monkeypatch):
     from PyQt6.QtWidgets import QInputDialog
-    assert list(BUILTIN_PRESETS) == ["DVD order", "Streaming order", "Absolute order", "Strip episode numbers"]
+    assert list(BUILTIN_PRESETS) == ["Aired order", "DVD order", "Streaming order", "Absolute order",
+                                     "Strip episode numbers"]
     w = make_window()
     w._fill_presets_menu()
     names = [a.text() for a in w.presets_menu.actions()]
-    assert names[:4] == list(BUILTIN_PRESETS)
+    assert names[:5] == list(BUILTIN_PRESETS)
     w._apply_builtin_preset("Absolute order")
     assert (w.cfg["episode_tv"], w.cfg["episode_anime"], w.cfg["episode_match"]) == ("absolute", "absolute", "number")
     asked = []
@@ -125,6 +126,8 @@ def test_builtin_presets(main, make_window, monkeypatch):
     assert w.cfg["episode_tv"] == "dvd"
     w._apply_builtin_preset("Streaming order")
     assert (w.cfg["episode_tv"], w.cfg["episode_match"]) == ("streaming", "number")
+    w._apply_builtin_preset("Aired order")                                       # back to the usual
+    assert (w.cfg["episode_tv"], w.cfg["episode_anime"], w.cfg["episode_match"]) == ("aired", "aired", "number")
 
 
 def test_settings_offer_the_four_orders(main, qapp, monkeypatch):

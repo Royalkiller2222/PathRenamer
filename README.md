@@ -52,7 +52,7 @@ The same renaming, without a window: `docker compose up -d` with [docker-compose
 
 ## Free and Pro
 
-Almost everything is free, forever: renaming, the watch folder that renames new downloads on its own, Plex, Jellyfin, Emby and Kodi scans, presets for DVD, streaming and absolute order, Docker, everything.
+Almost everything is free, forever: renaming, the watch folder that renames new downloads on its own, Plex, Jellyfin, Emby and Kodi scans, presets for aired, DVD, streaming and absolute order, Docker, everything.
 
 **PathRenamer Pro** is only for what costs money to run:
 
