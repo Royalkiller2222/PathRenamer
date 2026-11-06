@@ -123,9 +123,11 @@ attached a few minutes later.
 
 ## Pro, licensing and the app's API keys
 
-Renaming by hand is free. The automatic parts (watch-folder auto-rename,
-subtitles after renaming, media server scan after renaming) are Pro. Turning
-one on starts a 14-day trial; in Docker, `pathrenamer watch` starts it.
+Only features that cost money to run are Pro: today that is downloading
+subtitles after every rename (OpenSubtitles' API), later the hosted metadata
+service. The watch folder, media server scans and everything else are free.
+Turning automatic subtitles on starts a 14-day trial (`PRO_FEATURES` in
+`src/licensing.py`).
 
 The license and trial live sealed in config.json under `license_state`:
 encrypted with DPAPI for the Windows user, or signed with HMAC-SHA256 and a
@@ -149,6 +151,7 @@ Actions**:
 | `POLAR_ORGANIZATION_ID` | Variable | Your Polar organization ID. Setting it switches licensing on. |
 | `POLAR_PORTAL_URL` | Variable | Your Polar customer portal link (Manage My License). |
 | `OPENSUBTITLES_API_KEY` | Secret | The app's OpenSubtitles API key. Without it, users enter their own. |
+| `TVDB_API_KEY` | Secret | The app's TheTVDB API key, for DVD, streaming and absolute orders. Without it, users can enter their own (Settings → API Keys); otherwise those orders come from TVmaze. |
 
 To start selling Pro:
 

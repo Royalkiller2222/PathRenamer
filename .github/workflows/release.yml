@@ -68,12 +68,14 @@ jobs:
         shell: pwsh
         env:
           OPENSUBTITLES_API_KEY: ${{ secrets.OPENSUBTITLES_API_KEY }}
+          TVDB_API_KEY: ${{ secrets.TVDB_API_KEY }}
           POLAR_ORGANIZATION_ID: ${{ vars.POLAR_ORGANIZATION_ID }}
           POLAR_PORTAL_URL: ${{ vars.POLAR_PORTAL_URL }}
         run: |
           $lines = @(
             "# Written by the release build. Not in git.",
             "OPENSUBTITLES_API_KEY = '$($env:OPENSUBTITLES_API_KEY -replace "'", '')'",
+            "TVDB_API_KEY = '$($env:TVDB_API_KEY -replace "'", '')'",
             "POLAR_ORGANIZATION_ID = '$($env:POLAR_ORGANIZATION_ID -replace "'", '')'",
             "POLAR_PORTAL_URL = '$($env:POLAR_PORTAL_URL -replace "'", '')'"
           )
@@ -158,6 +160,7 @@ jobs:
       - name: Add the app's API keys
         env:
           OPENSUBTITLES_API_KEY: ${{ secrets.OPENSUBTITLES_API_KEY }}
+          TVDB_API_KEY: ${{ secrets.TVDB_API_KEY }}
           POLAR_ORGANIZATION_ID: ${{ vars.POLAR_ORGANIZATION_ID }}
           POLAR_PORTAL_URL: ${{ vars.POLAR_PORTAL_URL }}
         run: |
@@ -165,7 +168,7 @@ jobs:
           import os
           with open("src/build_info.py", "w", encoding="utf-8") as f:
               f.write("# Written by the release build. Not in git.\n")
-              for name in ("OPENSUBTITLES_API_KEY", "POLAR_ORGANIZATION_ID", "POLAR_PORTAL_URL"):
+              for name in ("OPENSUBTITLES_API_KEY", "TVDB_API_KEY", "POLAR_ORGANIZATION_ID", "POLAR_PORTAL_URL"):
                   value = (os.environ.get(name) or "").replace("\\", "").replace("'", "")
                   f.write(f"{name} = '{value}'\n")
           PY

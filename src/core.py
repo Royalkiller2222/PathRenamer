@@ -96,6 +96,7 @@ try:
 except ImportError:
     build_info = None
 OPENSUBTITLES_APP_KEY = getattr(build_info, "OPENSUBTITLES_API_KEY", "") or ""
+TVDB_APP_KEY = getattr(build_info, "TVDB_API_KEY", "") or ""
 WEBSITE_URL = "https://royalkiller2222.github.io/PathRenamer/"
 from scanner import (SUBTITLE_EXTENSIONS, detect_subtitle_language, is_language_only_name,
                      unique_subtitle_filename)
@@ -108,6 +109,8 @@ CONFIG_PATH = _APP_DIR / "config.json"
 HISTORY_PATH = _APP_DIR / "history.json"
 DEFAULTS = {
     "tmdb_api_key": "",
+    "tvdb_api_key": "",            # TheTVDB, for DVD/streaming/absolute orders (releases may have one built in)
+    "tvdb_pin": "",                # a TheTVDB subscriber PIN, for keys that need one
     "last_source_folder": "",
     "root_tv": "",
     "root_movie": "",
@@ -117,9 +120,13 @@ DEFAULTS = {
     # Each edition gets its own folder, as Plex wants when movies have folders
     "format_movie": "{title} ({year}) {edition}/{title} ({year}) {edition} {res} {vc} {ach} {c}",
     "format_anime": "{show} ({year})/Season {s00}/{show} {s00e00} - {title}",
-    "episode_tv": "dvd",
-    "episode_anime": "dvd",
+    # Episode order: "aired" (as broadcast), "dvd", "streaming" or "absolute"
+    "episode_tv": "aired",
+    "episode_anime": "aired",
+    "episode_orders_v2": True,     # (1.7: what was called "dvd" is the aired order)
     "rename_subtitles": True,
+    "handle_extras": True,         # featurettes, trailers, ... go next to their movie or show
+    "episode_match": "number",     # "number" | "title": match episodes by their title, not the numbers
     "use_tvmaze": True,            # data sources (Settings → Data Sources)
     "use_anidb": True,
     "use_cinemeta": True,
@@ -171,8 +178,23 @@ DEFAULTS = {
     "start_with_windows": False,   # start in the tray when Windows starts
 }
 
+# Episode orders (Settings → Formats, and the built-in presets)
+EPISODE_ORDERS = (("aired", "Aired order (as broadcast)"), ("dvd", "DVD order"),
+                  ("streaming", "Streaming order"), ("absolute", "Absolute order (1, 2, 3, … across seasons)"))
+
+# Presets that come with PathRenamer (Presets menu). "Strip episode numbers"
+# matches episodes by title and asks which order to name them in.
+BUILTIN_PRESETS = {
+    "Aired order": {"episode_tv": "aired", "episode_anime": "aired", "episode_match": "number"},
+    "DVD order": {"episode_tv": "dvd", "episode_anime": "dvd", "episode_match": "number"},
+    "Streaming order": {"episode_tv": "streaming", "episode_anime": "streaming", "episode_match": "number"},
+    "Absolute order": {"episode_tv": "absolute", "episode_anime": "absolute", "episode_match": "number"},
+    "Strip episode numbers": {"episode_match": "title"},
+}
+
 # What a preset remembers
 PRESET_KEYS = ("media_type", "format_tv", "format_movie", "format_anime", "episode_tv", "episode_anime",
+               "episode_match",
                "root_tv", "root_movie", "root_anime", "rename_action", "rename_subtitles",
                "use_tvmaze", "use_anidb", "use_cinemeta")
 
@@ -193,9 +215,16 @@ def cfg_load():
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = {**DEFAULTS, **json.load(f)}
+                saved = json.load(f)
+            cfg = {**DEFAULTS, **saved}
             if cfg.get("format_movie") in _OLD_MOVIE_DEFAULTS:
                 cfg["format_movie"] = DEFAULTS["format_movie"]
+            if not saved.get("episode_orders_v2"):
+                # Before 1.7 "dvd" (and "streaming") gave the aired order: keep the names people had
+                for key in ("episode_tv", "episode_anime"):
+                    if cfg.get(key) in ("dvd", "streaming"):
+                        cfg[key] = "aired"
+                cfg["episode_orders_v2"] = True
             return cfg
         except Exception:
             pass
@@ -212,17 +241,15 @@ def cfg_save(cfg):
 VIDEO_EXT = {".mkv",".mp4",".avi",".mov",".wmv",".m4v",".ts",".m2ts",".flv",".webm",".mpg",".mpeg"}
 SUB_EXT   = set(SUBTITLE_EXTENSIONS)     # .srt .sub .idx .ass .ssa .vtt .sup .smi
 
-# Sub-folders holding samples and bonus material, not episodes or movies
-# (Plex's extras folder names plus the usual release-folder ones).
-_SKIP_SCAN_DIRS = {"sample", "samples", "extras", "featurettes", "behind the scenes",
-                   "deleted scenes", "interviews", "trailers", "shorts", "bonus"}
+# Sub-folders holding samples: never renamed
+_SKIP_SCAN_DIRS = {"sample", "samples"}
 # "Movie.2019.1080p-sample.mkv", "sample-movie.mkv"
 _SAMPLE_FILE = re.compile(r"(?:^|[\s._-])sample(?:$|[\s._-])", re.IGNORECASE)
 
 def scan_folder(folder, include_subtitles=False):
-    """Video files (and optionally subtitles) under folder. Samples and files in
-    extras/sample sub-folders are skipped: renamed like the main file they would
-    collide with it."""
+    """Video files (and optionally subtitles) under folder. Samples are
+    skipped. Extras (Featurettes, Trailers, ... folders) are included:
+    match_files puts them next to their movie or show (see extra_kind)."""
     result = []
     for root, dirs, files in os.walk(folder):
         dirs[:] = sorted(d for d in dirs if d.strip().lower() not in _SKIP_SCAN_DIRS)
@@ -486,6 +513,8 @@ def fmt_tv(show, season, episode, title, ext, template, video_codec="", audio_co
 
     if episode_type == "absolute":
         template = template.replace("{s00e00}", "{abs00}")
+        # no season folder for absolute numbers ("Season {s00}/" would leave a folder called "Season")
+        template = re.sub(r"Season \{s(?:00)?\}[/\\]", "", template)
         template = template.replace("{s00}", "")
 
     try:
@@ -931,14 +960,30 @@ class CinemetaClient:
 # ═══════════════════════════════════════════════════════════════════
 #  API: TVMAZE
 # ═══════════════════════════════════════════════════════════════════
+def _last_number(text):
+    m = re.search(r"(\d+)/?$", str(text or ""))
+    return int(m.group(1)) if m else None
+
+
 class TVMazeClient:
-    def __init__(self): self.s = requests.Session()
+    def __init__(self):
+        self.s = requests.Session()
+        self._cache = {}             # answers already fetched (a season pack asks the same things)
     def _get(self, ep, **p):
+        key = (ep, tuple(sorted((k, str(v)) for k, v in p.items())))
+        if key in self._cache:
+            return self._cache[key]
         try:
             r = self.s.get(f"https://api.tvmaze.com{ep}", params=p, timeout=10)
-            if r.status_code == 404: return None
-            r.raise_for_status(); return r.json()
-        except Exception: return None
+            if r.status_code == 404:
+                self._cache[key] = None
+                return None
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            return None              # network trouble: not remembered, tried again next time
+        self._cache[key] = data
+        return data
     def search_show(self, title):
         d = self._get("/search/shows", q=title)
         if not d: return None
@@ -946,7 +991,8 @@ class TVMazeClient:
         s = best["show"]
         premiered = s.get("premiered", "")
         year = premiered[:4] if premiered else ""
-        return {"show": s["name"], "id": s["id"], "year": year}
+        return {"show": s["name"], "id": s["id"], "year": year,
+                "tvdb": (s.get("externals") or {}).get("thetvdb")}
     def search_show_all(self, title):
         d = self._get("/search/shows", q=title)
         if not d: return []
@@ -970,6 +1016,41 @@ class TVMazeClient:
         d = self._get(f"/shows/{show_id}/episodebynumber", season=season, number=episode)
         return {"title": d.get("name", f"Episode {episode}")} if d else None
 
+    def get_episodes(self, show_id):
+        """Every numbered episode of a show: [{"season", "number", "title"}]."""
+        d = self._get(f"/shows/{show_id}/episodes")
+        return [{"id": e.get("id"), "season": e.get("season"), "number": e.get("number"),
+                 "title": e.get("name") or ""}
+                for e in (d if isinstance(d, list) else [])
+                if e.get("season") is not None and e.get("number") is not None]
+
+    def get_alternate_order(self, show_id, kind):
+        """{TVMaze episode id: (season, number)} in the show's DVD ("dvd") or
+        streaming ("streaming") order, or None when TVMaze has no such list
+        for the show (most shows: their order is the aired one)."""
+        lists = self._get(f"/shows/{show_id}/alternatelists")
+        if not isinstance(lists, list) or not lists:
+            return None
+        if kind == "dvd":
+            chosen = next((l for l in lists if l.get("dvd_release")), None)
+        else:
+            chosen = (next((l for l in lists if l.get("streaming_premiere") and l.get("webChannel")), None)
+                      or next((l for l in lists if l.get("webChannel") and not l.get("dvd_release")), None))
+        if not chosen or chosen.get("id") is None:
+            return None
+        items = self._get(f"/alternatelists/{chosen['id']}/alternateepisodes", embed="episodes")
+        order = {}
+        for item in items if isinstance(items, list) else []:
+            if item.get("season") is None or item.get("number") is None:
+                continue
+            ids = [e.get("id") for e in ((item.get("_embedded") or {}).get("episodes") or [])]
+            ids += [_last_number(l.get("href")) for l in ((item.get("_links") or {}).get("episodes") or [])
+                    if isinstance(l, dict)]
+            for eid in ids:
+                if eid is not None:
+                    order[int(eid)] = (int(item["season"]), int(item["number"]))
+        return order or None
+
     def get_episode_by_date(self, show_id, air_date):
         d = self._get(f"/shows/{show_id}/episodesbydate", date=str(air_date))
         if isinstance(d, list) and d:
@@ -986,6 +1067,7 @@ class TVMazeClient:
             "show": data.get("name", ""),
             "id": show_id,
             "year": year,
+            "tvdb": (data.get("externals") or {}).get("thetvdb"),
         }
 
     def get_show_by_tvdb_id(self, tvdb_id):
@@ -1001,6 +1083,117 @@ class TVMazeClient:
             "first_air_date": d.get("premiered", ""),
             "rating": d.get("rating", {}).get("average", 0) if d.get("rating") else 0,
         }
+
+# ═══════════════════════════════════════════════════════════════════
+#  API: THETVDB (episode orders: aired, DVD, streaming/alternate, absolute)
+# ═══════════════════════════════════════════════════════════════════
+_TVDB_TOKENS = {}              # (key, pin) -> token; a token lasts a month
+
+
+class TVDBClient:
+    """TheTVDB API v4, for the episode orders TVMaze rarely has. Needs an API
+    key (and, for some keys, a subscriber PIN)."""
+    BASE = "https://api4.thetvdb.com/v4"
+    ORDERS = {"dvd": ("dvd",), "streaming": ("alternate", "regional"), "absolute": ("absolute",)}
+
+    def __init__(self, api_key, pin="", session=None, timeout=15):
+        self.api_key, self.pin = (api_key or "").strip(), (pin or "").strip()
+        self.s = session or requests.Session()
+        self.timeout = timeout
+        self._cache = {}
+
+    def _token(self, fresh=False):
+        key = (self.api_key, self.pin)
+        if fresh or key not in _TVDB_TOKENS:
+            body = {"apikey": self.api_key}
+            if self.pin:
+                body["pin"] = self.pin
+            r = self.s.post(f"{self.BASE}/login", json=body, timeout=self.timeout)
+            if r.status_code >= 400:
+                log.warning(f"TheTVDB didn't accept the API key ({r.status_code})")
+                return None
+            _TVDB_TOKENS[key] = ((r.json() or {}).get("data") or {}).get("token")
+        return _TVDB_TOKENS.get(key)
+
+    def _get(self, path, **params):
+        cache_key = (path, tuple(sorted(params.items())))
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        try:
+            for attempt in (0, 1):
+                token = self._token(fresh=attempt == 1)
+                if not token:
+                    return None
+                r = self.s.get(f"{self.BASE}{path}", params=params, timeout=self.timeout,
+                               headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+                if r.status_code != 401:
+                    break
+            if r.status_code == 404:
+                self._cache[cache_key] = None
+                return None
+            if r.status_code >= 400:
+                log.debug(f"TheTVDB answered {r.status_code} for {path}")
+                return None
+            data = r.json()
+        except Exception as e:
+            log.debug(f"TheTVDB request failed: {path}: {e!r}")
+            return None
+        self._cache[cache_key] = data
+        return data
+
+    def search_series(self, title, year=None):
+        d = self._get("/search", query=title, type="series")
+        items = (d or {}).get("data") or []
+        if not items:
+            return None
+        def score(x):
+            s = _title_score(title, x.get("name") or "")
+            return s + (5 if year and str(x.get("year")) == str(year) else 0)
+        best = max(items, key=score)
+        sid = best.get("tvdb_id") or str(best.get("id", "")).replace("series-", "")
+        return int(sid) if str(sid).isdigit() else None
+
+    def get_episodes(self, series_id, season_type="default"):
+        """[{"id", "season", "number", "absolute", "title"}] in that order (all pages)."""
+        out, page = [], 0
+        while page < 20:
+            d = self._get(f"/series/{series_id}/episodes/{season_type}", page=page)
+            eps = ((d or {}).get("data") or {}).get("episodes") or []
+            for e in eps:
+                if e.get("seasonNumber") is None or e.get("number") is None:
+                    continue
+                out.append({"id": e.get("id"), "season": int(e["seasonNumber"]), "number": int(e["number"]),
+                            "absolute": e.get("absoluteNumber"), "title": e.get("name") or ""})
+            if not eps or not ((d or {}).get("links") or {}).get("next"):
+                break
+            page += 1
+        return out
+
+    def order(self, series_id, season, episodes, order):
+        """(season, episodes) in the order for aired numbers, or None."""
+        aired = {(e["season"], e["number"]): e for e in self.get_episodes(series_id, "default")}
+        wanted = [aired.get((season, n)) for n in episodes]
+        if not all(wanted):
+            return None
+        if order == "absolute":
+            numbers = [e.get("absolute") for e in wanted]
+            if all(isinstance(n, int) and n > 0 for n in numbers):
+                return season, numbers
+        for season_type in self.ORDERS.get(order, ()):
+            listed = {e["id"]: (e["season"], e["number"]) for e in self.get_episodes(series_id, season_type)}
+            mapped = [listed.get(e["id"]) for e in wanted]
+            if all(mapped) and len({s for s, _ in mapped}) == 1:
+                if order == "absolute":
+                    return season, [n for _, n in mapped]
+                return mapped[0][0], [n for _, n in mapped]
+        return None
+
+
+def tvdb_from_config(cfg):
+    """The TheTVDB client the settings (or the release's built-in key) allow, or None."""
+    key = unprotect(cfg.get("tvdb_api_key") or "").strip() or TVDB_APP_KEY
+    return TVDBClient(key, unprotect(cfg.get("tvdb_pin") or "")) if key else None
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  API: ANIDB
@@ -1076,6 +1269,179 @@ class AniDBClient:
         return None
 
 # ═══════════════════════════════════════════════════════════════════
+#  EXTRAS (featurettes, trailers, deleted scenes, ...)
+# ═══════════════════════════════════════════════════════════════════
+# Folder names in releases -> the folder Plex, Jellyfin and Emby read extras from
+EXTRA_FOLDERS = {
+    "featurettes": "Featurettes", "featurette": "Featurettes", "making of": "Featurettes",
+    "behind the scenes": "Behind The Scenes", "behindthescenes": "Behind The Scenes", "bts": "Behind The Scenes",
+    "deleted scenes": "Deleted Scenes", "deleted": "Deleted Scenes",
+    "interviews": "Interviews", "interview": "Interviews",
+    "scenes": "Scenes", "shorts": "Shorts",
+    "trailers": "Trailers", "trailer": "Trailers", "teasers": "Trailers",
+    "extras": "Other", "extra": "Other", "bonus": "Other", "bonus features": "Other",
+    "special features": "Other", "other": "Other",
+}
+# What a file name says it is (checked inside an extras folder, and for a
+# file lying next to its movie)
+_EXTRA_NAME = [
+    (re.compile(r"(?i)(?:^|[\s._\-\[(])featurettes?(?:$|[\s._\-\])])"), "Featurettes"),
+    (re.compile(r"(?i)(?:^|[\s._\-\[(])(?:behind[\s._-]the[\s._-]scenes|making[\s._-]of)(?:$|[\s._\-\])])"), "Behind The Scenes"),
+    (re.compile(r"(?i)(?:^|[\s._\-\[(])deleted[\s._-]scenes?(?:$|[\s._\-\])])"), "Deleted Scenes"),
+    (re.compile(r"(?i)(?:^|[\s._\-\[(])(?:gag[\s._-]reel|bloopers)(?:$|[\s._\-\])])"), "Featurettes"),
+]
+_EXTRA_LOOSE_NAME = [               # only inside an extras folder: also common words in titles
+    (re.compile(r"(?i)\binterviews?\b"), "Interviews"),
+    (re.compile(r"(?i)\b(?:trailers?|teasers?)\b"), "Trailers"),
+]
+# Plex's own suffixes: "Dune (2021)-trailer.mkv"
+_EXTRA_SUFFIX = re.compile(r"(?i)-(behindthescenes|deleted|featurette|interview|scene|short|trailer|other)$")
+_SUFFIX_FOLDERS = {"behindthescenes": "Behind The Scenes", "deleted": "Deleted Scenes", "featurette": "Featurettes",
+                   "interview": "Interviews", "scene": "Scenes", "short": "Shorts", "trailer": "Trailers",
+                   "other": "Other"}
+
+
+def _extras_folder(path: Path):
+    """(the extras folder's Plex name, the release folder holding it) when the
+    file lies in an extras folder (at most two levels down), else (None, None)."""
+    for parent in list(Path(path).parents)[:2]:
+        kind = EXTRA_FOLDERS.get(re.sub(r"[\s._-]+", " ", parent.name).strip().lower())
+        if kind:
+            return kind, parent.parent
+    return None, None
+
+
+def extra_kind(path: Path):
+    """(Plex extras folder, the folder its movie or show is in) for an extra,
+    or (None, None). In an extras folder the name can make it more precise
+    ("Extras/Deleted Scene 1.mkv" -> Deleted Scenes). Next to the movie, only
+    an unmistakable name counts ("Dune.2021.Featurette.Spice.mkv",
+    "Dune (2021)-trailer.mkv"); match_files still checks the movie is there."""
+    path = Path(path)
+    stem = path.stem
+    kind, release = _extras_folder(path)
+    for rx, named in _EXTRA_NAME:
+        if rx.search(stem):
+            return (named if kind in (None, "Other", named) else kind), (release or path.parent)
+    m = _EXTRA_SUFFIX.search(stem)
+    if m:
+        return _SUFFIX_FOLDERS[m.group(1).lower()], (release or path.parent)
+    if kind == "Other":
+        for rx, named in _EXTRA_LOOSE_NAME:
+            if rx.search(stem):
+                return named, release
+    return kind, release
+
+
+_RELEASE_TAG = re.compile(
+    r"(?i)^(?:\d{3,4}[pi]|4k|uhd|hdr\d*|dv|dovi|sdr|web(?:-?dl|rip)?|amzn|nf|dsnp|hmax|atvp|bluray|blu-ray|bdrip|brrip|"
+    r"dvdrip|dvd|hdtv|hdrip|remux|x26[45]|h26[45]|h|264|265|hevc|avc|xvid|divx|aac\d*|ac3|eac3|dts(?:-?hd)?|"
+    r"ddp?\d*|atmos|truehd|flac|10bit|8bit|proper|repack|internal|multi|subbed|dubbed)$")
+_EXTRA_WORDS = re.compile(r"(?i)^(?:featurettes?|extras?|bonus|trailers?|teasers?|interviews?|"
+                          r"behindthescenes|deleted|scenes?|shorts?|other)$")
+
+
+_EXTRA_SINGULAR = {"Featurettes": "Featurette", "Behind The Scenes": "Behind the Scenes",
+                   "Deleted Scenes": "Deleted Scene", "Interviews": "Interview", "Scenes": "Scene",
+                   "Shorts": "Short", "Trailers": "Trailer", "Other": "Extra"}
+
+
+def extra_name(path: Path, owner_title="", owner_year="", kind=None):
+    """A readable name for an extra, as Plex shows it: release tags and the
+    movie's own title and year are taken off, and a leading "Featurette -"
+    after them. "Dune.2021.Featurette.The.Spice.Must.Flow.1080p.BluRay.x264-GRP"
+    -> "The Spice Must Flow"; "Deleted Scene 1" stays as it is."""
+    stem = _EXTRA_SUFFIX.sub("", Path(path).stem)
+    stem = re.sub(r"-[A-Za-z0-9]{2,12}$", "", stem) if re.search(r"[._]", stem) else stem   # -GROUP
+    words = [w for w in re.split(r"[\s._]+", stem) if w]
+    for i, w in enumerate(words):                  # tags start where the useful name ends
+        if _RELEASE_TAG.match(w.strip("[]()")):
+            words = words[:i]
+            break
+    owner = [w.lower() for w in re.split(r"[^\w']+", owner_title or "") if w]
+    lowered = [w.lower().strip("()[]-,:") for w in words]
+    cut = bool(owner) and lowered[:len(owner)] == owner
+    if cut:
+        words = words[len(owner):]
+    while words and (words[0].strip("()[]") == str(owner_year) or words[0] in ("-", "–")):
+        words, cut = words[1:], True
+    # "Featurette - The Making of Arrakis" or "<title> Featurette The ...": the word is a label
+    if len(words) > 1 and _EXTRA_WORDS.match(words[0].strip("-:")) and (cut or words[1] in ("-", "–", ":")
+                                                                       or words[0].endswith((":", "-"))):
+        words = words[1:]
+        while words and words[0] in ("-", "–", ":"):
+            words = words[1:]
+    name = sanitize(" ".join(words).strip(" -:")) if words else ""
+    if not name or name.lower() == str(owner_year):
+        name = _EXTRA_SINGULAR.get(kind or "", "") or sanitize(Path(path).stem)
+    return name
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  EPISODES BY TITLE
+# ═══════════════════════════════════════════════════════════════════
+_EP_NUMBERS = re.compile(r"(?i)\b(?:s\d{1,2}\s*e\d{1,3}(?:\s*-?\s*e\d{1,3})*|\d{1,2}x\d{2,3}|"
+                         r"(?:season|series|episode|ep|part)\s*\d+|e\d{1,3})\b")
+
+
+def _norm_words(text):
+    return re.sub(r"[^\w\s]", " ", str(text).lower().replace("&", " and ")).split()
+
+
+def episode_title_text(guess, show_name=""):
+    """The words in a file name that name the episode, without the show's
+    name, numbers or release tags: "The.Office.US.S02E01.The.Dundies.720p"
+    -> "The Dundies"; "Breaking Bad - Ozymandias.mkv" -> "Ozymandias"."""
+    raw = guess.raw or {}
+    text = ""
+    for key in ("episode_title", "alternative_title"):
+        v = raw.get(key)
+        if isinstance(v, list):
+            v = " ".join(str(x) for x in v)
+        if v:
+            text = str(v)
+            break
+    if not text:
+        v = raw.get("title")
+        text = " ".join(str(x) for x in v) if isinstance(v, list) else str(v or "")
+    words = _norm_words(_EP_NUMBERS.sub(" ", text))
+    show = [w for w in _norm_words(show_name) if not re.fullmatch(r"(?:19|20)\d\d|us|uk", w)]
+    if show and words[:len(show)] == show and len(words) > len(show):   # "The Office US The Dundies"
+        words = words[len(show):]
+        while len(words) > 1 and re.fullmatch(r"(?:19|20)\d\d|us|uk", words[0]):
+            words = words[1:]
+    if not words or words == show:
+        return ""
+    return " ".join(words)
+
+
+def best_episode_title(text, episodes, threshold=82, margin=6):
+    """(season, number, score) of the episode whose title best matches text,
+    or None when nothing is close or two episodes are about as close
+    ("Part 1" vs "Part 2")."""
+    from rapidfuzz import fuzz as _fuzz
+    want = " ".join(_norm_words(text))
+    if not want:
+        return None
+    scored = []
+    for e in episodes:
+        title = " ".join(_norm_words(e.get("title", "")))
+        if not title:
+            continue
+        score = max(_fuzz.ratio(want, title), 0.95 * _fuzz.token_set_ratio(want, title))
+        if want.replace(" ", "") == title.replace(" ", ""):
+            score = 100
+        scored.append((score, e))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: -x[0])
+    best, e = scored[0]
+    if best < threshold or (len(scored) > 1 and scored[1][0] > best - margin):
+        return None
+    return int(e["season"]), int(e["number"]), best
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MATCH ENGINE
 # ═══════════════════════════════════════════════════════════════════
 @dataclass(eq=False)
@@ -1098,6 +1464,7 @@ class Candidate:
     season: Optional[int] = None
     episodes: List[int] = field(default_factory=list)
     manual: bool = False                  # new name typed by the user
+    extra: str = ""                       # an extra: its Plex folder ("Featurettes", "Trailers", ...)
 
 def derive_title_for(path: Path, media_type: str = "tv") -> str:
     """Best-guess show/movie title for a file.
@@ -1110,9 +1477,10 @@ def derive_title_for(path: Path, media_type: str = "tv") -> str:
 
 
 class MatchEngine:
-    def __init__(self, cfg, tvmaze=None, anidb=None, tmdb=None, cinemeta=None):
+    def __init__(self, cfg, tvmaze=None, anidb=None, tmdb=None, cinemeta=None, tvdb=None):
         self.cfg = cfg; self.tvmaze = tvmaze; self.anidb = anidb
         self.tmdb = tmdb; self.cinemeta = cinemeta
+        self.tvdb = tvdb if tvdb is not None else tvdb_from_config(cfg)
     def match(self, path, media_type):
         return self.match_with_override(path, media_type)
 
@@ -1194,6 +1562,7 @@ class MatchEngine:
         Episode, Number in Order); they replace what the name says."""
         try:
             ext = path.suffix.lower()
+            chosen_numbers = bool(episodes)          # numbers picked by hand win over everything
             # Title, year, season, episode(s) / air date from the file name and
             # its folders. The file's own SxxEyy always wins; a folder's only
             # fills in what the file name lacks (e.g. obfuscated file names).
@@ -1233,10 +1602,18 @@ class MatchEngine:
                 return self._movie_with_title(path, title, guess.year, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id,
                                               edition=detect_edition(path.stem, raw))
 
+            by_title = None
+            if not chosen_numbers and (self.cfg.get("episode_match") == "title"
+                                 or (not guess.episodes and not guess.date)):
+                # No numbers, or numbers that may be wrong: find the episode by its title
+                by_title = self._episode_by_title(guess, title, selected_id)
+                if by_title:
+                    guess.season, guess.episodes, guess.date = by_title[0], [by_title[1]], None
             if not guess.episodes and not guess.date:
                 # Better to skip than to invent S01E01 (every such file would collide)
                 return Candidate(path, path.name, media_type, 0.0,
-                                 error="No season/episode number in the name")
+                                 error="No season/episode number in the name, and no episode title "
+                                       "that matches the show's episodes")
             season = guess.season if guess.season is not None else 1
             episodes = guess.episodes
             episode = episodes[0] if episodes else None
@@ -1244,12 +1621,77 @@ class MatchEngine:
             extra = dict(year=guess.year, episodes=episodes, air_date=guess.date,
                          fallback_title=guess.episode_title if guess.date else "")
             if media_type == "anime":
-                return self._anime_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id, **extra)
+                cand = self._anime_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id, **extra)
             else:
-                return self._tv_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id, **extra)
+                cand = self._tv_with_title(path, title, season, episode, ext, video_codec, audio_codec, audio_channels, media_source, resolution, selected_id, **extra)
+            if by_title and by_title[2] < 95:
+                cand.confidence = min(cand.confidence, 0.8)    # a close title, not an exact one: check it
+            elif (not by_title and self.cfg.get("episode_match") == "title" and not chosen_numbers
+                  and episode_title_text(guess, title)):
+                cand.confidence = min(cand.confidence, 0.6)    # its title wasn't found: numbers from the name
+            return cand
         except Exception as e:
             log.exception(f"match_with_override failed for {path.name}: {e}")
             return Candidate(path, path.name, media_type, 0.0, error=str(e))
+
+    def _episode_by_title(self, guess, show_title, selected_id=None):
+        """(season, episode, score 0-100) of the episode whose title the file
+        name carries, from the show's episode list on TVMaze, or None. Used
+        when the name has no SxxEyy, or when matching by title is turned on
+        (numbers in the name can be wrong)."""
+        if not self.tvmaze:
+            return None
+        id_src, sid = self._split_selected_id(selected_id)
+        if sid and id_src == "tvmaze":
+            info = self.tvmaze.get_show_info(sid) or {}
+            show_id, show_name = sid, info.get("show") or show_title
+        else:
+            found = self.tvmaze.search_show(show_title)
+            if not found:
+                return None
+            show_id, show_name = found["id"], found["show"]
+        text = episode_title_text(guess, show_name)
+        if not text:
+            return None
+        best = best_episode_title(text, self.tvmaze.get_episodes(show_id))
+        if best:
+            log.info(f"Episode by title: {text!r} -> S{best[0]:02d}E{best[1]:02d} ({best[2]:.0f}%)")
+        return best
+
+    def _in_order(self, show_id, season, episodes, order, show_name="", year=None):
+        """(season, episodes) in the chosen episode order for numbers in the
+        aired order. TheTVDB first (with a key): its DVD, alternate (streaming)
+        and absolute orders. Then TVMaze's alternate lists; absolute counts
+        every regular episode from the first. Numbers stay as they are when
+        neither has such an order for the show."""
+        if order not in ("dvd", "streaming", "absolute") or not episodes:
+            return season, episodes
+        if self.tvdb:
+            tvdb_id = None
+            if self.tvmaze and show_id:
+                tvdb_id = (self.tvmaze.get_show_info(show_id) or {}).get("tvdb")
+            if not tvdb_id and show_name:
+                tvdb_id = self.tvdb.search_series(show_name, year)
+            found = self.tvdb.order(tvdb_id, season, episodes, order) if tvdb_id else None
+            if found:
+                return found
+        if not self.tvmaze or not show_id:
+            return season, episodes
+        aired = self.tvmaze.get_episodes(show_id)
+        by_number = {(e["season"], e["number"]): e for e in aired}
+        if order == "absolute":
+            regular = sorted((e for e in aired if e["season"] and e["season"] > 0),
+                             key=lambda e: (e["season"], e["number"]))
+            position = {(e["season"], e["number"]): i + 1 for i, e in enumerate(regular)}
+            numbers = [position.get((season, n)) for n in episodes]
+            return (season, numbers) if all(numbers) else (season, episodes)
+        alternate = self.tvmaze.get_alternate_order(show_id, order)
+        if not alternate:
+            return season, episodes
+        mapped = [alternate.get((by_number.get((season, n)) or {}).get("id")) for n in episodes]
+        if not all(mapped) or len({s for s, _ in mapped}) != 1:
+            return season, episodes
+        return mapped[0][0], [n for _, n in mapped]
 
     def _episode_titles(self, client, show_id, season, episodes, air_date):
         """Episode title(s) from TVMaze / AniDB. Multi-episode files get the
@@ -1283,6 +1725,7 @@ class MatchEngine:
         show, ep_title, conf = title, default_title, 0.95
         show_year = ""
         id_src, sid = self._split_selected_id(selected_id)
+        show_id = sid if id_src == "tvmaze" else None
 
         # A show picked in the match selector is used by id; otherwise search
         # TVMaze by the detected title.
@@ -1304,6 +1747,7 @@ class MatchEngine:
             if s:
                 show = s["show"]
                 show_year = s.get("year", "")
+                show_id = s["id"]
                 tvmaze_log.debug(f"TVMAZE_FOUND: show='{show}', year='{show_year}', id={s['id']}")
                 log.debug(f"TVMaze found: {show}, year: '{show_year}'")
                 t = self._episode_titles(self.tvmaze, s["id"], season, episodes, air_date)
@@ -1320,8 +1764,10 @@ class MatchEngine:
 
         if not show_year and year:
             show_year = str(year)       # year from the file/folder name, e.g. "Doctor Who (2005)"
-        ep_type = self.cfg.get("episode_tv", "dvd")
-        rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_tv",""), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
+        ep_type = self.cfg.get("episode_tv", "aired")
+        name_season, name_eps = (season, episodes) if air_date else \
+            self._in_order(show_id, season, episodes, ep_type, show, show_year)
+        rel = fmt_tv(show, name_season, name_eps[0] if name_eps else episode, ep_title, ext, self.cfg.get("format_tv",""), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=name_eps, air_date=air_date)
         c = Candidate(path, rel, "tv", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
                       title=show, season=season, episodes=list(episodes), year=str(show_year or ""))
         if ext not in SUB_EXT:
@@ -1373,6 +1819,7 @@ class MatchEngine:
         show, ep_title, conf = title, default_title, 0.90
         show_year = ""
         id_src, sid = self._split_selected_id(selected_id)
+        show_id = sid if id_src == "tvmaze" else None
 
         if sid and id_src == "tvmaze" and self.tvmaze:
             show_info = self.tvmaze.get_show_info(sid)
@@ -1398,6 +1845,7 @@ class MatchEngine:
                 if s:
                     show = s["show"]
                     show_year = s.get("year", "")
+                    show_id = s["id"]
                     t = self._episode_titles(self.tvmaze, s["id"], season, episodes, air_date)
                     if t:
                         ep_title = t
@@ -1412,8 +1860,10 @@ class MatchEngine:
 
         if not show_year and year:
             show_year = str(year)
-        ep_type = self.cfg.get("episode_anime", "dvd")
-        rel = fmt_tv(show, season, episode, ep_title, ext, self.cfg.get("format_anime", self.cfg.get("format_tv","")), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=episodes, air_date=air_date)
+        ep_type = self.cfg.get("episode_anime", "aired")
+        name_season, name_eps = (season, episodes) if air_date else \
+            self._in_order(show_id, season, episodes, ep_type, show, show_year)
+        rel = fmt_tv(show, name_season, name_eps[0] if name_eps else episode, ep_title, ext, self.cfg.get("format_anime", self.cfg.get("format_tv","")), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=name_eps, air_date=air_date)
         c = Candidate(path, rel, "anime", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
                       title=show, season=season, episodes=list(episodes), year=str(show_year or ""))
         if ext not in SUB_EXT:
@@ -1466,6 +1916,17 @@ def match_files(files, engine, media_type, dest_root, selected_overrides=None, e
     episode_overrides = episode_overrides or {}         # str(path) -> (season, [episodes])
     sub_output_counts, dest_owner = {}, {}
     log.info(f"Scan started: {len(files)} file(s), type={media_type}, dest={dest_root}")
+    # Extras (featurettes, trailers, ...) go next to their movie or show, after it is matched
+    extras = []
+    for f in files:
+        if f.suffix.lower() in SUB_EXT or str(f) in selected_overrides or str(f) in episode_overrides:
+            continue
+        kind, release = extra_kind(f)
+        if kind:
+            extras.append((f, kind, release))
+    extra_paths = {os.path.normcase(str(f)) for f, _, _ in extras}
+    files = [f for f in files if os.path.normcase(str(f)) not in extra_paths]
+    owners = []                                       # (release folder, candidate) of matched videos
     # Videos first: their subtitles are renamed with them, so a subtitle
     # file that was also added to the list on its own is not done twice.
     ordered = ([f for f in files if f.suffix.lower() not in SUB_EXT] +
@@ -1504,11 +1965,62 @@ def match_files(files, engine, media_type, dest_root, selected_overrides=None, e
                     log.warning(f"  DUPLICATE: {f.name} and {owner.name} -> {dest}")
                 else:
                     claimed.update(os.path.normcase(str(s)) for s, _ in cand.subtitles)
+            if not cand.error and f.suffix.lower() not in SUB_EXT:
+                owners.append((f.parent, cand))
             yield cand
         except Exception as e:
             log.exception(f"Error matching {f.name}: {e}")
             yield Candidate(f, f.name, media_type, 0.0, error=str(e))
+    yield from _place_extras(extras, owners, engine, media_type, dest_root, dest_owner)
     log.info("Scan finished.")
+
+
+def _place_extras(extras, owners, engine, media_type, dest_root, dest_owner):
+    """Candidates for extras: "Dune (2021)/Featurettes/The Spice Must Flow.mkv"
+    next to the movie matched from the same release folder; for TV, in the
+    show's folder. An extra whose movie isn't in the list waits with a note;
+    a name that only looked like an extra is matched like any other file."""
+    on = engine.cfg.get("handle_extras", True)
+    for f, kind, release in extras:
+        owner = next((c for folder, c in owners if _same_path(folder, release)), None)
+        if owner is None and release is not None:   # an extras folder inside a season folder
+            owner = next((c for folder, c in owners if _same_path(folder.parent, release)), None)
+        in_folder = _extras_folder(f)[0] is not None
+        if owner is None and not in_folder:          # "Making of ..." alone: just a video
+            cand = engine.match_with_override(f, media_type)
+            cand_dest = Path(dest_root or ".") / cand.dest_rel
+            cand.conflict = not cand.error and cand_dest.exists() and not _same_path(cand_dest, f)
+            yield cand
+            continue
+        if not on:
+            yield Candidate(f, f.name, media_type, 0.0, extra=kind,
+                            error=f"{kind[:-1] if kind.endswith('s') else kind}: extras are turned off "
+                                  "(Settings → Options)")
+            continue
+        if owner is None:
+            yield Candidate(f, f.name, media_type, 0.0, extra=kind,
+                            error=f"Extra ({kind}): add its movie or episode to the list too, so it "
+                                  "knows where to go")
+            continue
+        parts = Path(owner.dest_rel).parts
+        if len(parts) < 2:
+            yield Candidate(f, f.name, media_type, 0.0, extra=kind,
+                            error="Extras need a folder per movie or show in the naming format")
+            continue
+        home = Path(parts[0]) if owner.media_type in ("tv", "anime") else Path(owner.dest_rel).parent
+        name = extra_name(f, owner.title, owner.year, kind)
+        rel = home / kind / f"{name}{f.suffix.lower()}"
+        n = 2
+        while os.path.normcase(os.path.normpath(str(Path(dest_root or ".") / rel))) in dest_owner:
+            rel = home / kind / f"{name} {n}{f.suffix.lower()}"
+            n += 1
+        dest = Path(dest_root or ".") / rel
+        dest_owner[os.path.normcase(os.path.normpath(str(dest)))] = f
+        cand = Candidate(f, str(rel).replace("\\", "/"), owner.media_type, owner.confidence, extra=kind,
+                         title=owner.title, year=owner.year, resolution=owner.resolution)
+        cand.conflict = dest.exists() and not _same_path(dest, f)
+        log.debug(f"Extra: {f.name} -> {cand.dest_rel}")
+        yield cand
 
 
 def rename_groups(cands, dst):

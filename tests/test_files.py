@@ -4,16 +4,16 @@ from pathlib import Path
 from conftest import make_files
 
 
-def test_scan_skips_samples_and_extras(main, tmp_path):
+def test_scan_skips_samples_but_keeps_extras(main, tmp_path):
     keep = make_files(tmp_path,
                       "Movie.2019.1080p.BluRay.x264-GRP/Movie.2019.1080p.BluRay.x264-GRP.mkv",
-                      "Show.S01.1080p/Show.S01E01.1080p.mkv")
+                      "Movie.2019.1080p.BluRay.x264-GRP/Featurettes/Making Of.mkv",
+                      "Show.S01.1080p/Show.S01E01.1080p.mkv",
+                      "Show.S01.1080p/Extras/Gag Reel.mkv")
     make_files(tmp_path,
                "Movie.2019.1080p.BluRay.x264-GRP/movie.2019.1080p-sample.mkv",
-               "Movie.2019.1080p.BluRay.x264-GRP/Sample/movie-sample.mkv",
-               "Movie.2019.1080p.BluRay.x264-GRP/Featurettes/Making Of.mkv",
-               "Show.S01.1080p/Extras/Gag Reel.mkv")
-    assert sorted(main.scan_folder(str(tmp_path))) == sorted(keep)
+               "Movie.2019.1080p.BluRay.x264-GRP/Sample/movie-sample.mkv")
+    assert sorted(main.scan_folder(str(tmp_path))) == sorted(keep)        # extras: see test_extras.py
 
 
 def test_scan_still_takes_an_explicitly_chosen_extras_folder(main, tmp_path):

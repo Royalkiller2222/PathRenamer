@@ -67,15 +67,16 @@ def test_episodes_are_detected_by_name(watch_window, qapp, tmp_path):
     assert w._watch_media_type(Path("Inception.2010.mkv")) == "anime"
 
 
-def test_automatic_renaming_needs_pro_after_licensing_starts(watch_window, qapp, tmp_path, monkeypatch):
+def test_automatic_renaming_is_free_after_the_trial(watch_window, qapp, tmp_path, monkeypatch):
+    """Only features that cost money to run are Pro: the watch folder isn't."""
     import licensing
     monkeypatch.setattr(licensing, "POLAR_ORGANIZATION_ID", "org")
     w = watch_window(**ended_trial())
     _watching(w, qapp, tmp_path / "dl")
     (tmp_path / "dl" / "Heat.1995.mkv").write_bytes(b"x")
-    assert wait_until(qapp, lambda: w.table.rowCount() == 1, timeout=10)
-    assert "part of PathRenamer Pro" in w.status.currentMessage()
-    assert (tmp_path / "dl" / "Heat.1995.mkv").exists()
+    assert wait_until(qapp, lambda: not (tmp_path / "dl" / "Heat.1995.mkv").exists(), timeout=10)
+    assert list((tmp_path / "movies").rglob("Heat (1995)*.mkv"))
+    assert "Pro" not in w.status.currentMessage()
 
 
 def test_after_rename_downloads_subtitles_and_scans_plex(make_window, qapp, tmp_path):
@@ -149,6 +150,7 @@ def test_settings_save_automation(main, qapp, monkeypatch, tmp_path):
     d.plex_url.setText("http://localhost:32400")
     d.plex_token.setText("tok")
     d.subs_languages.setText("en, spanish, klingon")
+    d.subs_auto.setChecked(True)                       # the one Pro switch: starts the trial
     d._save()
     c = d.cfg
     assert (c["watch_enabled"], c["watch_media_type"], c["watch_auto_rename"]) == (True, "movie", True)
@@ -160,10 +162,13 @@ def test_settings_save_automation(main, qapp, monkeypatch, tmp_path):
 def test_pro_switches_lock_after_the_trial(main, qapp, monkeypatch):
     import licensing
     monkeypatch.setattr(licensing, "POLAR_ORGANIZATION_ID", "org")
-    d = main.SettingsDialog(dict(main.DEFAULTS, watch_auto_rename=True, **ended_trial()))
-    assert not d.watch_auto.isEnabled() and not d.watch_auto.isChecked()
+    d = main.SettingsDialog(dict(main.DEFAULTS, watch_auto_rename=True, plex_auto_scan=True, subs_auto=True,
+                                 **ended_trial()))
+    assert not d.subs_auto.isEnabled() and not d.subs_auto.isChecked()          # subtitles: Pro
+    assert d.watch_auto.isEnabled() and d.watch_auto.isChecked()               # free
+    assert d.server_auto.isEnabled() and d.server_auto.isChecked()
     assert "trial has ended" in d.pro_status.text()
     early = main.SettingsDialog(dict(main.DEFAULTS))
     monkeypatch.setattr(licensing, "POLAR_ORGANIZATION_ID", "")
     early = main.SettingsDialog(dict(main.DEFAULTS))
-    assert early.watch_auto.isEnabled() and early.pro_key_box.isHidden()
+    assert early.subs_auto.isEnabled() and early.pro_key_box.isHidden()

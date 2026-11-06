@@ -1,9 +1,9 @@
 """PathRenamer Free and Pro.
 
-Renaming by hand is free, forever. Pro adds what PathRenamer does on its own:
-renaming new downloads from a watch folder, downloading missing subtitles
-after a rename, and asking the media server to scan. Everything that was free
-stays free.
+Everything is free, the watch folder and media server scans included. Pro
+is only for features that cost money to run: today, downloading missing
+subtitles after every rename (OpenSubtitles' paid API), later the hosted
+metadata service. Everything that was free stays free.
 
 Pro license keys are sold through Polar (polar.sh), which takes the payment
 and handles sales tax and VAT. A key is checked with Polar's public
@@ -62,9 +62,7 @@ DAY = 86400
 
 # Pro features: config switch -> what it does
 PRO_FEATURES = {
-    "watch_auto_rename": "Rename new downloads in a watch folder automatically",
     "subs_auto": "Download missing subtitles after every rename",
-    "plex_auto_scan": "Ask your media server (Plex, Jellyfin, Emby or Kodi) to scan as soon as files are renamed",
 }
 
 # The sealed state lives in the config under STATE_KEY. Plain values under the

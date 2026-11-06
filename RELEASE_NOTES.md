@@ -1,11 +1,9 @@
-PathRenamer 1.6.0 works with every media server and keeps itself up to date.
+PathRenamer 1.7.0 makes automation free, takes care of extras and knows every episode order.
 
-- **Jellyfin, Emby and Kodi**: connect your server under Settings → Automation → Media Server. Like Plex, it can scan the new files right after renaming, so they show up in seconds. Apps that play from these servers, like Plezy, see them too.
-- **One-click updates**: PathRenamer checks for a new version once a day. When one is out, click **Update to …** at the bottom right: it is downloaded, checked and installed, and PathRenamer starts again. Or use Help → Check for Updates.
-- **Tray and Windows start**: keep PathRenamer running in the tray when you close the window, so the watch folder keeps working, and start it with Windows (Settings → Options).
-- **Docker for servers and NAS boxes**: the same renaming on Linux, a Mac, Synology, Unraid or a Raspberry Pi, with every free feature: `ghcr.io/royalkiller2222/pathrenamer`. See [DOCKER.md](https://github.com/Royalkiller2222/PathRenamer/blob/main/DOCKER.md).
-- **Safer Pro**: licenses are tied to your computers and can't be unlocked by editing the settings.
+- **The watch folder and media server scans are now free**: new downloads are renamed into your library on their own, and Plex, Jellyfin, Emby or Kodi scans them right away, without Pro. Pro is only for what costs money to run: subtitles downloaded automatically after every rename.
+- **Episode orders**: aired, DVD, streaming and absolute (Settings → Formats). DVD, streaming and absolute orders come from TheTVDB (or TVmaze, without a TheTVDB key) for shows whose releases number episodes differently.
+- **Five built-in presets** (Presets menu): Aired order, DVD order, Streaming order, Absolute order and **Strip episode numbers**, which ignores the numbers in the file names, finds each episode by its title and names it in the order you pick.
+- **Featurettes and other extras**: files in Featurettes, Behind The Scenes, Deleted Scenes, Interviews, Trailers or Extras folders go into the movie's (or show's) folder, where Plex, Jellyfin and Emby show them as extras.
+- **Episodes by title**: files without an episode number, like "The Office - The Dundies.mkv", are matched by their episode title.
 
-Renaming by hand stays free. The automatic parts are part of PathRenamer Pro, with a free 14-day trial.
-
-Install with **PathRenamer-Setup-1.6.0.exe**. It upgrades an existing installation and keeps your settings. **PathRenamer.exe** is the same app without an installer. From 1.6.0 on, PathRenamer updates itself.
+Install with **PathRenamer-Setup-1.7.0.exe**, or click **Update to 1.7.0** in PathRenamer 1.6.0. It keeps your settings. Docker: `docker compose pull && docker compose up -d`.

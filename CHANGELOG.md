@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.7.0
+
+- Extras: files in Featurettes, Behind The Scenes, Deleted Scenes, Interviews,
+  Scenes, Shorts, Trailers or Extras folders (and names like
+  "Movie.2021.Featurette.Title" or "Movie (2021)-trailer") are renamed into
+  the movie's folder, or the show's, in the subfolder Plex, Jellyfin and Emby
+  read extras from: `Dune (2021)/Featurettes/The Spice Must Flow.mkv`.
+  Release tags and the movie's title are taken off their names. They used to
+  be skipped. Settings → Options can turn this off.
+- Episodes by title: a TV file without SxxEyy is matched by its episode title
+  ("The Office - The Dundies.mkv" -> S02E01). Settings → Options → "Match TV
+  episodes by their title" also ignores wrong numbers in names
+  ("Show.S02E05.The.Dundies.mkv" -> S02E01). Close but not exact titles, and
+  two equally close ones ("The Job (1)" / "(2)"), are marked for a look.
+  Command line: `pathrenamer rename --by-title`.
+- TVMaze answers are remembered while PathRenamer runs, so a season pack asks
+  for each show and episode list once.
+- Episode orders: aired (as broadcast), DVD, streaming and absolute. DVD and
+  streaming orders come from TVMaze's alternate episode lists, for shows whose
+  DVD or streaming release numbers episodes differently; absolute counts every
+  regular episode across seasons, without a season folder. The old "DVD"
+  setting gave the aired order, so existing settings become "aired" and names
+  don't change. Command line: `pathrenamer rename --order dvd`.
+  With a TheTVDB API key (built into releases when the TVDB_API_KEY secret
+  is set, or your own under Settings → API Keys), the orders come from
+  TheTVDB: its DVD, alternate (streaming) and absolute orders. Without one,
+  from TVmaze.
+- Five presets come with PathRenamer (Presets menu): Aired order, DVD order,
+  Streaming order, Absolute order, and Strip episode numbers (episodes found by their
+  title, named in the order you pick).
+- Free: the watch folder that renames on its own, and media server scans after
+  renaming. Pro is only for what costs money to run: subtitles downloaded
+  automatically after every rename.
+
 ## 1.6.0
 
 - Jellyfin, Emby and Kodi: Settings → Automation → Media Server connects
