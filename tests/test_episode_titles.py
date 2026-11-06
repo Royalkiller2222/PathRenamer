@@ -107,6 +107,6 @@ def test_episode_lists_and_answers_are_fetched_once():
         def json(self):
             return [{"season": 1, "number": 1, "name": "Pilot"}, {"season": 1, "number": None, "name": "Special"}]
     client.s.get = lambda url, params=None, timeout=None: calls.append(url) or Response()
-    assert client.get_episodes(526) == [{"season": 1, "number": 1, "title": "Pilot"}]
+    assert client.get_episodes(526) == [{"id": None, "season": 1, "number": 1, "title": "Pilot"}]
     client.get_episodes(526)
     assert len(calls) == 1

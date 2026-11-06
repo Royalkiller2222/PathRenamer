@@ -141,21 +141,26 @@ def test_watch_renames_new_downloads(home, capsys):
     assert "1 new file(s) for movies" in capsys.readouterr().out
 
 
-def test_watch_without_pro_only_reports(home, capsys, monkeypatch):
+def test_watch_renames_without_pro_but_downloads_no_subtitles(home, capsys, monkeypatch):
     monkeypatch.setattr(licensing, "POLAR_ORGANIZATION_ID", "org")
-    core.cfg_save(dict(core.cfg_load(), **ended_trial()))
+    core.cfg_save(dict(core.cfg_load(), subs_auto=True, **ended_trial()))
+    monkeypatch.setattr(cli, "subtitle_client", lambda cfg: pytest.fail("subtitles are Pro"))
     video = make_files(home / "dl", "Inception.2010.1080p.WEB-DL.mkv")[0]
+    video.write_bytes(b"video")
     w = _watcher(home)
     w.start_trial_if_needed()
     w.handle([video])
     out = capsys.readouterr().out
-    assert video.exists() and "part of PathRenamer Pro" in out and "Needs a look" in out
+    assert not video.exists() and "1 new file(s) for movies" in out
+    assert "Downloading subtitles after renaming is part of PathRenamer Pro" in out
 
 
-def test_watch_starts_the_trial(home, capsys, monkeypatch):
+def test_subtitles_after_renaming_start_the_trial(home, capsys, monkeypatch):
     monkeypatch.setattr(licensing, "POLAR_ORGANIZATION_ID", "org")
-    w = _watcher(home)
-    w.start_trial_if_needed()
+    _watcher(home).start_trial_if_needed()                          # subtitles off: no trial
+    assert capsys.readouterr().out == "" and not licensing.License(core.cfg_load()).trial_active()
+    core.cfg_save(dict(core.cfg_load(), subs_auto=True))
+    _watcher(home).start_trial_if_needed()
     assert "14-day Pro trial has started" in capsys.readouterr().out
     assert licensing.License(core.cfg_load()).trial_active()        # saved
 

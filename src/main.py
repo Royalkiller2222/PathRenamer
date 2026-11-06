@@ -78,6 +78,15 @@ def _set_link_color(pal):
     app.setPalette(palette)
 
 
+def _order_combo(current):
+    """A drop-down of the episode orders (EPISODE_ORDERS)."""
+    box = QComboBox()
+    for key, label in EPISODE_ORDERS:
+        box.addItem(label, key)
+    box.setCurrentIndex(max(0, box.findData(current)))
+    return box
+
+
 def _note_label(text):
     note = QLabel(text)
     note.setWordWrap(True)
@@ -309,7 +318,7 @@ class PlexSignInDialog(QDialog):
 #  SETTINGS DIALOG
 # ═══════════════════════════════════════════════════════════════════
 class SettingsDialog(QDialog):
-    PRO_SWITCHES = ("watch_auto_rename", "plex_auto_scan", "subs_auto")
+    PRO_SWITCHES = ("subs_auto",)
 
     def __init__(self, cfg, parent=None, page=None):
         super().__init__(parent)
@@ -463,16 +472,12 @@ class SettingsDialog(QDialog):
         grp3 = QGroupBox("Episode Numbering")
         gl3 = QFormLayout(grp3)
 
-        self.episode_tv = QComboBox()
-        self.episode_tv.addItems(["DVD", "Absolute", "Streaming"])
-        ep_map = {"dvd": 0, "absolute": 1, "streaming": 2}
-        self.episode_tv.setCurrentIndex(ep_map.get(self.cfg.get("episode_tv", "dvd"), 0))
+        self.episode_tv = _order_combo(self.cfg.get("episode_tv", "aired"))
         gl3.addRow("TV Shows:", self.episode_tv)
-
-        self.episode_anime = QComboBox()
-        self.episode_anime.addItems(["DVD", "Absolute", "Streaming"])
-        self.episode_anime.setCurrentIndex(ep_map.get(self.cfg.get("episode_anime", "dvd"), 0))
+        self.episode_anime = _order_combo(self.cfg.get("episode_anime", "aired"))
         gl3.addRow("Anime:", self.episode_anime)
+        gl3.addRow(_note_label("DVD and streaming orders come from TVmaze, for shows whose DVD or streaming "
+                               "release numbers episodes differently; other shows keep the aired order."))
 
         L.addWidget(grp3)
         L.addStretch()
@@ -685,8 +690,8 @@ class SettingsDialog(QDialog):
             self.watch_type.addItem(label, key)
         self.watch_type.setCurrentIndex(max(0, self.watch_type.findData(self.cfg.get("watch_media_type", "auto"))))
         gl.addRow("New files are:", self.watch_type)
-        self.watch_auto = self._pro_checkbox("Rename the files PathRenamer is sure about automatically",
-                                             "watch_auto_rename")
+        self.watch_auto = QCheckBox("Rename the files PathRenamer is sure about automatically")
+        self.watch_auto.setChecked(bool(self.cfg.get("watch_auto_rename")))
         gl.addRow(self.watch_auto)
         self.watch_existing = QCheckBox("Also handle the files already in the folder when watching starts")
         self.watch_existing.setChecked(bool(self.cfg.get("watch_include_existing")))
@@ -760,7 +765,8 @@ class SettingsDialog(QDialog):
         test_row.addWidget(self.plex_test_btn)
         test_row.addWidget(self.plex_status, 1)
         g2.addRow("", test_row)
-        self.server_auto = self._pro_checkbox("Ask the media server to scan right after renaming", "plex_auto_scan")
+        self.server_auto = QCheckBox("Ask the media server to scan right after renaming")
+        self.server_auto.setChecked(bool(self.cfg.get("plex_auto_scan")))
         g2.addRow(self.server_auto)
         g2.addRow("", _note_label("Only the folders that changed are scanned, so new episodes show up in "
                                   "seconds, also in apps like Plezy. Tools → Scan Media Server Now works "
@@ -909,10 +915,9 @@ class SettingsDialog(QDialog):
         self.btn_deactivate.setEnabled(has_key)
         self.pro_status.setText(self.license.summary())
         allowed = self.license.can_try()
-        for box in (getattr(self, "watch_auto", None), getattr(self, "server_auto", None),
-                    getattr(self, "subs_auto", None)):
-            if box is not None:
-                box.setEnabled(allowed)
+        box = getattr(self, "subs_auto", None)                  # the one Pro switch
+        if box is not None:
+            box.setEnabled(allowed)
 
     def _license_job(self, work, busy_text):
         """Run a License call on a copy of the settings in the background;
@@ -1079,8 +1084,8 @@ class SettingsDialog(QDialog):
             "format_tv": self.fmt_tv.text().strip(),
             "format_movie": self.fmt_movie.text().strip(),
             "format_anime": self.fmt_anime.text().strip(),
-            "episode_tv": ep_map[self.episode_tv.currentIndex()],
-            "episode_anime": ep_map[self.episode_anime.currentIndex()],
+            "episode_tv": self.episode_tv.currentData(),
+            "episode_anime": self.episode_anime.currentData(),
             "theme": self.theme_combo.currentData(),
             "layout": LAYOUTS[self.layout_combo.currentIndex()],
             "panel_mode": PANEL_MODES[self.panel_combo.currentIndex()],
@@ -2015,13 +2020,6 @@ class FormatEditorDialog(QDialog):
         ("{ext}", "File extension (no dot)", "mkv", True),
     ]
 
-    def _detect_episode_type(self, template_text):
-        if not template_text:
-            return "dvd"
-        if "{e00}" in template_text and "{s00e00}" not in template_text:
-            return "absolute"
-        return "dvd"
-
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.cfg = cfg
@@ -2082,12 +2080,8 @@ class FormatEditorDialog(QDialog):
         self.tv_template.textChanged.connect(self._update_tv_preview)
         gl2.addRow("Template:", self.tv_template)
 
-        self.tv_ep_type = QComboBox()
-        self.tv_ep_type.addItems(["DVD", "Absolute", "Streaming"])
-        saved_ep = self.cfg.get("format_tv", "")
-        ep_type = self._detect_episode_type(saved_ep)
-        self.tv_ep_type.setCurrentIndex({"dvd": 0, "absolute": 1, "streaming": 2}.get(ep_type, 0))
-        self.tv_ep_type.currentTextChanged.connect(self._update_tv_preview)
+        self.tv_ep_type = _order_combo(self.cfg.get("episode_tv", "aired"))
+        self.tv_ep_type.currentIndexChanged.connect(self._update_tv_preview)
         gl2.addRow("Episode Type:", self.tv_ep_type)
 
         L.addWidget(grp2)
@@ -2122,12 +2116,8 @@ class FormatEditorDialog(QDialog):
         self.anime_template.textChanged.connect(self._update_anime_preview)
         gl2.addRow("Template:", self.anime_template)
 
-        self.anime_ep_type = QComboBox()
-        self.anime_ep_type.addItems(["DVD", "Absolute", "Streaming"])
-        saved_ep = self.cfg.get("format_anime", "")
-        ep_type = self._detect_episode_type(saved_ep)
-        self.anime_ep_type.setCurrentIndex({"dvd": 0, "absolute": 1, "streaming": 2}.get(ep_type, 0))
-        self.anime_ep_type.currentTextChanged.connect(self._update_anime_preview)
+        self.anime_ep_type = _order_combo(self.cfg.get("episode_anime", "aired"))
+        self.anime_ep_type.currentIndexChanged.connect(self._update_anime_preview)
         gl2.addRow("Episode Type:", self.anime_ep_type)
 
         L.addWidget(grp2)
@@ -2285,14 +2275,12 @@ class FormatEditorDialog(QDialog):
 
     def _update_tv_preview(self):
         template = self.tv_template.text() or "{show}/Season {s00}/{show} {s00e00} - {title}"
-        ep_type = self.tv_ep_type.currentText().lower()
-        result = self._format_preview(template, ep_type)
+        result = self._format_preview(template, self.tv_ep_type.currentData())
         self.tv_example.setText(result)
 
     def _update_anime_preview(self):
         template = self.anime_template.text() or "{show}/Season {s00}/{show} {s00e00} - {title}"
-        ep_type = self.anime_ep_type.currentText().lower()
-        result = self._format_preview(template, ep_type)
+        result = self._format_preview(template, self.anime_ep_type.currentData())
         self.anime_example.setText(result)
 
     def _update_movie_preview(self):
@@ -2345,8 +2333,8 @@ class FormatEditorDialog(QDialog):
         self.cfg["format_tv"] = self.tv_template.text()
         self.cfg["format_anime"] = self.anime_template.text()
         self.cfg["format_movie"] = self.movie_template.text()
-        self.cfg["episode_tv"] = self.tv_ep_type.currentText().lower()
-        self.cfg["episode_anime"] = self.anime_ep_type.currentText().lower()
+        self.cfg["episode_tv"] = self.tv_ep_type.currentData()
+        self.cfg["episode_anime"] = self.anime_ep_type.currentData()
         cfg_save(self.cfg)
 
         if self.parent and hasattr(self.parent, "fmt_tv"):
@@ -3795,13 +3783,24 @@ class MainWindow(QMainWindow):
     def _fill_presets_menu(self):
         menu = self.presets_menu
         menu.clear()
+        tips = {"DVD order": "Name episodes in their DVD order",
+                "Streaming order": "Name episodes in their streaming order",
+                "Absolute order": "Number episodes 1, 2, 3, … across all seasons",
+                "Strip episode numbers": "Ignore the numbers in the names, find each episode by its title, "
+                                         "then name it in the order you pick"}
+        for name in BUILTIN_PRESETS:
+            act = menu.addAction(name)
+            act.setToolTip(tips.get(name, ""))
+            act.setStatusTip(tips.get(name, ""))
+            act.triggered.connect(lambda _=False, n=name: self._apply_builtin_preset(n))
+        menu.addSeparator()
         presets = self.cfg.get("presets") or {}
         if presets:
             for name in sorted(presets, key=str.lower):
                 act = menu.addAction(f"Use “{name}”")
                 act.triggered.connect(lambda _=False, n=name: self._apply_preset(n))
         else:
-            none = menu.addAction("No presets yet")
+            none = menu.addAction("No presets of your own yet")
             none.setEnabled(False)
         menu.addSeparator()
         menu.addAction("Save Current Settings as Preset…").triggered.connect(self._save_preset)
@@ -3844,6 +3843,32 @@ class MainWindow(QMainWindow):
         msg = f"Using preset “{name}”."
         if self.table.rowCount():
             msg += " Click Preview to see the names with it."
+        self.status.showMessage(msg)
+
+    def _apply_builtin_preset(self, name, order=None):
+        """A preset that comes with PathRenamer: an episode order, or matching
+        episodes by title (which asks for the order to name them in)."""
+        values = dict(BUILTIN_PRESETS[name])
+        if values.get("episode_match") == "title" and "episode_tv" not in values:
+            if order is None:
+                labels = [label for _, label in EPISODE_ORDERS]
+                current = next((i for i, (k, _) in enumerate(EPISODE_ORDERS)
+                                if k == self.cfg.get("episode_tv", "aired")), 0)
+                label, ok = QInputDialog.getItem(
+                    self, "Strip episode numbers",
+                    "The numbers in the file names are ignored and each episode is found by its title.\n"
+                    "Which order should the episodes be numbered in?", labels, current, False)
+                if not ok:
+                    return
+                order = next(k for k, l in EPISODE_ORDERS if l == label)
+            values.update(episode_tv=order, episode_anime=order)
+        self.cfg.update(values)
+        cfg_save(self.cfg)
+        order_name = dict(EPISODE_ORDERS).get(self.cfg.get("episode_tv"), "").split(" (")[0].lower()
+        msg = (f"Episodes are found by their title and named in {order_name}." if values["episode_match"] == "title"
+               else f"Episodes are named in {order_name}.")
+        if self.table.rowCount():
+            msg += " Click Preview to see the new names."
         self.status.showMessage(msg)
 
     def _delete_preset(self, name):
@@ -4015,7 +4040,7 @@ class MainWindow(QMainWindow):
 
     # ── Drag & drop ─────────────────────────────────────────────────
     # ── Watch folder ─────────────────────────────────────────────────
-    WATCH_SURE = 0.85                 # matches at least this sure are renamed on their own (Pro)
+    WATCH_SURE = 0.85                 # matches at least this sure are renamed on their own
 
     def _apply_automation(self):
         """Start, move or stop the watch folder to match the settings."""
@@ -4117,7 +4142,7 @@ class MainWindow(QMainWindow):
             return
         mark_duplicates(cands, dst)
         wanted = bool(self.cfg.get("watch_auto_rename"))
-        allowed = wanted and self.license.allows("watch_auto_rename")
+        allowed = wanted
         sure = [c for c in cands if allowed and dst and not c.error and not c.conflict
                 and c.confidence >= self.WATCH_SURE and c.source.suffix.lower() not in SUB_EXT]
         notes, placed = [], set()
@@ -4136,8 +4161,7 @@ class MainWindow(QMainWindow):
         if rest:
             shown = self._show_watch_candidates(rest, media_type, dst)
             where = "in the preview" if shown else "in the file list"
-            why = " (automatic renaming is part of PathRenamer Pro)" if wanted and not allowed else ""
-            notes.append(f"{len(rest)} new file(s) to check {where}{why}")
+            notes.append(f"{len(rest)} new file(s) to check {where}")
             self._notify("New downloads", f"{len(rest)} new file(s) to check in PathRenamer.")
         self.status.showMessage(" · ".join(notes))
 
@@ -4176,7 +4200,7 @@ class MainWindow(QMainWindow):
         """Pro: download missing subtitles, then ask the media server to scan, in the
         background. Downloads join the rename's undo step."""
         subs_on = bool(self.cfg.get("subs_auto")) and self.license.allows("subs_auto")
-        plex_on = bool(self.cfg.get("plex_auto_scan")) and self.license.allows("plex_auto_scan")
+        plex_on = bool(self.cfg.get("plex_auto_scan"))
         if not result.succeeded or not (subs_on or plex_on):
             return
         placed = {os.path.normcase(str(op.src)): op.dst for op in result.succeeded}

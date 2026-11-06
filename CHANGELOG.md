@@ -17,6 +17,18 @@
   Command line: `pathrenamer rename --by-title`.
 - TVMaze answers are remembered while PathRenamer runs, so a season pack asks
   for each show and episode list once.
+- Episode orders: aired (as broadcast), DVD, streaming and absolute. DVD and
+  streaming orders come from TVMaze's alternate episode lists, for shows whose
+  DVD or streaming release numbers episodes differently; absolute counts every
+  regular episode across seasons, without a season folder. The old "DVD"
+  setting gave the aired order, so existing settings become "aired" and names
+  don't change. Command line: `pathrenamer rename --order dvd`.
+- Four presets come with PathRenamer (Presets menu): DVD order, Streaming
+  order, Absolute order, and Strip episode numbers (episodes found by their
+  title, named in the order you pick).
+- Free: the watch folder that renames on its own, and media server scans after
+  renaming. Pro is only for what costs money to run: subtitles downloaded
+  automatically after every rename.
 
 ## 1.6.0
 

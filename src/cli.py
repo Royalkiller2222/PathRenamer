@@ -1,7 +1,7 @@
 """PathRenamer without a window: the command line, and the Docker version.
 
     pathrenamer rename /downloads/Heat.1995.1080p.mkv --type movie --to /movies
-    pathrenamer watch /downloads        (Pro: new downloads are renamed on their own)
+    pathrenamer watch /downloads        (new downloads are renamed on their own)
     pathrenamer undo | history | subtitles | scan | config | license | update
 
 Everything that is free in the Windows app is free here too: renaming,
@@ -52,7 +52,8 @@ SECRET_KEYS = {"plex_token", "jellyfin_key", "emby_key", "kodi_password", "opens
 CHOICES = {"media_server": ("plex", "jellyfin", "emby", "kodi"), "rename_action": RENAME_ACTIONS,
            "episode_match": ("number", "title"),
            "watch_media_type": TYPES, "media_type": ("tv", "movie", "anime"),
-           "episode_tv": ("dvd", "absolute", "streaming"), "episode_anime": ("dvd", "absolute", "streaming")}
+           "episode_tv": ("aired", "dvd", "streaming", "absolute"),
+           "episode_anime": ("aired", "dvd", "streaming", "absolute")}
 # Settings only the Windows app uses
 WINDOW_KEYS = {"theme", "layout", "panel_mode", "density", "show_details", "animations", "files_ratio",
                "first_run", "show_media_info", "confirm_rename", "tray_on_close", "start_with_windows",
@@ -187,7 +188,7 @@ def show(kind, dst, cands, include_unsure=False):
 
 # ── renaming ─────────────────────────────────────────────────────────────────
 def place(renamer, cfg, lic, kind, dst, cands, action, cleanup_root=None, source="cli", stamp=False):
-    """Rename the candidates, then (Pro) download missing subtitles and ask
+    """Rename the candidates, then download missing subtitles (Pro) and ask
     the media server to scan. Returns the RenameResult."""
     result, msg = place_groups(renamer, rename_groups(cands, dst), dst, action=action, source=source,
                                cleanup_root=cleanup_root, cleanup=cfg.get("cleanup_empty_folders", True))
@@ -208,9 +209,9 @@ def subtitle_client(cfg):
 
 
 def after(cfg, lic, renamer, result, cands, kind, stamp=False):
-    """Pro, like the app: missing subtitles, then a media server scan."""
+    """Like the app: missing subtitles (Pro), then a media server scan."""
     subs_on = bool(cfg.get("subs_auto")) and lic.allows("subs_auto")
-    scan_on = bool(cfg.get("plex_auto_scan")) and lic.allows("plex_auto_scan")
+    scan_on = bool(cfg.get("plex_auto_scan"))
     if not result.succeeded or not (subs_on or scan_on):
         return
     placed = {os.path.normcase(str(op.src)): op.dst for op in result.succeeded}
@@ -257,6 +258,8 @@ def cmd_rename(args, cfg):
         raise Stop(f"Unknown action {action!r}: use move, copy or hardlink.", 2)
     if args.by_title:
         cfg = dict(cfg, episode_match="title")
+    if args.order:
+        cfg = dict(cfg, episode_tv=args.order, episode_anime=args.order)
     say(f"Matching {len(files)} file(s)…")
     batches = match(files, cfg, chosen, args.to)
     todo, missing_root = [], []
@@ -302,9 +305,9 @@ def cmd_rename(args, cfg):
 
 # ── watching a folder ────────────────────────────────────────────────────────
 class Watcher:
-    """pathrenamer watch: new downloads are matched as soon as they finish.
-    With Pro (or during the trial) sure matches are renamed into the library;
-    otherwise what would be renamed is reported."""
+    """pathrenamer watch: new downloads are matched as soon as they finish
+    and sure matches are renamed into the library (with --no-rename, only
+    reported)."""
 
     def __init__(self, cfg, folder, chosen, to, action, rename=True, stamp=True, clock=time.time):
         self.cfg, self.folder, self.chosen, self.to, self.action = cfg, folder, chosen, to, action
@@ -322,21 +325,22 @@ class Watcher:
         say(text, self.stamp)
 
     def start_trial_if_needed(self):
-        if not self.rename or not self.lic.enabled or self.lic.allows():
+        """Subtitles after renaming are the one Pro part: turning them on starts the trial."""
+        if not self.cfg.get("subs_auto") or not self.lic.enabled or self.lic.allows():
             return
         if self.lic.can_try() and self.lic.start_trial():
             save_license(self.lic)
-            self.log("Your free 14-day Pro trial has started: new downloads are renamed on their own.")
+            self.log("Your free 14-day Pro trial has started: missing subtitles are downloaded after renaming.")
         else:
-            self.log("Automatic renaming is part of PathRenamer Pro. New downloads are reported here; "
-                     f"rename them with 'pathrenamer rename'. Get Pro: {BUY_URL}")
+            self.log("Downloading subtitles after renaming is part of PathRenamer Pro; renaming goes on as "
+                     f"usual. Get Pro: {BUY_URL}")
 
     def handle(self, paths):
         files = [p for p in paths if p.exists()]
         if not files:
             return
         for kind, dst, cands in match(files, self.cfg, self.chosen, self.to, self.engine):
-            allowed = self.rename and self.lic.allows("watch_auto_rename")
+            allowed = self.rename
             sure = [c for c in cands if allowed and dst and verdict(c)[0] == "ok"
                     and c.source.suffix.lower() not in SUB_EXT]
             if sure:
@@ -351,7 +355,7 @@ class Watcher:
                 if state == "ok" and not dst:
                     why = f"no library folder for {TYPE_NAMES[kind].lower()} (set root_{kind})"
                 elif state == "ok":
-                    why = "automatic renaming is part of PathRenamer Pro" if self.rename else "reported only"
+                    why = "reported only (--no-rename)"
                 target = f" -> {c.dest_rel}" if not c.error else ""
                 self.log(f"Needs a look: {c.source}{target} ({why})")
 
@@ -645,10 +649,12 @@ def build_parser():
     r.add_argument("--include-unsure", action="store_true", help="also rename matches it isn't sure about")
     r.add_argument("--by-title", action="store_true",
                    help="find TV episodes by their title, ignoring the numbers in the name")
+    r.add_argument("--order", choices=("aired", "dvd", "streaming", "absolute"),
+                   help="episode order for the new names (default: the settings, normally aired)")
 
-    w = sub.add_parser("watch", help="handle new downloads as they arrive (Pro: renames them on their own)",
-                       description="Watch a folder. Finished downloads are matched; with PathRenamer Pro "
-                                   "(or during the free trial) sure matches are renamed into the library.")
+    w = sub.add_parser("watch", help="rename new downloads as they arrive",
+                       description="Watch a folder. Finished downloads are matched, and sure matches are "
+                                   "renamed into the library.")
     w.add_argument("folder", nargs="?", help="the folder to watch (default: PATHRENAMER_WATCH)")
     w.add_argument("--type", choices=TYPES, help="what arrives there (default: auto)")
     w.add_argument("--to", metavar="FOLDER", help="library folder for everything")

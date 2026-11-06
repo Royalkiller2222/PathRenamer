@@ -123,9 +123,11 @@ attached a few minutes later.
 
 ## Pro, licensing and the app's API keys
 
-Renaming by hand is free. The automatic parts (watch-folder auto-rename,
-subtitles after renaming, media server scan after renaming) are Pro. Turning
-one on starts a 14-day trial; in Docker, `pathrenamer watch` starts it.
+Only features that cost money to run are Pro: today that is downloading
+subtitles after every rename (OpenSubtitles' API), later the hosted metadata
+service. The watch folder, media server scans and everything else are free.
+Turning automatic subtitles on starts a 14-day trial (`PRO_FEATURES` in
+`src/licensing.py`).
 
 The license and trial live sealed in config.json under `license_state`:
 encrypted with DPAPI for the Windows user, or signed with HMAC-SHA256 and a

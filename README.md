@@ -52,13 +52,14 @@ The same renaming, without a window: `docker compose up -d` with [docker-compose
 
 ## Free and Pro
 
-Everything you do by hand is free, forever. **PathRenamer Pro** adds the parts that run on their own:
+Almost everything is free, forever: renaming, the watch folder that renames new downloads on its own, Plex, Jellyfin, Emby and Kodi scans, presets for DVD, streaming and absolute order, Docker, everything.
 
-- A watch folder that renames new downloads into your library automatically
-- Missing subtitles downloaded after every rename
-- Plex, Jellyfin, Emby or Kodi scanning right after renaming
+**PathRenamer Pro** is only for what costs money to run:
 
-Turning on a Pro feature starts a free 14-day trial. Pro costs $5 a year or $19 once ([pricing](https://royalkiller2222.github.io/PathRenamer/pricing/)), with a 14-day refund.
+- Missing subtitles downloaded automatically after every rename (OpenSubtitles' API is paid per download)
+- Later: the hosted metadata service
+
+Turning on automatic subtitles starts a free 14-day trial. Pro costs $5 a year or $19 once ([pricing](https://royalkiller2222.github.io/PathRenamer/pricing/)), with a 14-day refund.
 
 ## License
 

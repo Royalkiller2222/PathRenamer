@@ -1,14 +1,14 @@
 <!--meta
 {"title": "PathRenamer Pricing: Free, Pro and Enterprise",
- "description": "Renaming for Plex, Jellyfin, Emby and Kodi is free, on Windows and in Docker. PathRenamer Pro adds a watch folder, automatic subtitles and media server scans; Enterprise is coming for teams.",
+ "description": "PathRenamer is free: renaming, the watch folder, media server scans and Docker. Pro is only for automatic subtitle downloads, which cost money to run.",
  "path": "/pricing/", "priority": 0.8,
  "crumbs": [["/", "Home"], ["/pricing/", "Pricing"]]}
 -->
 <div class="wrap">
   <div class="page-head center">
     <span class="eyebrow">Free and Pro</span>
-    <h1>Free to rename. Pro to automate.</h1>
-    <p class="lead" style="margin:0 auto">Everything you do by hand stays free, for good. Pro is for the parts that run on their own.</p>
+    <h1>Free to rename and automate.</h1>
+    <p class="lead" style="margin:0 auto">Renaming, the watch folder and media server scans are free, for good. Pro is only for what costs money to run.</p>
   </div>
 
   <div class="pricing">
@@ -24,7 +24,10 @@
         <li>Undo and rename history</li>
         <li>Move, copy or hard-link (keep seeding)</li>
         <li>Presets, layouts and themes</li>
-        <li>Ask Plex, Jellyfin, Emby or Kodi to scan with one click</li>
+        <li><strong>Watch folder</strong>: new downloads renamed into your library on their own</li>
+        <li><strong>Media server scans</strong> (Plex, Jellyfin, Emby, Kodi), right after renaming or with one click</li>
+        <li>Presets for DVD, streaming and absolute order, and episodes found by their title</li>
+        <li>Featurettes and trailers put next to their movie</li>
         <li>Docker and command-line version for servers and NAS boxes</li>
         <li>Updates in one click</li>
       </ul>
@@ -35,9 +38,8 @@
       {{ pro_cta }}
       <ul>
         <li>Everything in Free</li>
-        <li><strong>Watch folder</strong>: new downloads renamed into your library automatically</li>
-        <li><strong>Subtitles</strong> in your languages downloaded after every rename</li>
-        <li><strong>Media server scans</strong> right after renaming (Plex, Jellyfin, Emby or Kodi), only the changed folders</li>
+        <li><strong>Subtitles</strong> in your languages downloaded automatically after every rename</li>
+        <li>Pays for the subtitle service PathRenamer uses (it charges per download)</li>
         <li>In the Windows app and in Docker</li>
         <li>Use it on up to {{ pro_seats }} of your computers</li>
         <li>14-day money-back guarantee</li>
@@ -60,8 +62,8 @@
 
   <div class="wrap narrow" style="padding:56px 0 0">
     <h2>Questions about Pro</h2>
-    <details class="faq"><summary>What happens when the trial ends?</summary><div><p>The automatic features switch off, and everything you do by hand keeps working. Nothing is renamed or removed. Turn them back on any time with a Pro key.</p></div></details>
-    <details class="faq"><summary>How do I start the trial?</summary><div><p>Turn on any Pro feature in <strong>Settings → Automation</strong> or <strong>Settings → Subtitles</strong>. The {{ trial_days }}-day trial starts then. No account or card needed. In the Docker version it starts the first time <code>watch</code> runs.</p></div></details>
+    <details class="faq"><summary>What happens when the trial ends?</summary><div><p>Automatic subtitle downloads switch off. Everything else, the watch folder and media server scans included, keeps working. Nothing is renamed or removed. Turn them back on any time with a Pro key.</p></div></details>
+    <details class="faq"><summary>How do I start the trial?</summary><div><p>Turn on <strong>Settings → Subtitles → Download missing subtitles after renaming</strong>. The {{ trial_days }}-day trial starts then. No account or card needed. In Docker: <code>pathrenamer config set subs_auto true</code>.</p></div></details>
     <details class="faq"><summary>Can I get a refund?</summary><div><p>Yes. Ask within 14 days of buying, using the support contact in your Polar receipt email, and you get your money back, no questions asked.</p></div></details>
     <details class="faq"><summary>Does Pro work in the Docker version?</summary><div><p>Yes, with the same key: <code>pathrenamer license activate YOUR-KEY</code>, or set <code>PATHRENAMER_LICENSE_KEY</code>. Each Docker setup counts as one of your {{ pro_seats }} computers.</p></div></details>
     <details class="faq"><summary>Does Pro need the internet all the time?</summary><div><p>No. PathRenamer checks your key once a week and keeps Pro working for 30 days without a connection.</p></div></details>

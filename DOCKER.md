@@ -10,11 +10,12 @@ feature:
 | Rename files and folders (`rename`), with undo and history | Yes | Yes |
 | Download subtitles by hand (`subtitles`) | Yes | Yes |
 | Ask Plex, Jellyfin, Emby or Kodi to scan (`scan`) | Yes | Yes |
-| Rename new downloads on their own (`watch`) | Reports them | Yes |
+| Rename new downloads on their own (`watch`) | Yes | Yes |
+| The media server scans right after every rename | Yes | Yes |
 | Download missing subtitles after every rename | | Yes |
-| The media server scans right after every rename | | Yes |
 
-Pro comes with a free 14-day trial. It starts the first time `watch` runs.
+Pro is only for what costs money to run (OpenSubtitles' API). It comes with
+a free 14-day trial, which starts when automatic subtitles are turned on.
 
 ## Start it with Docker Compose
 
@@ -103,7 +104,7 @@ Inside the container, run them as `pathrenamer COMMAND` (for example
 | Command | What it does |
 |---|---|
 | `rename PATH...` | Match the files, show the new names, rename them. Options: `--type tv\|movie\|anime`, `--to FOLDER`, `--action move\|copy\|hardlink`, `--dry-run`, `--yes`, `--include-unsure`, `--by-title` (find episodes by their title, not the numbers in the name) |
-| `watch [FOLDER]` | Watch a folder (what the container does when it starts). Pro renames sure matches; otherwise they are reported in the log. `--no-rename` only reports |
+| `watch [FOLDER]` | Watch a folder (what the container does when it starts) and rename sure matches; the rest are reported in the log. `--no-rename` only reports |
 | `undo [ID]` | Put the last rename back, or the one with that ID |
 | `history` | List earlier renames and their IDs |
 | `subtitles PATH...` | Download missing subtitles (`--languages "English, Spanish"`) |
@@ -140,8 +141,8 @@ pathrenamer config set subs_languages "English, Dutch"
 
 ## Media servers
 
-PathRenamer asks your server to scan after renaming (Pro), or when you run
-`pathrenamer scan` (free). Pick one:
+PathRenamer asks your server to scan after renaming, or when you run
+`pathrenamer scan`. Both are free. Pick one:
 
 **Plex**
 
