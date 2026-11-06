@@ -582,6 +582,22 @@ class SettingsDialog(QDialog):
         self.rename_subs.setChecked(self.cfg.get("rename_subtitles", True))
         gl.addRow(self.rename_subs)
 
+        self.handle_extras = QCheckBox("Put featurettes, trailers and other extras next to their movie or show")
+        self.handle_extras.setChecked(self.cfg.get("handle_extras", True))
+        self.handle_extras.setToolTip(
+            "Files in Featurettes, Behind The Scenes, Deleted Scenes, Interviews, Trailers or Extras folders\n"
+            "go into the same folder inside the movie's (or show's) folder, where Plex, Jellyfin and\n"
+            "Emby show them as extras: Dune (2021)/Featurettes/The Spice Must Flow.mkv")
+        gl.addRow(self.handle_extras)
+
+        self.match_by_title = QCheckBox("Match TV episodes by their title, not the numbers in the name")
+        self.match_by_title.setChecked(self.cfg.get("episode_match", "number") == "title")
+        self.match_by_title.setToolTip(
+            "For files whose episode numbers are wrong: \"Show.S02E05.The.Dundies.mkv\" becomes S02E01,\n"
+            "the episode called The Dundies. Names without any numbers are always matched by title.\n"
+            "Close but not exact titles are marked for you to check.")
+        gl.addRow(self.match_by_title)
+
         self.read_media_info = QCheckBox("Read resolution and codecs from the video when the name doesn't say")
         self.read_media_info.setChecked(self.cfg.get("read_media_info", True))
         self.read_media_info.setToolTip("Fills {res}, {vc}, {c} and {ach} in your formats from the file itself\n"
@@ -1108,6 +1124,8 @@ class SettingsDialog(QDialog):
             "opensubtitles_username": self.os_user.text().strip(),
             "opensubtitles_password": protect(self.os_pass.text()),
             "check_updates": self.check_updates_chk.isChecked(),
+            "handle_extras": self.handle_extras.isChecked(),
+            "episode_match": "title" if self.match_by_title.isChecked() else "number",
             "tray_on_close": self.tray_on_close.isChecked(),
             "start_with_windows": self.start_with_windows.isChecked(),
             "first_run": False,
@@ -1286,6 +1304,9 @@ class RenameTable(QTableWidget):
         else:
             new_path = c.dest_rel
         detected = Path(c.dest_rel).stem
+        extra = getattr(c, "extra", "")
+        if extra and not c.error:              # "Featurettes · Heat (1995)"
+            detected = f"{extra} · {c.title} ({c.year})" if c.year else f"{extra} · {c.title}"
         if c.error:
             bg, fg, status = *self._row_colors["error"], f"⚠ Error: {c.error[:50]}"
         elif c.conflict:

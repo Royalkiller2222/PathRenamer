@@ -50,6 +50,7 @@ ENV_SETTINGS = {
 }
 SECRET_KEYS = {"plex_token", "jellyfin_key", "emby_key", "kodi_password", "opensubtitles_password"}
 CHOICES = {"media_server": ("plex", "jellyfin", "emby", "kodi"), "rename_action": RENAME_ACTIONS,
+           "episode_match": ("number", "title"),
            "watch_media_type": TYPES, "media_type": ("tv", "movie", "anime"),
            "episode_tv": ("dvd", "absolute", "streaming"), "episode_anime": ("dvd", "absolute", "streaming")}
 # Settings only the Windows app uses
@@ -254,6 +255,8 @@ def cmd_rename(args, cfg):
     action = args.action or cfg.get("rename_action") or "move"
     if action not in RENAME_ACTIONS:
         raise Stop(f"Unknown action {action!r}: use move, copy or hardlink.", 2)
+    if args.by_title:
+        cfg = dict(cfg, episode_match="title")
     say(f"Matching {len(files)} file(s)…")
     batches = match(files, cfg, chosen, args.to)
     todo, missing_root = [], []
@@ -640,6 +643,8 @@ def build_parser():
     r.add_argument("-n", "--dry-run", action="store_true", help="only show the new names")
     r.add_argument("-y", "--yes", action="store_true", help="rename without asking")
     r.add_argument("--include-unsure", action="store_true", help="also rename matches it isn't sure about")
+    r.add_argument("--by-title", action="store_true",
+                   help="find TV episodes by their title, ignoring the numbers in the name")
 
     w = sub.add_parser("watch", help="handle new downloads as they arrive (Pro: renames them on their own)",
                        description="Watch a folder. Finished downloads are matched; with PathRenamer Pro "

@@ -32,6 +32,8 @@ Something wrong? Right-click a row to fix its name, episode or match. **Undo** p
 
 - Clean names for Plex, Jellyfin, Emby and Kodi (and apps that play from them, like Plezy), including multi-episode files, daily shows, specials and movie editions
 - Subtitles are found and renamed with their video, with the right language
+- Featurettes, trailers and other extras go into their movie's folder, where Plex, Jellyfin and Emby show them
+- Episodes without numbers, or with wrong ones, are found by their episode title
 - Download missing subtitles from OpenSubtitles.com
 - Resolution and codecs read from the video when the name doesn't say
 - Move, copy or hard-link files (hard links keep torrents seeding)

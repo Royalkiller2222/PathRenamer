@@ -102,7 +102,7 @@ Inside the container, run them as `pathrenamer COMMAND` (for example
 
 | Command | What it does |
 |---|---|
-| `rename PATH...` | Match the files, show the new names, rename them. Options: `--type tv\|movie\|anime`, `--to FOLDER`, `--action move\|copy\|hardlink`, `--dry-run`, `--yes`, `--include-unsure` |
+| `rename PATH...` | Match the files, show the new names, rename them. Options: `--type tv\|movie\|anime`, `--to FOLDER`, `--action move\|copy\|hardlink`, `--dry-run`, `--yes`, `--include-unsure`, `--by-title` (find episodes by their title, not the numbers in the name) |
 | `watch [FOLDER]` | Watch a folder (what the container does when it starts). Pro renames sure matches; otherwise they are reported in the log. `--no-rename` only reports |
 | `undo [ID]` | Put the last rename back, or the one with that ID |
 | `history` | List earlier renames and their IDs |

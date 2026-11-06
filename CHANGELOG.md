@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.7.0
+
+- Extras: files in Featurettes, Behind The Scenes, Deleted Scenes, Interviews,
+  Scenes, Shorts, Trailers or Extras folders (and names like
+  "Movie.2021.Featurette.Title" or "Movie (2021)-trailer") are renamed into
+  the movie's folder, or the show's, in the subfolder Plex, Jellyfin and Emby
+  read extras from: `Dune (2021)/Featurettes/The Spice Must Flow.mkv`.
+  Release tags and the movie's title are taken off their names. They used to
+  be skipped. Settings → Options can turn this off.
+- Episodes by title: a TV file without SxxEyy is matched by its episode title
+  ("The Office - The Dundies.mkv" -> S02E01). Settings → Options → "Match TV
+  episodes by their title" also ignores wrong numbers in names
+  ("Show.S02E05.The.Dundies.mkv" -> S02E01). Close but not exact titles, and
+  two equally close ones ("The Job (1)" / "(2)"), are marked for a look.
+  Command line: `pathrenamer rename --by-title`.
+- TVMaze answers are remembered while PathRenamer runs, so a season pack asks
+  for each show and episode list once.
+
 ## 1.6.0
 
 - Jellyfin, Emby and Kodi: Settings → Automation → Media Server connects
