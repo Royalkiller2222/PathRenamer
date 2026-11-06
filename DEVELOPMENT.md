@@ -151,6 +151,7 @@ Actions**:
 | `POLAR_ORGANIZATION_ID` | Variable | Your Polar organization ID. Setting it switches licensing on. |
 | `POLAR_PORTAL_URL` | Variable | Your Polar customer portal link (Manage My License). |
 | `OPENSUBTITLES_API_KEY` | Secret | The app's OpenSubtitles API key. Without it, users enter their own. |
+| `TVDB_API_KEY` | Secret | The app's TheTVDB API key, for DVD, streaming and absolute orders. Without it, users can enter their own (Settings → API Keys); otherwise those orders come from TVmaze. |
 
 To start selling Pro:
 

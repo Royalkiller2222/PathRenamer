@@ -96,6 +96,7 @@ try:
 except ImportError:
     build_info = None
 OPENSUBTITLES_APP_KEY = getattr(build_info, "OPENSUBTITLES_API_KEY", "") or ""
+TVDB_APP_KEY = getattr(build_info, "TVDB_API_KEY", "") or ""
 WEBSITE_URL = "https://royalkiller2222.github.io/PathRenamer/"
 from scanner import (SUBTITLE_EXTENSIONS, detect_subtitle_language, is_language_only_name,
                      unique_subtitle_filename)
@@ -108,6 +109,8 @@ CONFIG_PATH = _APP_DIR / "config.json"
 HISTORY_PATH = _APP_DIR / "history.json"
 DEFAULTS = {
     "tmdb_api_key": "",
+    "tvdb_api_key": "",            # TheTVDB, for DVD/streaming/absolute orders (releases may have one built in)
+    "tvdb_pin": "",                # a TheTVDB subscriber PIN, for keys that need one
     "last_source_folder": "",
     "root_tv": "",
     "root_movie": "",
@@ -988,7 +991,8 @@ class TVMazeClient:
         s = best["show"]
         premiered = s.get("premiered", "")
         year = premiered[:4] if premiered else ""
-        return {"show": s["name"], "id": s["id"], "year": year}
+        return {"show": s["name"], "id": s["id"], "year": year,
+                "tvdb": (s.get("externals") or {}).get("thetvdb")}
     def search_show_all(self, title):
         d = self._get("/search/shows", q=title)
         if not d: return []
@@ -1063,6 +1067,7 @@ class TVMazeClient:
             "show": data.get("name", ""),
             "id": show_id,
             "year": year,
+            "tvdb": (data.get("externals") or {}).get("thetvdb"),
         }
 
     def get_show_by_tvdb_id(self, tvdb_id):
@@ -1078,6 +1083,117 @@ class TVMazeClient:
             "first_air_date": d.get("premiered", ""),
             "rating": d.get("rating", {}).get("average", 0) if d.get("rating") else 0,
         }
+
+# ═══════════════════════════════════════════════════════════════════
+#  API: THETVDB (episode orders: aired, DVD, streaming/alternate, absolute)
+# ═══════════════════════════════════════════════════════════════════
+_TVDB_TOKENS = {}              # (key, pin) -> token; a token lasts a month
+
+
+class TVDBClient:
+    """TheTVDB API v4, for the episode orders TVMaze rarely has. Needs an API
+    key (and, for some keys, a subscriber PIN)."""
+    BASE = "https://api4.thetvdb.com/v4"
+    ORDERS = {"dvd": ("dvd",), "streaming": ("alternate", "regional"), "absolute": ("absolute",)}
+
+    def __init__(self, api_key, pin="", session=None, timeout=15):
+        self.api_key, self.pin = (api_key or "").strip(), (pin or "").strip()
+        self.s = session or requests.Session()
+        self.timeout = timeout
+        self._cache = {}
+
+    def _token(self, fresh=False):
+        key = (self.api_key, self.pin)
+        if fresh or key not in _TVDB_TOKENS:
+            body = {"apikey": self.api_key}
+            if self.pin:
+                body["pin"] = self.pin
+            r = self.s.post(f"{self.BASE}/login", json=body, timeout=self.timeout)
+            if r.status_code >= 400:
+                log.warning(f"TheTVDB didn't accept the API key ({r.status_code})")
+                return None
+            _TVDB_TOKENS[key] = ((r.json() or {}).get("data") or {}).get("token")
+        return _TVDB_TOKENS.get(key)
+
+    def _get(self, path, **params):
+        cache_key = (path, tuple(sorted(params.items())))
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        try:
+            for attempt in (0, 1):
+                token = self._token(fresh=attempt == 1)
+                if not token:
+                    return None
+                r = self.s.get(f"{self.BASE}{path}", params=params, timeout=self.timeout,
+                               headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+                if r.status_code != 401:
+                    break
+            if r.status_code == 404:
+                self._cache[cache_key] = None
+                return None
+            if r.status_code >= 400:
+                log.debug(f"TheTVDB answered {r.status_code} for {path}")
+                return None
+            data = r.json()
+        except Exception as e:
+            log.debug(f"TheTVDB request failed: {path}: {e!r}")
+            return None
+        self._cache[cache_key] = data
+        return data
+
+    def search_series(self, title, year=None):
+        d = self._get("/search", query=title, type="series")
+        items = (d or {}).get("data") or []
+        if not items:
+            return None
+        def score(x):
+            s = _title_score(title, x.get("name") or "")
+            return s + (5 if year and str(x.get("year")) == str(year) else 0)
+        best = max(items, key=score)
+        sid = best.get("tvdb_id") or str(best.get("id", "")).replace("series-", "")
+        return int(sid) if str(sid).isdigit() else None
+
+    def get_episodes(self, series_id, season_type="default"):
+        """[{"id", "season", "number", "absolute", "title"}] in that order (all pages)."""
+        out, page = [], 0
+        while page < 20:
+            d = self._get(f"/series/{series_id}/episodes/{season_type}", page=page)
+            eps = ((d or {}).get("data") or {}).get("episodes") or []
+            for e in eps:
+                if e.get("seasonNumber") is None or e.get("number") is None:
+                    continue
+                out.append({"id": e.get("id"), "season": int(e["seasonNumber"]), "number": int(e["number"]),
+                            "absolute": e.get("absoluteNumber"), "title": e.get("name") or ""})
+            if not eps or not ((d or {}).get("links") or {}).get("next"):
+                break
+            page += 1
+        return out
+
+    def order(self, series_id, season, episodes, order):
+        """(season, episodes) in the order for aired numbers, or None."""
+        aired = {(e["season"], e["number"]): e for e in self.get_episodes(series_id, "default")}
+        wanted = [aired.get((season, n)) for n in episodes]
+        if not all(wanted):
+            return None
+        if order == "absolute":
+            numbers = [e.get("absolute") for e in wanted]
+            if all(isinstance(n, int) and n > 0 for n in numbers):
+                return season, numbers
+        for season_type in self.ORDERS.get(order, ()):
+            listed = {e["id"]: (e["season"], e["number"]) for e in self.get_episodes(series_id, season_type)}
+            mapped = [listed.get(e["id"]) for e in wanted]
+            if all(mapped) and len({s for s, _ in mapped}) == 1:
+                if order == "absolute":
+                    return season, [n for _, n in mapped]
+                return mapped[0][0], [n for _, n in mapped]
+        return None
+
+
+def tvdb_from_config(cfg):
+    """The TheTVDB client the settings (or the release's built-in key) allow, or None."""
+    key = unprotect(cfg.get("tvdb_api_key") or "").strip() or TVDB_APP_KEY
+    return TVDBClient(key, unprotect(cfg.get("tvdb_pin") or "")) if key else None
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  API: ANIDB
@@ -1361,9 +1477,10 @@ def derive_title_for(path: Path, media_type: str = "tv") -> str:
 
 
 class MatchEngine:
-    def __init__(self, cfg, tvmaze=None, anidb=None, tmdb=None, cinemeta=None):
+    def __init__(self, cfg, tvmaze=None, anidb=None, tmdb=None, cinemeta=None, tvdb=None):
         self.cfg = cfg; self.tvmaze = tvmaze; self.anidb = anidb
         self.tmdb = tmdb; self.cinemeta = cinemeta
+        self.tvdb = tvdb if tvdb is not None else tvdb_from_config(cfg)
     def match(self, path, media_type):
         return self.match_with_override(path, media_type)
 
@@ -1541,12 +1658,24 @@ class MatchEngine:
             log.info(f"Episode by title: {text!r} -> S{best[0]:02d}E{best[1]:02d} ({best[2]:.0f}%)")
         return best
 
-    def _in_order(self, show_id, season, episodes, order):
+    def _in_order(self, show_id, season, episodes, order, show_name="", year=None):
         """(season, episodes) in the chosen episode order for numbers in the
-        aired order. DVD and streaming orders come from TVMaze's alternate
-        lists; absolute counts every regular episode from the first. Numbers
-        stay as they are when TVMaze has no such order for the show."""
-        if order not in ("dvd", "streaming", "absolute") or not episodes or not self.tvmaze or not show_id:
+        aired order. TheTVDB first (with a key): its DVD, alternate (streaming)
+        and absolute orders. Then TVMaze's alternate lists; absolute counts
+        every regular episode from the first. Numbers stay as they are when
+        neither has such an order for the show."""
+        if order not in ("dvd", "streaming", "absolute") or not episodes:
+            return season, episodes
+        if self.tvdb:
+            tvdb_id = None
+            if self.tvmaze and show_id:
+                tvdb_id = (self.tvmaze.get_show_info(show_id) or {}).get("tvdb")
+            if not tvdb_id and show_name:
+                tvdb_id = self.tvdb.search_series(show_name, year)
+            found = self.tvdb.order(tvdb_id, season, episodes, order) if tvdb_id else None
+            if found:
+                return found
+        if not self.tvmaze or not show_id:
             return season, episodes
         aired = self.tvmaze.get_episodes(show_id)
         by_number = {(e["season"], e["number"]): e for e in aired}
@@ -1637,7 +1766,7 @@ class MatchEngine:
             show_year = str(year)       # year from the file/folder name, e.g. "Doctor Who (2005)"
         ep_type = self.cfg.get("episode_tv", "aired")
         name_season, name_eps = (season, episodes) if air_date else \
-            self._in_order(show_id, season, episodes, ep_type)
+            self._in_order(show_id, season, episodes, ep_type, show, show_year)
         rel = fmt_tv(show, name_season, name_eps[0] if name_eps else episode, ep_title, ext, self.cfg.get("format_tv",""), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=name_eps, air_date=air_date)
         c = Candidate(path, rel, "tv", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
                       title=show, season=season, episodes=list(episodes), year=str(show_year or ""))
@@ -1732,8 +1861,8 @@ class MatchEngine:
         if not show_year and year:
             show_year = str(year)
         ep_type = self.cfg.get("episode_anime", "aired")
-        name_season, name_eps = (season, episodes) if air_date or not show_id else \
-            self._in_order(show_id, season, episodes, ep_type)
+        name_season, name_eps = (season, episodes) if air_date else \
+            self._in_order(show_id, season, episodes, ep_type, show, show_year)
         rel = fmt_tv(show, name_season, name_eps[0] if name_eps else episode, ep_title, ext, self.cfg.get("format_anime", self.cfg.get("format_tv","")), video_codec, audio_codec, audio_channels, media_source, resolution, ep_type, ep_title, show_year, episodes=name_eps, air_date=air_date)
         c = Candidate(path, rel, "anime", conf, video_codec=video_codec, audio_codec=audio_codec, audio_channels=audio_channels, media_source=media_source, resolution=resolution,
                       title=show, season=season, episodes=list(episodes), year=str(show_year or ""))

@@ -147,3 +147,102 @@ def test_command_line_order(capsys):
     assert (args.order, args.by_title) == ("dvd", True)
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["rename", "x", "--order", "random"])
+
+
+# ── TheTVDB ──────────────────────────────────────────────────────────────────
+class TVDBSession:
+    """Answers like api4.thetvdb.com."""
+
+    def __init__(self, orders):
+        self.orders, self.calls, self.logins = orders, [], 0
+
+    def post(self, url, json=None, timeout=None):
+        self.logins += 1
+        from conftest import FakeResponse
+        return FakeResponse(json={"data": {"token": f"tok{self.logins}"}})
+
+    def get(self, url, params=None, timeout=None, headers=None):
+        from conftest import FakeResponse
+        self.calls.append((url, dict(params or {}), headers["Authorization"]))
+        kind = url.rsplit("/", 1)[-1]
+        if "/search" in url:
+            return FakeResponse(json={"data": [{"tvdb_id": "78874", "name": "Firefly", "year": "2002"}]})
+        eps = self.orders.get(kind, [])
+        page = params.get("page", 0)
+        chunk = eps[page * 2:(page + 1) * 2]                                # two per page: tests paging
+        return FakeResponse(json={"data": {"episodes": chunk},
+                                  "links": {"next": "more" if (page + 1) * 2 < len(eps) else None}})
+
+
+def _ep(eid, season, number, absolute=None):
+    return {"id": eid, "seasonNumber": season, "number": number, "absoluteNumber": absolute, "name": f"E{eid}"}
+
+
+TVDB_ORDERS = {
+    "default": [_ep(1, 1, 1, 2), _ep(2, 1, 2, 3), _ep(11, 1, 11, 1), _ep(21, 2, 1, 15), _ep(99, 0, 1)],
+    "dvd": [_ep(11, 1, 1), _ep(1, 1, 2), _ep(2, 1, 3), _ep(21, 2, 1)],
+    "regional": [_ep(1, 3, 7), _ep(2, 3, 8)],
+}
+
+
+@pytest.fixture
+def tvdb():
+    core._TVDB_TOKENS.clear()
+    session = TVDBSession(TVDB_ORDERS)
+    return core.TVDBClient("key", "1234", session=session), session
+
+
+def test_tvdb_orders(tvdb):
+    client, session = tvdb
+    assert client.order(78874, 1, [1], "dvd") == (1, [2])
+    assert client.order(78874, 1, [1, 2], "dvd") == (1, [2, 3])
+    assert client.order(78874, 1, [1], "absolute") == (1, [2])            # absoluteNumber
+    assert client.order(78874, 1, [2], "streaming") == (3, [8])           # no "alternate": "regional"
+    assert client.order(78874, 2, [1], "streaming") is None               # not in that order
+    assert client.order(78874, 5, [1], "dvd") is None                     # unknown episode
+    assert session.logins == 1 and all(auth == "Bearer tok1" for _, _, auth in session.calls)
+    assert {c[1]["page"] for c in session.calls if c[0].endswith("/default")} == {0, 1, 2}
+
+
+def test_tvdb_logs_in_again_when_the_token_expires(tvdb):
+    client, session = tvdb
+    from conftest import FakeResponse
+    real_get, answered = session.get, []
+
+    def get(url, **kw):
+        if not answered:
+            answered.append(1)
+            return FakeResponse(401)
+        return real_get(url, **kw)
+    session.get = get
+    assert client.search_series("Firefly", 2002) == 78874 and session.logins == 2
+
+
+def test_engine_prefers_tvdb_and_falls_back_to_tvmaze(tmp_path, tvdb):
+    client, _ = tvdb
+    maze = FakeTVMaze(alternate={})
+    maze.get_show_info = lambda show_id: {"show": "Firefly", "id": show_id, "year": "2002", "tvdb": 78874}
+    video, = make_files(tmp_path / "Firefly", "Firefly.S01E01.mkv")
+    engine = MatchEngine(cfg=dict(core.DEFAULTS, read_media_info=False, episode_tv="dvd"), tvmaze=maze, tvdb=client)
+    assert "S01E02 - The Train Job" in engine.match(video, "tv").dest_rel   # TheTVDB's DVD order
+    broken = core.TVDBClient("bad", session=TVDBSession({}))                 # nothing from TheTVDB
+    engine = MatchEngine(cfg=dict(core.DEFAULTS, read_media_info=False, episode_tv="dvd"),
+                         tvmaze=FakeTVMaze(), tvdb=broken)
+    assert "S01E02 - The Train Job" in engine.match(video, "tv").dest_rel   # TVMaze's DVD list
+
+
+def test_tvdb_key_from_settings_or_the_release(monkeypatch):
+    assert core.tvdb_from_config(dict(core.DEFAULTS)) is None
+    client = core.tvdb_from_config(dict(core.DEFAULTS, tvdb_api_key="mine", tvdb_pin=core.protect("42")))
+    assert (client.api_key, client.pin) == ("mine", "42")
+    monkeypatch.setattr(core, "TVDB_APP_KEY", "built-in")
+    assert core.tvdb_from_config(dict(core.DEFAULTS)).api_key == "built-in"
+
+
+def test_tvdb_settings_are_saved(main, qapp, monkeypatch):
+    monkeypatch.setattr(main, "cfg_save", lambda c: None)
+    d = main.SettingsDialog(dict(main.DEFAULTS))
+    d.tvdb_key.setText(" key-1 ")
+    d.tvdb_pin.setText("4242")
+    d._save()
+    assert d.cfg["tvdb_api_key"] == "key-1" and main.unprotect(d.cfg["tvdb_pin"]) == "4242"

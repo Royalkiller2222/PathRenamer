@@ -1006,6 +1006,26 @@ class SettingsDialog(QDialog):
         gl2.addRow("", note2)
 
         L.addWidget(grp2)
+
+        grp3 = QGroupBox("TheTVDB (episode orders)")
+        gl3 = QFormLayout(grp3)
+        self.tvdb_key = QLineEdit(self.cfg.get("tvdb_api_key", ""))
+        self.tvdb_key.setPlaceholderText("Built in" if TVDB_APP_KEY else "Paste your TheTVDB API key")
+        self.tvdb_key.setEchoMode(QLineEdit.EchoMode.Password)
+        row3 = QHBoxLayout()
+        row3.addWidget(self.tvdb_key, 1)
+        get_tvdb = QPushButton("Get Key")
+        get_tvdb.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://thetvdb.com/api-information")))
+        row3.addWidget(get_tvdb)
+        gl3.addRow("API Key:", row3)
+        self.tvdb_pin = QLineEdit(unprotect(self.cfg.get("tvdb_pin", "")))
+        self.tvdb_pin.setPlaceholderText("Only if your key needs a subscriber PIN")
+        self.tvdb_pin.setEchoMode(QLineEdit.EchoMode.Password)
+        gl3.addRow("PIN:", self.tvdb_pin)
+        gl3.addRow("", _note_label("Used for DVD, streaming and absolute episode orders (Settings → Formats and "
+                                   "the Presets menu). Without it, those orders come from TVmaze, which has "
+                                   "them for fewer shows."))
+        L.addWidget(grp3)
         L.addStretch()
         return w
 
@@ -1036,7 +1056,8 @@ class SettingsDialog(QDialog):
 
         credits = QLabel(
             "Show and episode data from TVmaze (CC BY-SA 4.0), movie data from Cinemeta, anime data "
-            "from AniDB, subtitles from OpenSubtitles.com. With your own key, movie data from TMDB: "
+            "from AniDB, subtitles from OpenSubtitles.com, episode orders from TheTVDB "
+            "(metadata provided by TheTVDB, thetvdb.com). With your own key, movie data from TMDB: "
             "this product uses the TMDB API but is not endorsed or certified by TMDB.")
         credits.setWordWrap(True)
         credits.setStyleSheet("color: #888; font-size: 11px; margin-top: 8px;")
@@ -1106,6 +1127,8 @@ class SettingsDialog(QDialog):
             "use_anidb": self.use_anidb.isChecked(),
             "use_cinemeta": self.use_cinemeta.isChecked(),
             "tmdb_api_key": self.tmdb_key.text().strip(),
+            "tvdb_api_key": self.tvdb_key.text().strip(),
+            "tvdb_pin": protect(self.tvdb_pin.text().strip()),
             "watch_enabled": self.watch_enabled.isChecked(),
             "watch_folder": self.watch_folder.text().strip(),
             "watch_media_type": self.watch_type.currentData(),

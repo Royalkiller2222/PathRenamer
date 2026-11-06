@@ -23,6 +23,10 @@
   regular episode across seasons, without a season folder. The old "DVD"
   setting gave the aired order, so existing settings become "aired" and names
   don't change. Command line: `pathrenamer rename --order dvd`.
+  With a TheTVDB API key (built into releases when the TVDB_API_KEY secret
+  is set, or your own under Settings → API Keys), the orders come from
+  TheTVDB: its DVD, alternate (streaming) and absolute orders. Without one,
+  from TVmaze.
 - Five presets come with PathRenamer (Presets menu): Aired order, DVD order,
   Streaming order, Absolute order, and Strip episode numbers (episodes found by their
   title, named in the order you pick).

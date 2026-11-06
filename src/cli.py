@@ -48,7 +48,8 @@ ENV_SETTINGS = {
     "PATHRENAMER_TYPE": "watch_media_type",
     "PATHRENAMER_ACTION": "rename_action",
 }
-SECRET_KEYS = {"plex_token", "jellyfin_key", "emby_key", "kodi_password", "opensubtitles_password"}
+SECRET_KEYS = {"plex_token", "jellyfin_key", "emby_key", "kodi_password", "opensubtitles_password",
+               "tvdb_api_key", "tvdb_pin"}
 CHOICES = {"media_server": ("plex", "jellyfin", "emby", "kodi"), "rename_action": RENAME_ACTIONS,
            "episode_match": ("number", "title"),
            "watch_media_type": TYPES, "media_type": ("tv", "movie", "anime"),
